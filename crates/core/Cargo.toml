@@ -22,7 +22,6 @@ rusqlite.workspace = true
 ureq.workspace = true
 fastembed.workspace = true
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"] }
-ort = { version = "=2.0.0-rc.12", features = ["coreml"] }
 usearch.workspace = true
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
@@ -33,6 +32,17 @@ tree-sitter-go.workspace = true
 tree-sitter-java.workspace = true
 tree-sitter-c.workspace = true
 tree-sitter-cpp.workspace = true
+
+# ort: use pyke's PREBUILT onnxruntime (default `download-binaries`).
+# The `coreml` EP feature is only enabled on Apple Silicon — enabling
+# it elsewhere forces ORT to compile from source, which link-fails on
+# Linux (glibc `__isoc23_*`) and Windows MSVC (unresolved CRT
+# `__imp_*`). CoreML is mac-only at runtime anyway.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+ort = { version = "=2.0.0-rc.12", features = ["coreml"] }
+
+[target.'cfg(not(all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
+ort = "=2.0.0-rc.12"
 
 [features]
 cuda = ["ort/cuda"]
