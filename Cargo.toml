@@ -32,7 +32,12 @@ indicatif = "0.18"
 rusqlite = { version = "0.39", features = ["bundled"] }
 ureq = { version = "3", features = ["json"] }
 fastembed = "5.13"
-usearch = "2.25"
+# default-features=false drops the optional `numkong` SIMD C kernels:
+# numkong 7.6's dynamic-dispatch C fails to compile on the older
+# GCC/Clang on CI runners (avx512fp16 / NEON SDOT inlining). usearch
+# falls back to its own distance impls — fine here (small indexes,
+# embedding dominates, not vector math).
+usearch = { version = "2.25", default-features = false }
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
