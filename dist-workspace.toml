@@ -9,5 +9,12 @@ installers = ["shell", "powershell"]
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 
 # Pin macOS to a current GA image (older default macos-12 was retired).
+# Linux runners pinned to ubuntu-24.04 (glibc 2.39). ort's onnxruntime
+# objects reference `__isoc23_*` (glibc ≥2.38 ABI); the older default
+# runner's glibc 2.35 lacks them → link fails. 24.04 resolves it; the
+# arm64 target additionally needs a NATIVE arm runner (the x86 cross
+# build link-fails the same way).
 [dist.github-custom-runners]
 aarch64-apple-darwin = "macos-14"
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
