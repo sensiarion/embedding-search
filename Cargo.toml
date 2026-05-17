@@ -49,3 +49,8 @@ embedding-search-core = { path = "crates/core" }
 strip = true
 lto = "thin"
 codegen-units = 1
+
+# cargo-dist builds release artifacts with `--profile dist`.
+[profile.dist]
+inherits = "release"
+lto = "thin"
