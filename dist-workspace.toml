@@ -5,8 +5,14 @@ members = ["cargo:crates/cli"]
 [dist]
 cargo-dist-version = "0.30.0"
 ci = "github"
-installers = ["shell", "powershell"]
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+installers = ["shell"]
+# x86_64-pc-windows-msvc intentionally omitted: ort 2.0-rc.12 has no
+# prebuilt onnxruntime for it, so it compiles ORT from source and
+# link-fails on MSVC (30 unresolved CRT `__imp_*`: nearbyintf, rint,
+# strncpy, protobuf io_win32 …). Windows users build from source.
+# (x86_64-apple-darwin also omitted — Intel-mac runner queue is
+# unreliable; Apple Silicon is native via aarch64-apple-darwin.)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
 
 # Pin macOS to a current GA image (older default macos-12 was retired).
 # Linux runners pinned to ubuntu-24.04 (glibc 2.39). ort's onnxruntime

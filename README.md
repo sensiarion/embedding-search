@@ -16,6 +16,11 @@ Editors spawn it with the workspace as cwd, so it indexes the open
 project automatically. (The `--mcp` trailing arg is what flips the
 binary into server mode.)
 
+Prebuilt release binaries: **macOS arm64, Linux x86_64, Linux arm64**.
+Intel macOS and Windows are not prebuilt (their onnxruntime toolchain
+paths are unreliable) — build from source there: `cargo build
+--release` (see *Build from source*).
+
 ### Claude Code
 
 One command (`--scope user` = available in every project):
