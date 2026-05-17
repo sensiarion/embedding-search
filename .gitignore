@@ -1,0 +1,8 @@
+/target
+.embedding-search/
+benchmarks/corpus/
+benchmarks/results/*.jsonl
+*.usearch
+.idea/
+.claude/
+**/.DS_Store

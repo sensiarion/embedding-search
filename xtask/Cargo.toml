@@ -1,0 +1,14 @@
+[package]
+name = "xtask"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+embedding-search-core = { path = "../crates/core", features = ["bench-stub"] }
+serde_json.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+tempfile = "3"
+libc = "0.2"

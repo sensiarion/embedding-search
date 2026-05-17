@@ -1,0 +1,736 @@
+use crate::chunker::{Chunk, Chunker};
+use crate::config::{Config, PROJECT_INDEX_DIR};
+use crate::db::{Db, NewChunk};
+use crate::embedder::Embedder;
+use crate::error::{Error, Result};
+use crate::vector::VectorIndex;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SyncStats {
+    pub files_indexed: usize,
+    pub files_skipped: usize,
+    pub files_deleted: usize,
+    pub chunks_total: usize,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IndexStatus {
+    pub files: i64,
+    pub chunks: i64,
+    pub vector_count: usize,
+    pub model: String,
+    pub last_sync_at: Option<String>,
+    /// Index was never built.
+    pub is_stale: bool,
+    /// A CLI search would trigger a resync now (never synced, or last
+    /// sync older than `sync.resync_interval_minutes`).
+    pub resync_due: bool,
+    /// Search backend the next query will use.
+    pub search_backend: SearchBackend,
+    /// File hash-tree root (short) — changes iff indexed content did.
+    pub merkle_root: Option<String>,
+}
+
+/// Progress callback events.
+pub enum SyncEvent<'a> {
+    Scanned(usize),
+    File {
+        done: usize,
+        total: usize,
+        path: &'a str,
+        /// Files re-embedded so far (changed since last sync).
+        indexed: usize,
+        /// This file changed and was re-embedded (vs. skipped clean).
+        changed: bool,
+    },
+    /// Chunk-level progress, emitted at each embed-batch flush: of the
+    /// `discovered` chunks seen so far, `embedded` are written. The
+    /// total rises as files are parsed, so this advances within a large
+    /// file even while the file count barely moves.
+    Chunks {
+        embedded: usize,
+        discovered: usize,
+    },
+}
+
+/// Parse a stored rfc3339 `last_sync_at` to UTC, or `None` if absent /
+/// unparseable. Single source for both freshness checks below.
+fn parse_last(last: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = last?;
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+}
+
+/// The index is "stale" only if it was never built (no recorded sync,
+/// or an unparseable timestamp). There is no time-based expiry: every
+/// sync is hash-incremental and near-instant when nothing changed, so
+/// freshness is driven by content, not a clock.
+pub(crate) fn never_synced(last: Option<&str>) -> bool {
+    parse_last(last).is_none()
+}
+
+/// Whether a CLI search should resync first: never synced, an
+/// unparseable stamp, or the last sync is older than the throttle.
+/// Not a correctness expiry — just paces the walk+hash on a clean tree.
+pub(crate) fn resync_due(last: Option<&str>, interval_minutes: i64) -> bool {
+    match parse_last(last) {
+        None => true,
+        Some(ts) => chrono::Utc::now().signed_duration_since(ts).num_minutes() >= interval_minutes,
+    }
+}
+
+/// Vector backend the next query uses: exact (brute force) under the
+/// configured size, else the HNSW graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchBackend {
+    Exact,
+    Hnsw,
+}
+
+impl SearchBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchBackend::Exact => "exact",
+            SearchBackend::Hnsw => "hnsw",
+        }
+    }
+
+    fn pick(vectors: usize, exact_below: usize) -> Self {
+        if vectors < exact_below {
+            SearchBackend::Exact
+        } else {
+            SearchBackend::Hnsw
+        }
+    }
+}
+
+impl IndexStatus {
+    /// Single assembly point for the status DTO (shared by the live
+    /// engine and the read-only Inspector) — keeps the derived fields
+    /// and the short-root truncation from drifting.
+    pub(crate) fn assemble(
+        files: i64,
+        chunks: i64,
+        vector_count: usize,
+        model: String,
+        last_sync_at: Option<String>,
+        merkle_root: Option<String>,
+        cfg: &Config,
+    ) -> Self {
+        Self {
+            files,
+            chunks,
+            vector_count,
+            model,
+            is_stale: never_synced(last_sync_at.as_deref()),
+            resync_due: resync_due(last_sync_at.as_deref(), cfg.sync.resync_interval_minutes),
+            search_backend: SearchBackend::pick(vector_count, cfg.search.exact_below),
+            merkle_root: merkle_root.map(|r| r.chars().take(16).collect()),
+            last_sync_at,
+        }
+    }
+}
+
+/// A changed file ready to embed: metadata + its chunks.
+struct FileWork {
+    rel: String,
+    mtime: i64,
+    size: i64,
+    hash: String,
+    lang: String,
+    chunks: Vec<Chunk>,
+}
+
+/// A chunk tagged with its content hash and, when the same content
+/// already existed in the prior index, the vector to reuse instead of
+/// re-embedding.
+struct Planned {
+    chunk: Chunk,
+    hash: String,
+    reuse: Option<u64>,
+}
+
+/// A changed file resolved against its prior index state: which chunks
+/// reuse a vector, which need embedding, and which old vectors are now
+/// orphaned.
+struct FilePlan {
+    rel: String,
+    mtime: i64,
+    size: i64,
+    fhash: String,
+    lang: String,
+    chunks: Vec<Planned>,
+    removed: Vec<u64>,
+}
+
+/// Resolve the sync worker-thread cap: the configured value, or (when
+/// `0`) all cores but one so the workstation stays responsive instead
+/// of every core saturating on a large reindex.
+fn sync_thread_count(configured: usize) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1))
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// (mtime secs, size bytes) of a path, or (0, 0) if unstattable.
+fn mtime_size(path: &Path) -> (i64, i64) {
+    let Ok(m) = std::fs::metadata(path) else {
+        return (0, 0);
+    };
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    (mtime, m.len() as i64)
+}
+
+pub struct SyncEngine {
+    project_dir: PathBuf,
+    index_dir: PathBuf,
+    config: Config,
+    db: Mutex<Db>,
+    vector: Mutex<VectorIndex>,
+    embedder: Embedder,
+    chunker: Chunker,
+    /// Private worker pool for the parallel scan/hash/parse phase,
+    /// built once (not the global pool) so its thread count bounds CPU
+    /// and repeated syncs don't pay pool spawn/teardown.
+    pool: rayon::ThreadPool,
+}
+
+impl SyncEngine {
+    pub fn new(project_dir: PathBuf, config: Config) -> Result<Self> {
+        let index_dir = project_dir.join(PROJECT_INDEX_DIR);
+
+        // Build the embedder first: it is the single source of the
+        // active (model_name, dimensions) for both local ONNX and the
+        // external OpenAI-compatible backend (no static spec for remote).
+        let embedder = Embedder::new(&config)?;
+        let model_name = embedder.model_name.as_str();
+        let dims = embedder.dimensions;
+
+        // Any change that makes existing chunks/vectors invalid (model,
+        // dims, precision, token cap, chunk byte cap, chunker logic)
+        // shifts the fingerprint → wipe stale index before reopening.
+        let fingerprint = config.index_fingerprint(model_name, dims);
+        if index_dir.exists() {
+            let probe = Db::open_or_create(&index_dir)?;
+            let stored = probe.get_meta("index_fingerprint")?;
+            let (indexed_files, _) = probe.counts()?;
+            drop(probe);
+            // Wipe when the stored fingerprint differs OR is absent
+            // (legacy index from before fingerprinting) — but only if
+            // there is data to invalidate, so a freshly created empty
+            // db is left alone.
+            let mismatch = stored.as_deref() != Some(fingerprint.as_str());
+            if mismatch && indexed_files > 0 {
+                tracing::warn!(
+                    "index fingerprint changed ({} -> {fingerprint}) — wiping index",
+                    stored.as_deref().unwrap_or("none")
+                );
+                let _ = std::fs::remove_file(index_dir.join("meta.db"));
+                let _ = std::fs::remove_file(index_dir.join("meta.db-wal"));
+                let _ = std::fs::remove_file(index_dir.join("meta.db-shm"));
+                let _ = std::fs::remove_file(index_dir.join("vectors.usearch"));
+            }
+        }
+
+        let db = Db::open_or_create(&index_dir)?;
+        db.set_meta("model_name", model_name)?;
+        db.set_meta("dimensions", &dims.to_string())?;
+        db.set_meta("index_fingerprint", &fingerprint)?;
+        let vector = VectorIndex::open_or_create(&index_dir, dims)?;
+        let chunker = Chunker::new(config.sync.max_chunk_bytes);
+
+        let gi = index_dir.join(".gitignore");
+        if !gi.exists() {
+            let _ = std::fs::write(&gi, "*\n");
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(sync_thread_count(config.sync.sync_threads))
+            .build()
+            .map_err(|e| Error::Index(format!("rayon pool: {e}")))?;
+
+        Ok(Self {
+            project_dir,
+            index_dir,
+            config,
+            db: Mutex::new(db),
+            vector: Mutex::new(vector),
+            embedder,
+            chunker,
+            pool,
+        })
+    }
+
+    pub fn index_dir(&self) -> &Path {
+        &self.index_dir
+    }
+
+    pub fn project_dir(&self) -> &Path {
+        &self.project_dir
+    }
+
+    fn is_excluded(&self, rel: &Path) -> bool {
+        let dirs = &self.config.sync.exclude_dirs;
+        if rel
+            .components()
+            .any(|c| dirs.iter().any(|d| d == &*c.as_os_str().to_string_lossy()))
+        {
+            return true;
+        }
+        let rel_s = rel.to_string_lossy();
+        if rel_s.ends_with(".lock") {
+            return true;
+        }
+        self.config
+            .sync
+            .exclude
+            .iter()
+            .any(|p| !p.is_empty() && rel_s.contains(p.as_str()))
+    }
+
+    /// Read a file as UTF-8 text, or `None` if it is binary. Sniffs an
+    /// 8 KiB head for a NUL byte first so huge binaries (videos, model
+    /// weights, …) are rejected without slurping the whole file into
+    /// RAM; zip/pdf/image/office (.docx) containers all carry NUL in
+    /// their header and are caught here.
+    fn read_text(path: &Path) -> Option<String> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut head = [0u8; 8192];
+        let n = f.read(&mut head).ok()?;
+        if head[..n].contains(&0) {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(n);
+        bytes.extend_from_slice(&head[..n]);
+        f.read_to_end(&mut bytes).ok()?;
+        // tail NUL (binary without one in the first 8 KiB) — cheap vs
+        // chunk+embed; non-UTF-8 also rejects most remaining binaries.
+        if bytes[n..].contains(&0) {
+            return None;
+        }
+        String::from_utf8(bytes).ok()
+    }
+
+    fn collect_files(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let walk = ignore::WalkBuilder::new(&self.project_dir)
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .parents(true)
+            .build();
+        for entry in walk.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(&self.project_dir) else {
+                continue;
+            };
+            if self.is_excluded(rel) {
+                continue;
+            }
+            out.push(path.to_path_buf());
+        }
+        out
+    }
+
+    fn rel_str(&self, path: &Path) -> String {
+        path.strip_prefix(&self.project_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// Drop a file's chunks+vectors from both stores.
+    fn purge(&self, rel: &str) -> Result<()> {
+        let old = self.db.lock().unwrap().delete_file_by_path(rel)?;
+        if !old.is_empty() {
+            self.vector.lock().unwrap().remove_many(&old)?;
+        }
+        Ok(())
+    }
+
+    /// Persist the vector index and stamp the sync time. The merkle
+    /// root is rescanned only when `changed` (files added/removed):
+    /// on a clean no-op resync the root cannot have moved, so the
+    /// O(files) scan + hash is skipped.
+    fn finalize(&self, changed: bool) -> Result<()> {
+        self.vector.lock().unwrap().save()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let db = self.db.lock().unwrap();
+        db.set_meta("last_sync_at", &now)?;
+        if changed {
+            let root = db.merkle_root()?;
+            db.set_meta("merkle_root", &root)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve which of a file's new chunks can keep their existing
+    /// vector (content unchanged across the edit) vs. must be embedded,
+    /// and which old vectors are now orphaned. Identity is the chunk's
+    /// blake3 — robust to chunks moving (byte offsets / index shift)
+    /// when the file is edited above them.
+    fn plan_file(&self, f: FileWork) -> Result<FilePlan> {
+        let old = self
+            .db
+            .lock()
+            .unwrap()
+            .chunk_fingerprints_for_file(&f.rel)?;
+        let mut avail: HashMap<String, Vec<u64>> = HashMap::new();
+        for (h, vid) in old {
+            avail.entry(h).or_default().push(vid);
+        }
+        let mut chunks = Vec::with_capacity(f.chunks.len());
+        for c in f.chunks {
+            let hash = blake3::hash(c.content.as_bytes()).to_hex().to_string();
+            let reuse = avail.get_mut(&hash).and_then(Vec::pop);
+            chunks.push(Planned {
+                chunk: c,
+                hash,
+                reuse,
+            });
+        }
+        // vectors left unclaimed = chunks that vanished from the file
+        let removed = avail.into_values().flatten().collect();
+        Ok(FilePlan {
+            rel: f.rel,
+            mtime: f.mtime,
+            size: f.size,
+            fhash: f.hash,
+            lang: f.lang,
+            chunks,
+            removed,
+        })
+    }
+
+    /// Persist one planned file: reused chunks keep their vector (only
+    /// their row metadata — index/offsets — is refreshed), genuinely
+    /// new chunks consume freshly embedded vectors, orphaned vectors
+    /// are dropped. `embedded` yields vectors for the no-reuse chunks
+    /// in plan order. Returns the file's chunk count.
+    fn apply_plan(
+        &self,
+        p: FilePlan,
+        embedded: &mut impl Iterator<Item = Vec<f32>>,
+    ) -> Result<usize> {
+        let n = p.chunks.len();
+        let need_new = p.chunks.iter().filter(|c| c.reuse.is_none()).count();
+        let (file_id, mut fresh) = {
+            let db = self.db.lock().unwrap();
+            let id = db.upsert_file(&p.rel, p.mtime, p.size, &p.fhash)?;
+            (id, db.alloc_vector_ids(need_new)?.into_iter())
+        };
+        let mut add_keys = Vec::with_capacity(need_new);
+        let mut add_vecs = Vec::with_capacity(need_new);
+        let mut new_chunks = Vec::with_capacity(n);
+        let mut vids = Vec::with_capacity(n);
+        for (i, pc) in p.chunks.into_iter().enumerate() {
+            let vid = match pc.reuse {
+                Some(v) => v,
+                None => {
+                    let v = fresh.next().ok_or_else(|| {
+                        Error::Index("internal: allocated vector ids < new chunks".into())
+                    })?;
+                    let vec = embedded.next().ok_or_else(|| {
+                        Error::Index("internal: embedded vectors < new chunks".into())
+                    })?;
+                    add_keys.push(v);
+                    add_vecs.push(vec);
+                    v
+                }
+            };
+            new_chunks.push(NewChunk {
+                chunk_index: i as i32,
+                content: pc.chunk.content,
+                start_byte: pc.chunk.start_byte,
+                end_byte: pc.chunk.end_byte,
+                node_type: pc.chunk.node_type,
+                language: p.lang.clone(),
+                content_hash: pc.hash,
+            });
+            vids.push(vid);
+        }
+        // Two-store write: vectors first, then chunk rows. A crash
+        // between them leaves an orphan/missing vector for this one
+        // file; the next resync re-plans it from content hashes and
+        // self-heals. Acceptable — no cross-store transaction exists.
+        {
+            let v = self.vector.lock().unwrap();
+            if !p.removed.is_empty() {
+                v.remove_many(&p.removed)?;
+            }
+            if !add_keys.is_empty() {
+                v.add_batch(&add_keys, &add_vecs)?;
+            }
+        }
+        self.db
+            .lock()
+            .unwrap()
+            .replace_chunks(file_id, &new_chunks, &vids)?;
+        Ok(n)
+    }
+
+    /// Plan a group of changed files, embed ONLY the chunks that
+    /// actually changed (across all files, one model call), then store.
+    fn flush_group(&self, group: Vec<FileWork>) -> Result<usize> {
+        if group.is_empty() {
+            return Ok(0);
+        }
+        let plans: Vec<FilePlan> = group
+            .into_iter()
+            .map(|f| self.plan_file(f))
+            .collect::<Result<_>>()?;
+        let vectors = {
+            let texts: Vec<&str> = plans
+                .iter()
+                .flat_map(|p| {
+                    p.chunks
+                        .iter()
+                        .filter(|c| c.reuse.is_none())
+                        .map(|c| c.chunk.content.as_str())
+                })
+                .collect();
+            self.embedder
+                .embed_documents(&texts, self.config.sync.embed_batch_size)?
+        };
+        let mut it = vectors.into_iter();
+        let mut chunks_total = 0;
+        for p in plans {
+            chunks_total += self.apply_plan(p, &mut it)?;
+        }
+        Ok(chunks_total)
+    }
+
+    /// Classify a file: always returns its relative key (so the caller
+    /// can track `seen` for delete-detection) plus `Some(FileWork)` only
+    /// when it changed and must be re-embedded. The expensive tree-sitter
+    /// parse is skipped entirely for unchanged files (hash compared
+    /// first).
+    fn classify(
+        &self,
+        path: &Path,
+        existing: &HashMap<String, crate::db::FileState>,
+        force: bool,
+    ) -> (String, Option<FileWork>) {
+        let rel = self.rel_str(path);
+        let (mtime, size) = mtime_size(path);
+        let prior = existing.get(&rel);
+
+        // Cheap hash-tree node check: same mtime + size ⇒ assume
+        // unchanged and skip the file read, blake3 AND tree-sitter
+        // parse entirely (the dominant cost on a clean resync).
+        if !force && prior.is_some_and(|st| st.mtime == mtime && st.size == size) {
+            return (rel, None);
+        }
+
+        let Some(content) = Self::read_text(path) else {
+            return (rel, None);
+        };
+        let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+        // mtime/size moved but bytes are identical (touch, checkout):
+        // nothing to embed, but the caller still marks it seen.
+        if !force && prior.is_some_and(|st| st.hash == hash) {
+            return (rel, None);
+        }
+        let (lang, chunks) = self.chunker.chunk_file(path, &content);
+        if chunks.is_empty() {
+            return (rel, None);
+        }
+        let rel2 = rel.clone();
+        (
+            rel,
+            Some(FileWork {
+                rel: rel2,
+                mtime,
+                size,
+                hash,
+                lang,
+                chunks,
+            }),
+        )
+    }
+
+    /// Full incremental sync. `progress` receives per-file events.
+    pub fn sync<F: FnMut(SyncEvent<'_>)>(&self, force: bool, mut progress: F) -> Result<SyncStats> {
+        let started = Instant::now();
+        let mut stats = SyncStats::default();
+
+        let files = self.collect_files();
+        progress(SyncEvent::Scanned(files.len()));
+
+        let existing = self.db.lock().unwrap().file_states()?;
+
+        // Bounded windows cap peak memory at O(window) chunked files,
+        // not O(repo). Window order is preserved so vector-id allocation
+        // stays deterministic. `self.pool` (private, not the global
+        // pool) bounds CPU to `sync_threads`.
+        use rayon::prelude::*;
+        let batch_chunks = self.config.sync.embed_batch_size.max(1);
+        let batch_bytes = self.config.sync.embed_batch_bytes.max(4096);
+        let window = self.config.sync.scan_window.max(1);
+        let mut group: Vec<FileWork> = Vec::new();
+        let mut pending_chunks = 0usize;
+        let mut pending_bytes = 0usize;
+
+        let total = files.len();
+        let mut seen: HashSet<String> = HashSet::with_capacity(total);
+        let mut done = 0usize;
+        let mut discovered = 0usize;
+        for win in files.chunks(window) {
+            let classified: Vec<(String, Option<FileWork>)> = self.pool.install(|| {
+                win.par_iter()
+                    .map(|p| self.classify(p, &existing, force))
+                    .collect()
+            });
+
+            for (rel, work) in classified {
+                done += 1;
+                let changed = work.is_some();
+                match work {
+                    None => stats.files_skipped += 1,
+                    Some(work) => {
+                        pending_chunks += work.chunks.len();
+                        pending_bytes += work.chunks.iter().map(|c| c.content.len()).sum::<usize>();
+                        discovered += work.chunks.len();
+                        group.push(work);
+                        stats.files_indexed += 1;
+                    }
+                }
+                // Emit after classifying so `changed`/`indexed` are
+                // accurate: the bar can fix its message on the file
+                // actually re-embedded, not flicker through skips.
+                progress(SyncEvent::File {
+                    done,
+                    total,
+                    path: &rel,
+                    indexed: stats.files_indexed,
+                    changed,
+                });
+                seen.insert(rel);
+
+                if pending_chunks >= batch_chunks || pending_bytes >= batch_bytes {
+                    stats.chunks_total += self.flush_group(std::mem::take(&mut group))?;
+                    pending_chunks = 0;
+                    pending_bytes = 0;
+                    progress(SyncEvent::Chunks {
+                        embedded: stats.chunks_total,
+                        discovered,
+                    });
+                }
+            }
+        }
+        stats.chunks_total += self.flush_group(group)?;
+        progress(SyncEvent::Chunks {
+            embedded: stats.chunks_total,
+            discovered,
+        });
+
+        let to_delete: Vec<String> = existing
+            .keys()
+            .filter(|p| !seen.contains(*p))
+            .cloned()
+            .collect();
+        for rel in to_delete {
+            self.purge(&rel)?;
+            stats.files_deleted += 1;
+        }
+
+        let changed = stats.files_indexed > 0 || stats.files_deleted > 0;
+        self.finalize(changed)?;
+        stats.elapsed_ms = started.elapsed().as_millis() as u64;
+        Ok(stats)
+    }
+
+    /// True only if the index was never built. A startup sync runs
+    /// unconditionally regardless (it is hash-incremental and cheap);
+    /// this just reports health.
+    pub fn is_stale(&self) -> Result<bool> {
+        let last = self.db.lock().unwrap().get_meta("last_sync_at")?;
+        Ok(never_synced(last.as_deref()))
+    }
+
+    /// CLI-side throttle check (Cursor ~10 min): has it been longer than
+    /// `resync_interval_minutes` since the last sync? The MCP server
+    /// does not call this — it runs its own periodic background resync
+    /// on the same interval plus a startup sync.
+    pub fn is_due(&self) -> Result<bool> {
+        let last = self.db.lock().unwrap().get_meta("last_sync_at")?;
+        Ok(resync_due(
+            last.as_deref(),
+            self.config.sync.resync_interval_minutes,
+        ))
+    }
+
+    pub fn status(&self) -> Result<IndexStatus> {
+        let db = self.db.lock().unwrap();
+        let (files, chunks) = db.counts()?;
+        let last = db.get_meta("last_sync_at")?;
+        let merkle_root = db.get_meta("merkle_root")?;
+        drop(db);
+        Ok(IndexStatus::assemble(
+            files,
+            chunks,
+            self.vector.lock().unwrap().len(),
+            self.embedder.model_name.clone(),
+            last,
+            merkle_root,
+            &self.config,
+        ))
+    }
+
+    /// `scope`: optional project-relative dir or file to restrict
+    /// results to (Cursor `@folder` / `@file`).
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<crate::search::SearchResult>> {
+        crate::search::run(self, query, limit, scope)
+    }
+
+    /// Small index ⇒ exact brute-force search (HNSW heuristic buys
+    /// nothing and can miss the true nearest at this scale).
+    pub(crate) fn use_exact(&self) -> bool {
+        self.vector.lock().unwrap().len() < self.config.search.exact_below
+    }
+
+    pub(crate) fn embedder(&self) -> &Embedder {
+        &self.embedder
+    }
+
+    pub(crate) fn with_vector<R>(&self, f: impl FnOnce(&VectorIndex) -> R) -> R {
+        f(&self.vector.lock().unwrap())
+    }
+
+    pub(crate) fn with_db<R>(&self, f: impl FnOnce(&Db) -> Result<R>) -> Result<R> {
+        f(&self.db.lock().unwrap())
+    }
+
+    pub fn list_files(&self) -> Result<Vec<crate::db::FileInfo>> {
+        self.db.lock().unwrap().list_files()
+    }
+
+    pub fn chunks_for_file(&self, rel: &str) -> Result<Vec<crate::db::ChunkRow>> {
+        self.db.lock().unwrap().chunks_for_file(rel)
+    }
+}

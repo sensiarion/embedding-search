@@ -1,0 +1,4 @@
+[toolchain]
+# Concrete pin for reproducible builds; rustup auto-installs on use.
+channel = "1.94.0"
+components = ["clippy", "rustfmt"]

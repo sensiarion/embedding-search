@@ -1,0 +1,51 @@
+[workspace]
+members = ["crates/core", "crates/cli", "xtask"]
+default-members = ["crates/core", "crates/cli"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+version = "0.1.0"
+license = "MIT"
+authors = ["sensiarion"]
+repository = "https://github.com/sensiarion/embedding-search"
+
+[workspace.dependencies]
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-std", "sync", "fs", "process", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+blake3 = "1.8"
+dirs = "6"
+ignore = "0.4"
+rayon = "1.12"
+chrono = { version = "0.4", features = ["serde"] }
+rmcp = { version = "1.7", features = ["server", "transport-io", "macros", "schemars"] }
+schemars = "1"
+clap = { version = "4.6", features = ["derive", "color", "env"] }
+indicatif = "0.18"
+rusqlite = { version = "0.39", features = ["bundled"] }
+ureq = { version = "3", features = ["json"] }
+fastembed = "5.13"
+usearch = "2.25"
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+
+embedding-search-core = { path = "crates/core" }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
