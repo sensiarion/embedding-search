@@ -105,6 +105,10 @@ fn hf_repo(repo: &str, cache_dir: &Path) -> Result<(String, hf_hub::api::sync::A
     let api = hf_hub::api::sync::ApiBuilder::new()
         .with_cache_dir(cache_dir.to_path_buf())
         .with_progress(true)
+        // hf-hub defaults to 0 retries: a single transient HTTP
+        // timeout (slow link, big model/tokenizer file) then aborts
+        // the whole load. Retry with backoff instead.
+        .with_retries(4)
         .build()
         .map_err(|e| Error::Embed(format!("hf-hub: {e}")))?;
     let r = api.model(repo.clone());

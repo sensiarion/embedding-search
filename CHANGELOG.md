@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+- Fix: a single transient HTTP timeout while downloading a model
+  (large weights/tokenizer on a slow link) aborted the whole load.
+  Model fetches now retry with backoff.
+
 ## 0.2.1
 
 - Fix: indexing panicked ("byte index N is not a char boundary") on
