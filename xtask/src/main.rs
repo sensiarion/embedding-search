@@ -184,6 +184,70 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Set the release version everywhere it is hand-duplicated, so the
+/// plugin's pinned mcp-bin tag never drifts from the crate version (a
+/// bare/`@latest` spec is cached forever by mcp-bin → plugin updates
+/// would keep the old binary). Single command: `cargo xtask bump X`.
+fn bump(new: &str) -> Result<()> {
+    // xtask's manifest dir is `<root>/xtask`; its parent is the root.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("workspace root")?
+        .to_path_buf();
+    let cargo = std::fs::read_to_string(root.join("Cargo.toml"))?;
+    // Anchor on a leading newline so `rust-version = "` (which
+    // contains the substring `version = "`) cannot match.
+    let old = cargo
+        .split("[workspace.package]")
+        .nth(1)
+        .and_then(|s| s.split("\nversion = \"").nth(1))
+        .and_then(|s| s.split('"').next())
+        .context("workspace.package version not found")?
+        .to_string();
+    if old == new {
+        println!("already {new}");
+        return Ok(());
+    }
+    let edit = |rel: &str, from: String, to: String| -> Result<()> {
+        let p = root.join(rel);
+        let c = std::fs::read_to_string(&p)?;
+        if !c.contains(&from) {
+            anyhow::bail!("pattern not found in {rel}: {from}");
+        }
+        std::fs::write(&p, c.replace(&from, &to)).context(rel.to_string())
+    };
+    // workspace crate version (anchored by the following `license` line
+    // so workspace.dependencies versions can't match)
+    edit(
+        "Cargo.toml",
+        format!("version = \"{old}\"\nlicense"),
+        format!("version = \"{new}\"\nlicense"),
+    )?;
+    // MCP server handshake version (attribute arg must be a literal)
+    edit(
+        "crates/cli/src/mcp.rs",
+        format!("version = \"{old}\")]"),
+        format!("version = \"{new}\")]"),
+    )?;
+    // plugin manifest version + its pinned mcp-bin release tag
+    edit(
+        ".claude-plugin/plugin.json",
+        format!("\"version\": \"{old}\""),
+        format!("\"version\": \"{new}\""),
+    )?;
+    edit(
+        ".claude-plugin/plugin.json",
+        format!("sensiarion/embedding-search@v{old}"),
+        format!("sensiarion/embedding-search@v{new}"),
+    )?;
+    println!(
+        "bumped {old} -> {new} (Cargo.toml, mcp.rs, plugin.json version + \
+         mcp-bin tag).\nnext: add CHANGELOG.md entry, `cargo build` (lock), \
+         commit, `git tag -a v{new}`"
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
@@ -196,8 +260,15 @@ fn main() -> Result<()> {
             println!("generated {n} files in {out}");
         }
         "bench" => bench(files, seed)?,
+        "bump" => {
+            let v = args.get(1).context("usage: cargo xtask bump <version>")?;
+            bump(v)?;
+        }
         _ => {
-            eprintln!("usage: cargo xtask <gen-corpus|bench> [--files N] [--seed S] [--out DIR]");
+            eprintln!(
+                "usage: cargo xtask <gen-corpus|bench|bump> \
+                 [--files N] [--seed S] [--out DIR]"
+            );
             std::process::exit(2);
         }
     }
