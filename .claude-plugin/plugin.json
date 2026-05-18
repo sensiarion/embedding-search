@@ -1,6 +1,6 @@
 {
   "name": "embedding-search-autouse",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Auto-directs Claude to prefer the embedding-search MCP (semantic code search) over grep/find for conceptual lookups, every session and every turn.",
   "author": {
     "name": "sensiarion",
@@ -9,7 +9,7 @@
   "mcpServers": {
     "embedding-search": {
       "command": "npx",
-      "args": ["-y", "mcp-bin", "sensiarion/embedding-search@v0.2.2", "--mcp"],
+      "args": ["-y", "mcp-bin", "sensiarion/embedding-search@v0.2.3", "--mcp"],
       "env": { "RUST_LOG": "warn" }
     }
   },

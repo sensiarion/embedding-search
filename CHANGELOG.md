@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3
+
+- Fix: decoder-LLM embedding repos exported with a KV-cache graph
+  (e.g. `onnx-community/Qwen3-Embedding-*`) failed late with a cryptic
+  ONNX "Missing Input: past_key_values" error after a multi-GB
+  download. They are now detected from the small graph file and
+  rejected up front with an actionable message (use an
+  encoder/embedding export, a built-in, or a remote endpoint).
+
 ## 0.2.2
 
 - Fix: a single transient HTTP timeout while downloading a model

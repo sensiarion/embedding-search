@@ -337,6 +337,17 @@ fn try_model2vec(repo: &str, cache_dir: &Path) -> Result<Option<StaticModel2Vec>
     }
 }
 
+/// A with-KV-cache decoder ONNX graph names its inputs
+/// `past_key_values.<n>.{key,value}`, present as plain protobuf
+/// strings in the (small) graph file — so this is detectable before
+/// the multi-GB `.onnx_data` download. Such exports need
+/// `past_key_values` inputs the encoder embedding feed never supplies.
+#[cfg(not(feature = "bench-stub"))]
+fn is_kv_cache_decoder(onnx: &[u8]) -> bool {
+    const M: &[u8] = b"past_key_values";
+    onnx.windows(M.len()).any(|w| w == M)
+}
+
 /// Download (cached) the chosen ONNX + tokenizer files from the HF
 /// repo. `explicit` pins an exact file; else the precision mapping.
 #[cfg(not(feature = "bench-stub"))]
@@ -405,6 +416,23 @@ fn load_user_defined(
                 candidates.join(", ")
             ))
         })?;
+    // Decoder/KV-cache export guard. onnx-community exports
+    // decoder-LLM embedders (Qwen3-Embedding, etc.) as a with-past
+    // graph that requires `past_key_values.*` inputs the encoder
+    // embedding pipeline never supplies → a cryptic ORT "Missing
+    // Input: past_key_values.0.value" at the probe. The graph `.onnx`
+    // (here, before the multi-GB `.onnx_data`) carries those input
+    // names as plain protobuf strings — reject up front instead.
+    if is_kv_cache_decoder(&onnx) {
+        return Err(Error::Embed(format!(
+            "HF repo '{repo}': '{model_file}' is a decoder export with \
+             KV-cache inputs (past_key_values) — it cannot run as a \
+             sentence embedder via this pipeline. Use an encoder/embedding \
+             ONNX export, a built-in (`models list`), or a remote \
+             OpenAI-compatible endpoint (`models add-remote`)."
+        )));
+    }
+
     // External-data sidecar (onnx-community / >2 GB models): the graph
     // references its weights by basename (`model_fp16.onnx_data`). Fetch
     // it next to the `.onnx`; absent ⇒ a self-contained model, fine.
@@ -996,6 +1024,17 @@ mod tests {
         assert!(assert_loadable_embedding("r", mixed).is_ok());
         assert!(assert_loadable_embedding("r", b"not json").is_ok());
         assert!(assert_loadable_embedding("r", b"{}").is_ok());
+    }
+
+    #[test]
+    fn is_kv_cache_decoder_detects_past_key_values() {
+        assert!(is_kv_cache_decoder(
+            b"...graph...present_key_values...past_key_values.0.key...input_ids..."
+        ));
+        assert!(!is_kv_cache_decoder(
+            b"input_ids attention_mask token_type_ids last_hidden_state"
+        ));
+        assert!(!is_kv_cache_decoder(b""));
     }
 
     #[test]
