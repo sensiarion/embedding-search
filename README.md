@@ -429,6 +429,35 @@ cargo build --release
 # one binary: target/release/embedding-search (CLI; `--mcp` runs the server)
 ```
 
+## Releasing (maintainers / agents)
+
+The version is hand-duplicated in several places; **never edit them
+individually** — run one command, which keeps them in lockstep:
+
+```
+cargo xtask bump 0.3.0     # Cargo.toml + mcp.rs handshake +
+                           # .claude-plugin/plugin.json "version"
+                           # AND its pinned mcp-bin tag
+# then:
+#  1. add a CHANGELOG.md entry (BREAKING: prefix if applicable)
+#  2. cargo build            # refreshes Cargo.lock
+#  3. commit, git tag -a v0.3.0 -m v0.3.0
+#  4. git push origin main && git push origin v0.3.0
+```
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`
+(cargo-dist): builds macOS arm64 + Linux x64/arm64 tarballs and
+publishes the GitHub release. mcp-bin downloads from there.
+
+**Why the plugin pins a tag — do not change back to a bare/`@latest`
+spec.** mcp-bin caches a bare `owner/repo` (or `@latest`, which 404s)
+as the resolved release *forever*, so a `claude plugin update` would
+keep running the old MCP binary. `.claude-plugin/plugin.json` therefore
+pins `sensiarion/embedding-search@v<version>`; `cargo xtask bump`
+advances that tag with the crate version so an updated plugin pulls
+the matching server. (Standalone `claude mcp add` / OpenCode users on
+the bare spec refresh with `npx mcp-bin expire sensiarion/embedding-search`.)
+
 
 ## TODO
 
