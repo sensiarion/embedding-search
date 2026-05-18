@@ -9,9 +9,11 @@ use {
         InitOptions, InitOptionsUserDefined, Pooling, TokenizerFiles, UserDefinedEmbeddingModel,
     },
     rayon::prelude::*,
+    safetensors::SafeTensors,
     serde::Deserialize,
     std::path::Path,
     std::time::Duration,
+    tokenizers::Tokenizer,
 };
 
 enum Backend {
@@ -20,6 +22,11 @@ enum Backend {
     Local(Option<Mutex<TextEmbedding>>),
     #[cfg(not(feature = "bench-stub"))]
     Remote(RemoteEmbedder),
+    /// Model2Vec / `StaticModel`: a static token-embedding matrix +
+    /// tokenizer, mean-pooled (+ optional L2). No transformer/ONNX —
+    /// its own tiny inference path.
+    #[cfg(not(feature = "bench-stub"))]
+    Static(StaticModel2Vec),
 }
 
 pub struct Embedder {
@@ -86,6 +93,36 @@ fn read(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(Error::Io)
 }
 
+/// Normalized repo id + a cached hf-hub handle. Single source of the
+/// `ApiBuilder` setup shared by the ONNX (`load_user_defined`) and
+/// Model2Vec routes. Callers build the trivial `fetch` closure from
+/// `r` (it must borrow `r`, so it can't be returned here).
+#[cfg(not(feature = "bench-stub"))]
+fn hf_repo(repo: &str, cache_dir: &Path) -> Result<(String, hf_hub::api::sync::ApiRepo)> {
+    // Defensive: a pre-existing config / copy-pasted browser URL may
+    // hold a full HF URL where an id is expected.
+    let repo = crate::config::normalize_hf_repo(repo);
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_cache_dir(cache_dir.to_path_buf())
+        .with_progress(true)
+        .build()
+        .map_err(|e| Error::Embed(format!("hf-hub: {e}")))?;
+    let r = api.model(repo.clone());
+    Ok((repo, r))
+}
+
+/// External-data sidecar candidates for an ONNX file `mf` (repo- or
+/// dir-relative). Pairs of `(relative path to fetch, basename the
+/// graph references)`. ONNX external data is keyed by basename, so a
+/// `.onnx` in an `onnx/` subdir still points at `model.onnx_data`.
+#[cfg(not(feature = "bench-stub"))]
+fn onnx_data_sidecars(mf: &str) -> [(String, String); 2] {
+    [format!("{mf}_data"), format!("{mf}.data")].map(|rel| {
+        let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        (rel, name)
+    })
+}
+
 /// Assemble a user-defined model: `onnx` is the model bytes,
 /// `fetch_tok` supplies the four tokenizer files by name (hf-hub cache
 /// or a local dir). Single source of the tokenizer file set + pooling.
@@ -93,6 +130,7 @@ fn read(path: &Path) -> Result<Vec<u8>> {
 fn user_defined_from(
     onnx: Vec<u8>,
     fetch_tok: impl Fn(&str) -> Result<Vec<u8>>,
+    externals: Vec<(String, Vec<u8>)>,
 ) -> Result<UserDefinedEmbeddingModel> {
     let tok = TokenizerFiles {
         tokenizer_file: fetch_tok("tokenizer.json")?,
@@ -100,31 +138,278 @@ fn user_defined_from(
         special_tokens_map_file: fetch_tok("special_tokens_map.json")?,
         tokenizer_config_file: fetch_tok("tokenizer_config.json")?,
     };
-    Ok(UserDefinedEmbeddingModel::new(onnx, tok).with_pooling(Pooling::Mean))
+    let mut m = UserDefinedEmbeddingModel::new(onnx, tok).with_pooling(Pooling::Mean);
+    // ONNX external-data: the `.onnx` is just the graph; weights live in
+    // a sibling file the model references by name (onnx-community /
+    // models >2 GB). fastembed loads it in-memory by matching this name.
+    for (name, buf) in externals {
+        m = m.with_external_initializer(name, buf);
+    }
+    Ok(m)
 }
 
-/// Download (cached) the precision-specific ONNX + tokenizer files from
-/// the HF repo so fp16/int8 works.
+/// Repo-relative ONNX candidates, first match wins. `explicit` (an
+/// exact file like `model_q4f16.onnx`) overrides the precision→file
+/// mapping; a bare name is also tried under `onnx/`.
 #[cfg(not(feature = "bench-stub"))]
-fn load_user_defined(
+fn onnx_candidates(precision: Precision, explicit: Option<&str>) -> Vec<String> {
+    match explicit {
+        Some(f) if f.contains('/') => vec![f.to_string()],
+        Some(f) => vec![f.to_string(), format!("onnx/{f}")],
+        None => vec![
+            precision.onnx_file().to_string(),
+            "onnx/model.onnx".to_string(),
+            "model.onnx".to_string(),
+            "onnx/model_quantized.onnx".to_string(),
+        ],
+    }
+}
+
+/// `Some(normalize)` if `config.json` is a Model2Vec / `StaticModel`
+/// (routed to the static backend, not fastembed) — carrying its
+/// `normalize` flag so the route parses config.json exactly once.
+/// `None` ⇒ not Model2Vec. Defaults `normalize` to true (the
+/// `potion-*` / `StaticEmbedding`+`Normalize` common case).
+#[cfg(not(feature = "bench-stub"))]
+fn model2vec_normalize(config_json: &[u8]) -> Option<bool> {
+    let v = serde_json::from_slice::<serde_json::Value>(config_json).ok()?;
+    let is_m2v = v.get("model_type").and_then(|m| m.as_str()) == Some("model2vec")
+        || v.get("architectures")
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("StaticModel")));
+    is_m2v.then(|| v.get("normalize").and_then(|n| n.as_bool()).unwrap_or(true))
+}
+
+/// Reject LM-head ONNX exports (transformer path only), from
+/// `config.json`, *before* downloading weights: `*ForMaskedLM/
+/// CausalLM/PreTraining` / `*LMHead*` output vocab logits, not
+/// embeddings, and ALiBi long-context ones OOM at tens of GB from a
+/// baked `[heads, ctx, ctx]` bias. Unparseable/odd config → allow
+/// (don't block on a heuristic). Model2Vec is handled separately
+/// (`model2vec_normalize`), not rejected.
+#[cfg(not(feature = "bench-stub"))]
+fn assert_loadable_embedding(repo: &str, config_json: &[u8]) -> Result<()> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(config_json) else {
+        return Ok(());
+    };
+    let names: Vec<&str> = v
+        .get("architectures")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+
+    let bad = |n: &str| {
+        n.ends_with("ForMaskedLM")
+            || n.ends_with("ForCausalLM")
+            || n.ends_with("ForPreTraining")
+            || n.contains("LMHead")
+    };
+    if !names.is_empty() && names.iter().all(|n| bad(n)) {
+        return Err(Error::Embed(format!(
+            "HF repo '{repo}': its ONNX is a language-model head ({}), not a \
+             sentence-embedding model — pooling its vocab logits is not an \
+             embedding and these exports (ALiBi/long-context) consume tens \
+             of GB of RAM. Use an embedding export, or the built-in \
+             `jinaai/jina-embeddings-v2-base-code` (models set-default).",
+            names.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Model2Vec / `StaticModel`: a `[vocab, dim]` static token-embedding
+/// matrix + tokenizer. `embed` = tokenize → mean of the token rows →
+/// optional L2 (per the model's `Normalize` module / `config.json`).
+/// No transformer, no ONNX — that is the whole model.
+#[cfg(not(feature = "bench-stub"))]
+struct StaticModel2Vec {
+    emb: Vec<f32>,
+    vocab: usize,
+    dim: usize,
+    tok: Tokenizer,
+    normalize: bool,
+}
+
+#[cfg(not(feature = "bench-stub"))]
+impl StaticModel2Vec {
+    fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        let enc = self
+            .tok
+            .encode(text, false)
+            .map_err(|e| Error::Embed(format!("model2vec tokenize: {e}")))?;
+        let mut acc = vec![0.0f32; self.dim];
+        let mut n = 0usize;
+        for &id in enc.get_ids() {
+            let i = id as usize;
+            if i >= self.vocab {
+                continue;
+            }
+            let row = &self.emb[i * self.dim..(i + 1) * self.dim];
+            for (a, r) in acc.iter_mut().zip(row) {
+                *a += r;
+            }
+            n += 1;
+        }
+        // No in-vocab tokens (empty/all-OOB chunk) → a zero vector: a
+        // deliberate degenerate fallback (cosine-neutral) rather than
+        // an error, so one odd chunk never fails a whole sync.
+        if n > 0 {
+            let inv = 1.0 / n as f32;
+            for a in &mut acc {
+                *a *= inv;
+            }
+        }
+        if self.normalize {
+            let norm = acc.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for a in &mut acc {
+                    *a /= norm;
+                }
+            }
+        }
+        Ok(acc)
+    }
+}
+
+/// Download (cached) the Model2Vec matrix + tokenizer from the HF repo
+/// and build the static embedder. `fetch` is the shared hf-hub getter.
+#[cfg(not(feature = "bench-stub"))]
+fn load_model2vec(
     repo: &str,
-    precision: Precision,
-    cache_dir: &Path,
-) -> Result<UserDefinedEmbeddingModel> {
-    let api = hf_hub::api::sync::ApiBuilder::new()
-        .with_cache_dir(cache_dir.to_path_buf())
-        .with_progress(true)
-        .build()
-        .map_err(|e| Error::Embed(format!("hf-hub: {e}")))?;
-    let r = api.model(repo.to_string());
+    normalize: bool,
+    fetch: impl Fn(&str) -> Result<Vec<u8>>,
+) -> Result<StaticModel2Vec> {
+    let st_bytes = fetch("model.safetensors")?;
+    let st = SafeTensors::deserialize(&st_bytes)
+        .map_err(|e| Error::Embed(format!("model2vec '{repo}': bad safetensors: {e}")))?;
+    let t = st
+        .tensor("embeddings")
+        .map_err(|e| Error::Embed(format!("model2vec '{repo}': no `embeddings` tensor: {e}")))?;
+    let [vocab, dim] = *t.shape() else {
+        return Err(Error::Embed(format!(
+            "model2vec '{repo}': embeddings must be 2-D [vocab, dim], got {:?}",
+            t.shape()
+        )));
+    };
+    if t.dtype() != safetensors::Dtype::F32 {
+        return Err(Error::Embed(format!(
+            "model2vec '{repo}': embeddings dtype {:?} unsupported (need F32)",
+            t.dtype()
+        )));
+    }
+    // safetensors slice is little-endian f32, contiguous [vocab, dim].
+    let raw = t.data();
+    let emb: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let tok = Tokenizer::from_bytes(fetch("tokenizer.json")?)
+        .map_err(|e| Error::Embed(format!("model2vec '{repo}': tokenizer: {e}")))?;
+    Ok(StaticModel2Vec {
+        emb,
+        vocab,
+        dim,
+        tok,
+        normalize,
+    })
+}
+
+/// Route an HF repo: `Some(static model)` if its `config.json` is
+/// Model2Vec, else `None` (caller falls back to the ONNX path).
+/// config.json is parsed exactly once here. Shared by the custom and
+/// built-in repo paths so a Model2Vec built-in default works too.
+#[cfg(not(feature = "bench-stub"))]
+fn try_model2vec(repo: &str, cache_dir: &Path) -> Result<Option<StaticModel2Vec>> {
+    let (repo_n, r) = hf_repo(repo, cache_dir)?;
     let fetch = |f: &str| -> Result<Vec<u8>> {
         let p = r
             .get(f)
             .map_err(|e| Error::Embed(format!("hf-hub get {f}: {e}")))?;
         read(&p)
     };
-    let onnx = fetch(precision.onnx_file())?;
-    user_defined_from(onnx, fetch)
+    match model2vec_normalize(&fetch("config.json")?) {
+        Some(normalize) => Ok(Some(load_model2vec(&repo_n, normalize, fetch)?)),
+        None => Ok(None),
+    }
+}
+
+/// Download (cached) the chosen ONNX + tokenizer files from the HF
+/// repo. `explicit` pins an exact file; else the precision mapping.
+#[cfg(not(feature = "bench-stub"))]
+fn load_user_defined(
+    repo: &str,
+    precision: Precision,
+    cache_dir: &Path,
+    explicit: Option<&str>,
+) -> Result<UserDefinedEmbeddingModel> {
+    let (repo, r) = hf_repo(repo, cache_dir)?;
+    let fetch = |f: &str| -> Result<Vec<u8>> {
+        let p = r
+            .get(f)
+            .map_err(|e| Error::Embed(format!("hf-hub get {f}: {e}")))?;
+        read(&p)
+    };
+    // One repo file listing (single request) so we fetch only files
+    // that exist — no speculative 404 round-trips for the common
+    // single-file model on every process start. If the API is
+    // unreachable (offline) `present` is permissive so a fully-cached
+    // model still loads via the prior speculative behavior.
+    let listing: Option<Vec<String>> = r
+        .info()
+        .ok()
+        .map(|i| i.siblings.into_iter().map(|s| s.rfilename).collect());
+    let present = |f: &str| listing.as_ref().is_none_or(|l| l.iter().any(|x| x == f));
+
+    // Reject wrong-head exports up front — before downloading the
+    // (often >600 MB) weights — since an MLM/LM-head repo is unusable
+    // as an embedder and ALiBi-MLM ones OOM at ~15 GB. config.json is
+    // tiny and a required tokenizer file anyway.
+    if present("config.json") {
+        assert_loadable_embedding(&repo, &fetch("config.json")?)?;
+    }
+
+    // Explicit file (if any) overrides the precision mapping; first
+    // present candidate that fetches wins; all-miss → one actionable
+    // error. Many repos ship only `onnx/model.onnx` or flat
+    // `model.onnx`, so the precision path also falls back.
+    let candidates = onnx_candidates(precision, explicit);
+    let (model_file, onnx) = candidates
+        .iter()
+        .filter(|f| present(f))
+        .find_map(|f| fetch(f).ok().map(|b| (f.clone(), b)))
+        .ok_or_else(|| {
+            // Surface the repo's actual `.onnx` files so a wrong
+            // --onnx-file / unmapped precision is a pick-from-this list,
+            // not a dead end. (Listing absent only when offline.)
+            let avail = listing.as_ref().map(|l| {
+                let mut v: Vec<&str> = l
+                    .iter()
+                    .filter(|f| f.ends_with(".onnx"))
+                    .map(String::as_str)
+                    .collect();
+                v.sort_unstable();
+                v.join(", ")
+            });
+            let hint = match avail.as_deref() {
+                Some(a) if !a.is_empty() => format!(" Available in repo: {a}."),
+                _ => String::new(),
+            };
+            Error::Embed(format!(
+                "HF repo '{repo}': no ONNX weights found (looked for {}).{hint} \
+                 The repo must also contain tokenizer.json, config.json, \
+                 special_tokens_map.json, tokenizer_config.json.",
+                candidates.join(", ")
+            ))
+        })?;
+    // External-data sidecar (onnx-community / >2 GB models): the graph
+    // references its weights by basename (`model_fp16.onnx_data`). Fetch
+    // it next to the `.onnx`; absent ⇒ a self-contained model, fine.
+    let externals = onnx_data_sidecars(&model_file)
+        .into_iter()
+        .filter(|(rel, _)| present(rel))
+        .find_map(|(rel, name)| Some(vec![(name, fetch(&rel).ok()?)]))
+        .unwrap_or_default();
+    user_defined_from(onnx, fetch, externals)
 }
 
 /// Resolve a user `onnx_path` (file or directory) to the actual model
@@ -172,11 +457,30 @@ fn resolve_onnx(
 }
 
 /// Filesystem-safe slug for a custom-model cache subdir.
-#[cfg(not(feature = "bench-stub"))]
 fn slug(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+/// On-disk cache directory holding a registered custom model's weights
+/// (`models remove` deletes it). Same naming as where they are written:
+/// hf-hub's `models--{repo}` for `--repo`, our `url/<slug>` for `--url`.
+/// `None` for a repo-less/url-less (malformed) entry. The repo is
+/// normalized so it matches what the loader actually fetched. Not
+/// gated on `bench-stub`: the CLI `models remove` needs it regardless.
+pub fn custom_model_cache_dir(
+    cache_dir: &std::path::Path,
+    cm: &crate::config::CustomModel,
+) -> Option<std::path::PathBuf> {
+    if let Some(repo) = &cm.repo {
+        let repo = crate::config::normalize_hf_repo(repo);
+        Some(cache_dir.join(format!("models--{repo}").replace('/', "--")))
+    } else if cm.url.is_some() {
+        Some(cache_dir.join("url").join(slug(&cm.name)))
+    } else {
+        None
+    }
 }
 
 /// A ureq agent with a global timeout — the single place HTTP client
@@ -244,7 +548,7 @@ fn load_url_user_defined(
     let onnx = fetch(file, "model.onnx")?;
     let digest = blake3::hash(&onnx).to_hex();
     let model_name = format!("custom:{name}#{}", &digest[..16]);
-    let udm = user_defined_from(onnx, |f| fetch(f, f))?;
+    let udm = user_defined_from(onnx, |f| fetch(f, f), Vec::new())?;
     Ok((udm, model_name))
 }
 
@@ -261,7 +565,18 @@ fn load_local_user_defined(
     let onnx = read(&onnx_path)?;
     let digest = blake3::hash(&onnx).to_hex();
     let name = format!("custom:{}#{}", onnx_path.display(), &digest[..16]);
-    let udm = user_defined_from(onnx, |f| read(&dir.join(f)))?;
+    // External-data sidecar next to the `.onnx` (same split as the HF
+    // path): a self-contained model simply has none.
+    let parent = onnx_path.parent().unwrap_or(Path::new("."));
+    let mf = onnx_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model.onnx");
+    let externals = onnx_data_sidecars(mf)
+        .into_iter()
+        .find_map(|(rel, name)| Some(vec![(name, read(&parent.join(&rel)).ok()?)]))
+        .unwrap_or_default();
+    let udm = user_defined_from(onnx, |f| read(&dir.join(f)), externals)?;
     Ok((udm, name))
 }
 
@@ -411,21 +726,34 @@ impl Embedder {
         if let Some(cm) = cfg.custom_model() {
             let (udm, name) = match (&cm.repo, &cm.url) {
                 (Some(repo), None) => {
-                    let udm =
-                        load_user_defined(repo, cfg.model.precision, &cache_dir).map_err(|e| {
-                            Error::Embed(format!(
-                                "custom model '{}' (repo {repo}): {e}. The HF repo must \
-                                 contain the ONNX weights ({}) plus tokenizer.json, \
-                                 config.json, special_tokens_map.json, \
-                                 tokenizer_config.json.",
-                                cm.name,
-                                cfg.model.precision.onnx_file()
-                            ))
-                        })?;
-                    (
-                        udm,
-                        format!("custom:{repo}@{}", cfg.model.precision.label()),
-                    )
+                    // Model2Vec → static backend; else the ONNX path.
+                    if let Some(sm) = try_model2vec(repo, &cache_dir)? {
+                        return Ok(Self {
+                            dimensions: sm.dim,
+                            model_name: format!(
+                                "model2vec:{}",
+                                crate::config::normalize_hf_repo(repo)
+                            ),
+                            is_e5: false,
+                            backend: Backend::Static(sm),
+                        });
+                    }
+                    // Per-model precision overrides the global one (so a
+                    // big model can be int8 without changing the rest);
+                    // an explicit `onnx_file` overrides precision.
+                    let precision = cm.precision.unwrap_or(cfg.model.precision);
+                    let explicit = cm.onnx_file.as_deref();
+                    // `load_user_defined`'s error already names the repo
+                    // and every path tried; the CLI adds the model-name
+                    // context — no extra wrap (avoids a nested prefix).
+                    let udm = load_user_defined(repo, precision, &cache_dir, explicit)?;
+                    // The identity (→ index fingerprint) tracks the
+                    // actual weights pulled: the exact file, else the
+                    // precision label.
+                    let tag = explicit
+                        .map(|f| format!("#{f}"))
+                        .unwrap_or_else(|| format!("@{}", precision.label()));
+                    (udm, format!("custom:{repo}{tag}"))
                 }
                 (None, Some(url)) => load_url_user_defined(&cm.name, url, &cache_dir)?,
                 (Some(_), Some(_)) => {
@@ -446,10 +774,25 @@ impl Embedder {
 
         let spec = cfg.model_spec()?;
 
+        // Built-in Model2Vec (e.g. the default potion-*): the static
+        // backend, same routing as a custom repo.
+        if spec.static_model {
+            if let Some(repo) = spec.hf_repo {
+                if let Some(sm) = try_model2vec(repo, &cache_dir)? {
+                    return Ok(Self {
+                        dimensions: sm.dim,
+                        model_name: spec.name.to_string(),
+                        is_e5: spec.needs_e5_prefix,
+                        backend: Backend::Static(sm),
+                    });
+                }
+            }
+        }
+
         let model = match (&spec.hf_repo, &spec.fastembed) {
             (Some(repo), _) => {
                 let precision = spec.effective_precision(cfg.model.precision);
-                let udm = load_user_defined(repo, precision, &cache_dir)?;
+                let udm = load_user_defined(repo, precision, &cache_dir, None)?;
                 build_user_defined(udm, cfg)?
             }
             (None, Some(model)) => {
@@ -557,6 +900,11 @@ impl Embedder {
             Backend::Local(None) => Err(Error::Embed("embedder not initialized".into())),
             #[cfg(not(feature = "bench-stub"))]
             Backend::Remote(r) => r.embed_documents(&texts),
+            #[cfg(not(feature = "bench-stub"))]
+            // Pure CPU, no shared state, no internal batching — embed
+            // the group in parallel (the ONNX/remote backends batch
+            // internally; this is the equivalent for static models).
+            Backend::Static(s) => texts.par_iter().map(|t| s.embed_one(t)).collect(),
         }
     }
 
@@ -589,6 +937,87 @@ impl Embedder {
 #[cfg(all(test, not(feature = "bench-stub")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn onnx_data_sidecars_keep_basename_for_subdir_models() {
+        // `onnx/model_fp16.onnx` → fetch `onnx/model_fp16.onnx_data`
+        // but the graph references the basename `model_fp16.onnx_data`.
+        let s = onnx_data_sidecars("onnx/model_fp16.onnx");
+        assert_eq!(
+            s,
+            [
+                (
+                    "onnx/model_fp16.onnx_data".to_string(),
+                    "model_fp16.onnx_data".to_string()
+                ),
+                (
+                    "onnx/model_fp16.onnx.data".to_string(),
+                    "model_fp16.onnx.data".to_string()
+                ),
+            ]
+        );
+        // flat model: relative path == basename
+        let (rel, name) = onnx_data_sidecars("model.onnx")[0].clone();
+        assert_eq!(rel, "model.onnx_data");
+        assert_eq!(name, "model.onnx_data");
+    }
+
+    #[test]
+    fn onnx_candidates_explicit_overrides_precision() {
+        // bare explicit name also tried under onnx/
+        assert_eq!(
+            onnx_candidates(Precision::Fp16, Some("model_q4f16.onnx")),
+            vec!["model_q4f16.onnx", "onnx/model_q4f16.onnx"]
+        );
+        // explicit with a path is used verbatim
+        assert_eq!(
+            onnx_candidates(Precision::Full, Some("onnx/model_q4.onnx")),
+            vec!["onnx/model_q4.onnx"]
+        );
+        // no explicit ⇒ precision mapping + fallbacks
+        assert_eq!(
+            onnx_candidates(Precision::Fp16, None)[0],
+            "onnx/model_fp16.onnx"
+        );
+    }
+
+    #[test]
+    fn assert_loadable_embedding_rejects_lm_heads() {
+        // LM head only → reject
+        let mlm = br#"{"architectures":["JinaBertForMaskedLM"]}"#;
+        assert!(assert_loadable_embedding("r", mlm).is_err());
+        // encoder export, mixed, unparseable/absent → allow
+        assert!(assert_loadable_embedding("r", br#"{"architectures":["JinaBertModel"]}"#).is_ok());
+        let mixed = br#"{"architectures":["BertModel","BertForMaskedLM"]}"#;
+        assert!(assert_loadable_embedding("r", mixed).is_ok());
+        assert!(assert_loadable_embedding("r", b"not json").is_ok());
+        assert!(assert_loadable_embedding("r", b"{}").is_ok());
+    }
+
+    #[test]
+    fn model2vec_normalize_detects_static_and_carries_flag() {
+        // model_type or StaticModel arch → Some(normalize); normalize
+        // defaults to true, honored when explicitly false.
+        assert_eq!(
+            model2vec_normalize(br#"{"model_type":"model2vec"}"#),
+            Some(true)
+        );
+        assert_eq!(
+            model2vec_normalize(br#"{"architectures":["StaticModel"],"normalize":false}"#),
+            Some(false)
+        );
+        // not model2vec → None; LM-head guard does NOT reject model2vec
+        assert_eq!(
+            model2vec_normalize(br#"{"architectures":["BertModel"]}"#),
+            None
+        );
+        assert_eq!(model2vec_normalize(b"not json"), None);
+        assert!(assert_loadable_embedding(
+            "r",
+            br#"{"model_type":"model2vec","architectures":["StaticModel"]}"#
+        )
+        .is_ok());
+    }
 
     #[test]
     fn parse_embeddings_reorders_by_index() {

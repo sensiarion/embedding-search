@@ -101,10 +101,83 @@ fn in_scope(file_path: &str, scope: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Scoped queries have no path predicate in the vector index, so they
-/// over-fetch then filter: `limit * FACTOR`, at least `MIN`.
-const SCOPE_OVERFETCH_FACTOR: usize = 40;
-const SCOPE_OVERFETCH_MIN: usize = 400;
+/// The vector index has no path/keyword predicate, so scoped OR hybrid
+/// queries over-fetch the embedding neighborhood then filter/re-rank
+/// it: `limit * FACTOR`, at least `MIN`.
+const OVERFETCH_FACTOR: usize = 40;
+const OVERFETCH_MIN: usize = 400;
+
+/// RRF damping (Cormack et al.): rank+K constant. 60 is the standard
+/// value — large enough that top ranks aren't winner-take-all.
+const RRF_K: f32 = 60.0;
+
+/// Split into lowercased `[a-z0-9_]` terms of length ≥ 2 — the unit
+/// shared by the lexical document and query side.
+fn tokenize(s: &str) -> Vec<String> {
+    s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| t.len() >= 2)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// BM25 (k1=1.2, b=0.75) of each candidate against the query, with the
+/// candidate set itself as the corpus — a lexical re-ranking of the
+/// embedding neighborhood, no separate full-text index. `docs` are the
+/// pre-tokenized candidate contents; returns one score per candidate.
+fn bm25_scores(docs: &[Vec<String>], query_terms: &[String]) -> Vec<f32> {
+    const K1: f32 = 1.2;
+    const B: f32 = 0.75;
+    let n = docs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // One pass per doc: term-frequency map (borrowed keys). df/tf are
+    // then map lookups, not repeated full-doc scans.
+    let tf_maps: Vec<HashMap<&str, u32>> = docs
+        .iter()
+        .map(|d| {
+            let mut m = HashMap::with_capacity(d.len());
+            for t in d {
+                *m.entry(t.as_str()).or_insert(0) += 1;
+            }
+            m
+        })
+        .collect();
+    let avgdl = (docs.iter().map(Vec::len).sum::<usize>() as f32 / n as f32).max(1.0);
+    let mut out = vec![0.0f32; n];
+    for qt in query_terms {
+        let qt = qt.as_str();
+        let df = tf_maps.iter().filter(|m| m.contains_key(qt)).count();
+        if df == 0 {
+            continue;
+        }
+        let idf = (1.0 + (n as f32 - df as f32 + 0.5) / (df as f32 + 0.5)).ln();
+        for (i, m) in tf_maps.iter().enumerate() {
+            let Some(&c) = m.get(qt) else { continue };
+            let tf = c as f32;
+            let dl = docs[i].len() as f32;
+            let denom = tf + K1 * (1.0 - B + B * dl / avgdl);
+            out[i] += idf * (tf * (K1 + 1.0)) / denom;
+        }
+    }
+    out
+}
+
+/// Rank positions (0 = best) for `scores`, descending. Ties keep input
+/// (semantic) order — a stable sort over original indices.
+fn ranks_desc(scores: &[f32]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..scores.len()).collect();
+    idx.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut rank = vec![0usize; scores.len()];
+    for (pos, &i) in idx.iter().enumerate() {
+        rank[i] = pos;
+    }
+    rank
+}
 
 pub fn run(
     engine: &SyncEngine,
@@ -114,16 +187,65 @@ pub fn run(
 ) -> Result<Vec<SearchResult>> {
     let qvec = engine.embedder().embed_query(query)?;
     let scope = scope.map(norm_scope).filter(|s| !s.is_empty());
+    // Distinct query terms: a repeated term would scale its own idf
+    // contribution uniformly (no ranking effect) and waste a df pass.
+    let mut q_terms = tokenize(query);
+    q_terms.sort_unstable();
+    q_terms.dedup();
+    // Hybrid only helps when the query has lexical content; a
+    // symbol-only query falls back to pure vector ranking.
+    let hybrid = engine.search_config().hybrid && !q_terms.is_empty();
 
-    // Scoped queries over-fetch then filter (the vector index has no
-    // path predicate); unscoped fetch exactly `limit`.
-    let k = if scope.is_some() {
-        (limit * SCOPE_OVERFETCH_FACTOR).max(SCOPE_OVERFETCH_MIN)
+    // Over-fetch the neighborhood when we must filter (scope) or
+    // re-rank (hybrid) it; otherwise fetch exactly `limit`.
+    let k = if scope.is_some() || hybrid {
+        (limit * OVERFETCH_FACTOR).max(OVERFETCH_MIN)
     } else {
         limit
     };
     let exact = engine.use_exact();
     let hits = engine.with_vector(|v| v.search(&qvec, k, exact))?;
+
+    // Materialize the (scope-filtered) candidates in cosine order. One
+    // batched DB hit for the whole neighborhood (not one lock+query per
+    // id); the cosine order comes from `hits`, the rows from the map.
+    let vids: Vec<u64> = hits.iter().map(|(v, _)| *v).collect();
+    let mut rows = engine.with_db(|db| db.chunks_by_vector_ids(&vids))?;
+    let mut cands: Vec<(crate::db::ChunkRow, f32)> = Vec::with_capacity(hits.len());
+    for (vid, cos) in &hits {
+        let Some(cur) = rows.remove(vid) else {
+            continue;
+        };
+        if let Some(s) = &scope {
+            if !in_scope(&cur.file_path, s) {
+                continue;
+            }
+        }
+        cands.push((cur, *cos));
+    }
+
+    // Fuse the cosine ranking with a BM25 lexical ranking by Reciprocal
+    // Rank Fusion. `score` then reports the fused relevance (sum of
+    // reciprocal ranks); without hybrid it stays the raw cosine.
+    let order: Vec<usize> = if hybrid {
+        let docs: Vec<Vec<String>> = cands.iter().map(|(c, _)| tokenize(&c.content)).collect();
+        let cos: Vec<f32> = cands.iter().map(|(_, s)| *s).collect();
+        let sem_rank = ranks_desc(&cos);
+        let lex_rank = ranks_desc(&bm25_scores(&docs, &q_terms));
+        let mut fused: Vec<(usize, f32)> = (0..cands.len())
+            .map(|i| {
+                let f = 1.0 / (RRF_K + sem_rank[i] as f32) + 1.0 / (RRF_K + lex_rank[i] as f32);
+                (i, f)
+            })
+            .collect();
+        fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (i, f) in &fused {
+            cands[*i].1 = *f;
+        }
+        fused.into_iter().map(|(i, _)| i).collect()
+    } else {
+        (0..cands.len()).collect()
+    };
 
     // Per-file caches: each result file's text and its chunk list are
     // fetched at most once even when several hits share the file
@@ -134,18 +256,13 @@ pub fn run(
     let mut sibs: HashMap<String, Vec<crate::db::ChunkRow>> = HashMap::new();
     let mut out = Vec::with_capacity(limit);
 
-    for (vid, score) in hits {
-        if out.len() >= limit {
-            break;
-        }
-        let Some(cur) = engine.with_db(|db| db.chunk_by_vector_id(vid))? else {
+    // `order` is a permutation, so each slot is taken exactly once —
+    // moving the row out (vs cloning `content`/paths per result).
+    let mut slots: Vec<Option<(crate::db::ChunkRow, f32)>> = cands.into_iter().map(Some).collect();
+    for ci in order.into_iter().take(limit) {
+        let Some((cur, score)) = slots[ci].take() else {
             continue;
         };
-        if let Some(s) = &scope {
-            if !in_scope(&cur.file_path, s) {
-                continue;
-            }
-        }
         let text = files
             .entry(cur.file_path.clone())
             .or_insert_with(|| {
@@ -220,6 +337,35 @@ mod tests {
             language: "rust".into(),
             vector_id: vid,
         }
+    }
+
+    #[test]
+    fn tokenize_lowercases_and_drops_short_runs() {
+        assert_eq!(
+            tokenize("fn parse_HF_Repo(x)!"),
+            vec!["fn", "parse_hf_repo"]
+        );
+        assert!(tokenize("a + b - .").is_empty()); // all len<2
+    }
+
+    #[test]
+    fn bm25_ranks_exact_term_match_first() {
+        let docs = vec![
+            tokenize("the quick brown fox"),
+            tokenize("embedding search hybrid rerank"),
+            tokenize("totally unrelated content here"),
+        ];
+        let q = tokenize("hybrid rerank");
+        let s = bm25_scores(&docs, &q);
+        let r = ranks_desc(&s);
+        assert_eq!(r[1], 0); // doc 1 contains both query terms → best
+        assert!(s[0] == 0.0 && s[2] == 0.0);
+    }
+
+    #[test]
+    fn ranks_desc_breaks_ties_by_input_order() {
+        // equal scores keep original order (stable)
+        assert_eq!(ranks_desc(&[1.0, 1.0, 2.0]), vec![1, 2, 0]);
     }
 
     #[test]

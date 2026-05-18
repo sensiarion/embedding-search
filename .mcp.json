@@ -2,7 +2,7 @@
   "mcpServers": {
     "embedding-search": {
       "command": "npx",
-      "args": ["-y", "mcp-bin", "sensiarion/embedding-search@latest", "--mcp"],
+      "args": ["-y", "mcp-bin", "sensiarion/embedding-search", "--mcp"],
       "env": { "RUST_LOG": "warn" }
     }
   }

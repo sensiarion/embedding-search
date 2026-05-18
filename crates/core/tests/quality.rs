@@ -86,6 +86,78 @@ fn russian_query_matches_russian_doc() {
 }
 
 #[test]
+#[ignore = "downloads a real external-data ONNX model (~300 MB)"]
+fn external_data_custom_model_loads_and_embeds() {
+    // onnx-community / >2 GB models split weights into a `.onnx_data`
+    // sidecar — proves it is fetched and wired so ORT initializes.
+    use embedding_search_core::config::{CustomModel, Precision};
+    use embedding_search_core::embedder::Embedder;
+    let mut cfg = Config::default();
+    cfg.custom_models.push(CustomModel {
+        name: "gemma".into(),
+        repo: Some("onnx-community/embeddinggemma-300m-ONNX".into()),
+        url: None,
+        e5_prefix: false,
+        precision: Some(Precision::Int8),
+        onnx_file: None,
+    });
+    cfg.model.default = "gemma".into();
+    let emb = Embedder::new(&cfg).expect("external-data model must load");
+    assert!(emb.dimensions > 0);
+    let v = emb.embed_query("semantic code search").expect("embed");
+    assert_eq!(v.len(), emb.dimensions);
+}
+
+#[test]
+#[ignore = "downloads a real quantized ONNX model (~570 MB)"]
+fn explicit_onnx_file_picks_exact_quantization() {
+    // A repo quantization the precision→file mapping can't reach
+    // (q4f16) is loaded via the exact-file override.
+    use embedding_search_core::config::CustomModel;
+    use embedding_search_core::embedder::Embedder;
+    let mut cfg = Config::default();
+    cfg.custom_models.push(CustomModel {
+        name: "qwen3".into(),
+        repo: Some("onnx-community/Qwen3-Embedding-0.6B-ONNX".into()),
+        url: None,
+        e5_prefix: false,
+        precision: None,
+        onnx_file: Some("model_q4f16.onnx".into()),
+    });
+    cfg.model.default = "qwen3".into();
+    let emb = Embedder::new(&cfg).expect("explicit q4f16 file must load");
+    assert!(emb.dimensions > 0);
+    let v = emb.embed_query("semantic code search").expect("embed");
+    assert_eq!(v.len(), emb.dimensions);
+}
+
+#[test]
+#[ignore = "downloads a real Model2Vec model (~500 MB)"]
+fn model2vec_static_backend_loads_and_embeds() {
+    // Model2Vec/StaticModel: static matrix + tokenizer, no ONNX —
+    // proves the static backend path produces real embeddings.
+    use embedding_search_core::config::CustomModel;
+    use embedding_search_core::embedder::Embedder;
+    let mut cfg = Config::default();
+    cfg.custom_models.push(CustomModel {
+        name: "potion".into(),
+        repo: Some("minishlab/potion-multilingual-128M".into()),
+        url: None,
+        e5_prefix: false,
+        precision: None,
+        onnx_file: None,
+    });
+    cfg.model.default = "potion".into();
+    let emb = Embedder::new(&cfg).expect("model2vec must load");
+    assert_eq!(emb.dimensions, 256);
+    let v = emb.embed_query("authentication token").expect("embed");
+    assert_eq!(v.len(), 256);
+    // L2-normalized (config.normalize = true) → unit norm
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
+}
+
+#[test]
 #[ignore = "loads real model"]
 fn relevant_scores_beat_irrelevant() {
     let (_d, eng) = fixture();

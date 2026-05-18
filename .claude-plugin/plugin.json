@@ -5,6 +5,13 @@
     "name": "sensiarion",
     "url": "https://github.com/sensiarion"
   },
+  "mcpServers": {
+    "embedding-search": {
+      "command": "npx",
+      "args": ["-y", "mcp-bin", "sensiarion/embedding-search", "--mcp"],
+      "env": { "RUST_LOG": "warn" }
+    }
+  },
   "hooks": {
     "SessionStart": [
       {

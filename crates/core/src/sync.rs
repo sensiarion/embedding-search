@@ -183,6 +183,39 @@ fn sync_thread_count(configured: usize) -> usize {
         .max(1)
 }
 
+/// Absolute roots of git linked worktrees registered under this repo
+/// (`<project>/.git/worktrees/*/gitdir`), restricted to ones nested
+/// inside `project_dir`. Git's own registry is authoritative and read
+/// once — unlike a per-directory `.git` probe, which also misfires on
+/// submodules (their work dir is a `.git` *file* too). If `project_dir`
+/// is itself a linked worktree (`.git` is a file) it owns no registry,
+/// so there is nothing nested to prune.
+fn linked_worktree_roots(project_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(project_dir.join(".git").join("worktrees")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            // `gitdir` points at the worktree's own `.git` FILE; its
+            // parent is that worktree's working-tree root.
+            let content = std::fs::read_to_string(e.path().join("gitdir")).ok()?;
+            let root = Path::new(content.trim()).parent()?.to_path_buf();
+            let abs = std::fs::canonicalize(root).ok()?;
+            (abs != project_dir && abs.starts_with(project_dir)).then_some(abs)
+        })
+        .collect()
+}
+
+/// Remove a project's on-disk index (SQLite + WAL/SHM + vector file).
+/// Single source of the wipe set — shared by the fingerprint-mismatch
+/// rebuild and the `clear` command. Missing files are not an error.
+pub fn wipe_index(index_dir: &Path) {
+    for f in ["meta.db", "meta.db-wal", "meta.db-shm", "vectors.usearch"] {
+        let _ = std::fs::remove_file(index_dir.join(f));
+    }
+}
+
 /// (mtime secs, size bytes) of a path, or (0, 0) if unstattable.
 fn mtime_size(path: &Path) -> (i64, i64) {
     let Ok(m) = std::fs::metadata(path) else {
@@ -241,10 +274,7 @@ impl SyncEngine {
                     "index fingerprint changed ({} -> {fingerprint}) — wiping index",
                     stored.as_deref().unwrap_or("none")
                 );
-                let _ = std::fs::remove_file(index_dir.join("meta.db"));
-                let _ = std::fs::remove_file(index_dir.join("meta.db-wal"));
-                let _ = std::fs::remove_file(index_dir.join("meta.db-shm"));
-                let _ = std::fs::remove_file(index_dir.join("vectors.usearch"));
+                wipe_index(&index_dir);
             }
         }
 
@@ -330,11 +360,16 @@ impl SyncEngine {
 
     fn collect_files(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();
+        // Nested git linked worktrees are duplicate checkouts of the
+        // same code — resolve their roots once and prune those subtrees
+        // (only the working tree being synced is "the codebase").
+        let worktrees = linked_worktree_roots(&self.project_dir);
         let walk = ignore::WalkBuilder::new(&self.project_dir)
             .hidden(false)
             .git_ignore(true)
             .git_global(true)
             .parents(true)
+            .filter_entry(move |e| !worktrees.iter().any(|w| e.path().starts_with(w)))
             .build();
         for entry in walk.flatten() {
             let path = entry.path();
@@ -716,6 +751,10 @@ impl SyncEngine {
 
     pub(crate) fn embedder(&self) -> &Embedder {
         &self.embedder
+    }
+
+    pub(crate) fn search_config(&self) -> &crate::config::SearchConfig {
+        &self.config.search
     }
 
     pub(crate) fn with_vector<R>(&self, f: impl FnOnce(&VectorIndex) -> R) -> R {

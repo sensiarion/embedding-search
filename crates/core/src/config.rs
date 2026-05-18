@@ -3,7 +3,7 @@ use fastembed::EmbeddingModel;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const DEFAULT_MODEL: &str = "intfloat/multilingual-e5-base";
+pub const DEFAULT_MODEL: &str = "minishlab/potion-multilingual-128M";
 
 /// Bumped whenever chunking logic changes shape (AST kinds, line
 /// window, structured split). Part of the index fingerprint so a
@@ -58,6 +58,17 @@ pub struct CustomModel {
     /// True if it is an e5-style model needing `query:`/`passage:`.
     #[serde(default)]
     pub e5_prefix: bool,
+    /// ONNX precision to pull for this model (HF `--repo` only). `None`
+    /// ⇒ the global `[model] precision`. Per-model so registering a
+    /// big model at int8 doesn't change precision for the others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<Precision>,
+    /// Exact ONNX file to pull from the repo, e.g. `model_q4f16.onnx`
+    /// or `onnx/model_q4.onnx` — overrides the `precision`→file
+    /// mapping for repos with quantizations it doesn't cover (q4,
+    /// q4f16, bnb4, uint8…). A bare name is also tried under `onnx/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onnx_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,12 +79,19 @@ pub struct SearchConfig {
     /// approximate heuristic; on a small codebase exact is both more
     /// accurate and effectively as fast, so the graph buys nothing.
     pub exact_below: usize,
+    /// Hybrid retrieval: over-fetch the embedding neighborhood, then
+    /// re-rank it by fusing the cosine ranking with a BM25-lite lexical
+    /// ranking (Reciprocal Rank Fusion). Catches exact-identifier
+    /// queries pure-vector search ranks poorly. Disable for
+    /// vector-only.
+    pub hybrid: bool,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             exact_below: 50_000,
+            hybrid: true,
         }
     }
 }
@@ -222,6 +240,23 @@ impl Precision {
             Precision::Full => "f32",
             Precision::Fp16 => "fp16",
             Precision::Int8 => "int8",
+        }
+    }
+}
+
+/// Single source for string → `Precision` (CLI `--precision`, etc.):
+/// the serde names plus `f32` as an alias for `full`. clap derives its
+/// value parser from this automatically.
+impl std::str::FromStr for Precision {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "fp16" => Ok(Precision::Fp16),
+            "int8" => Ok(Precision::Int8),
+            "full" | "f32" => Ok(Precision::Full),
+            other => Err(Error::Config(format!(
+                "invalid precision {other:?} (expected fp16 | int8 | full)"
+            ))),
         }
     }
 }
@@ -489,15 +524,21 @@ pub struct ModelSpec {
     pub needs_e5_prefix: bool,
     /// HF repo with precision-specific ONNX (`onnx/model*.onnx`) +
     /// tokenizer. `Some` => loaded as a user-defined model so fp16/int8
-    /// works. `None` => fastembed built-in enum, f32 only.
+    /// works. `None` => fastembed built-in enum, f32 only. For a
+    /// `static_model` repo it instead holds the Model2Vec safetensors.
     pub hf_repo: Option<&'static str>,
+    /// Model2Vec / `StaticModel`: a static token-embedding matrix, no
+    /// ONNX/transformer. Loaded via the static backend; precision is
+    /// N/A (single f32 matrix) and there is no ORT working set.
+    pub static_model: bool,
     pub note: &'static str,
 }
 
 impl ModelSpec {
-    /// Whether `precision` is honored (only user-defined HF models).
+    /// Whether `precision` is honored (user-defined ONNX only; not
+    /// fastembed built-ins, not Model2Vec static matrices).
     pub fn supports_precision(&self) -> bool {
-        self.hf_repo.is_some()
+        self.hf_repo.is_some() && !self.static_model
     }
 
     /// Effective precision: requested if supported, else Full.
@@ -510,16 +551,43 @@ impl ModelSpec {
     }
 
     /// Rough resident RAM in MB: weights at the precision + a fixed
-    /// ONNX Runtime / tokenizer working-set overhead.
+    /// working-set overhead. Model2Vec has no ONNX Runtime, so only a
+    /// small tokenizer overhead vs. ORT's ~350 MB.
     pub fn ram_mb(&self, precision: Precision) -> u32 {
-        const OVERHEAD_MB: f32 = 350.0;
+        let overhead = if self.static_model { 30.0 } else { 350.0 };
         let p = self.effective_precision(precision);
         let weights = self.params_m as f32 * p.bytes_per_param();
-        (weights + OVERHEAD_MB) as u32
+        (weights + overhead) as u32
     }
 }
 
 pub const SUPPORTED_MODELS: &[ModelSpec] = &[
+    ModelSpec {
+        name: "minishlab/potion-multilingual-128M",
+        fastembed: None,
+        dimensions: 256,
+        code: 3,
+        multilingual: 5,
+        // Model2Vec matrix params (vocab 500353 × 256 ≈ 128M).
+        params_m: 128,
+        needs_e5_prefix: false,
+        hf_repo: Some("minishlab/potion-multilingual-128M"),
+        static_model: true,
+        note: "DEFAULT: Model2Vec static, multilingual incl. Russian, tiny+fast",
+    },
+    ModelSpec {
+        name: "minishlab/potion-base-32M",
+        fastembed: None,
+        dimensions: 512,
+        code: 3,
+        multilingual: 2,
+        // vocab 63091 × 512 ≈ 32M.
+        params_m: 32,
+        needs_e5_prefix: false,
+        hf_repo: Some("minishlab/potion-base-32M"),
+        static_model: true,
+        note: "Model2Vec static, English, smallest+fastest, lowest RAM",
+    },
     ModelSpec {
         name: "intfloat/multilingual-e5-base",
         fastembed: None,
@@ -529,7 +597,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         params_m: 278,
         needs_e5_prefix: true,
         hf_repo: Some("Xenova/multilingual-e5-base"),
-        note: "DEFAULT: 100 langs incl. Russian, strong code",
+        static_model: false,
+        note: "100 langs incl. Russian, strong code (ONNX, heavier)",
     },
     ModelSpec {
         name: "intfloat/multilingual-e5-small",
@@ -540,7 +609,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         params_m: 118,
         needs_e5_prefix: true,
         hf_repo: Some("Xenova/multilingual-e5-small"),
-        note: "Lightweight multilingual, lowest RAM",
+        static_model: false,
+        note: "Lightweight multilingual ONNX",
     },
     ModelSpec {
         name: "intfloat/multilingual-e5-large",
@@ -551,6 +621,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         params_m: 560,
         needs_e5_prefix: true,
         hf_repo: Some("Xenova/multilingual-e5-large"),
+        static_model: false,
         note: "Max multilingual quality, heavier",
     },
     ModelSpec {
@@ -562,6 +633,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         params_m: 161,
         needs_e5_prefix: false,
         hf_repo: None,
+        static_model: false,
         note: "Best pure code, 30 prog langs, English only (f32)",
     },
     ModelSpec {
@@ -573,10 +645,50 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         params_m: 137,
         needs_e5_prefix: false,
         hf_repo: None,
+        static_model: false,
         note: "Fast, matryoshka dims, mostly English (f32)",
     },
 ];
 
 pub fn model_spec(name: &str) -> Option<&'static ModelSpec> {
     SUPPORTED_MODELS.iter().find(|m| m.name == name)
+}
+
+/// Canonicalize a Hugging Face repo reference to the bare `org/name`
+/// id that `hf-hub` expects. Accepts a plain id, a full
+/// `https://huggingface.co/org/name` URL, or one with a trailing
+/// `/tree/<rev>` / `/blob/...` (what a user copies from the browser).
+/// Single owner of this parsing — used by `models add` (stored clean)
+/// and the embedder (defensive, so a pre-existing URL in config still
+/// loads after upgrade).
+pub fn normalize_hf_repo(input: &str) -> String {
+    let s = input.trim();
+    let s = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    let s = s.strip_prefix("www.").unwrap_or(s);
+    let s = s
+        .strip_prefix("huggingface.co/")
+        .or_else(|| s.strip_prefix("hf.co/"))
+        .unwrap_or(s);
+    let s = s.trim_start_matches('@').trim_matches('/');
+    let mut segs = Vec::with_capacity(2);
+    for seg in s.split('/') {
+        if matches!(seg, "tree" | "blob" | "resolve") {
+            break;
+        }
+        if seg.is_empty() {
+            continue;
+        }
+        segs.push(seg);
+        if segs.len() == 2 {
+            break;
+        }
+    }
+    if segs.is_empty() {
+        s.to_string()
+    } else {
+        segs.join("/")
+    }
 }

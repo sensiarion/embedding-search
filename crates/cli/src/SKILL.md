@@ -1,3 +1,8 @@
+---
+name: embedding-search
+description: Semantic (meaning-based) code search over the current project via the embedding-search MCP. Use for conceptual/relationship code questions ("how does auth work", "where is X enforced") instead of grep/find; grep only for exact known strings.
+---
+
 # embedding-search — semantic code search
 
 This server gives you **meaning-based** code search over the current
@@ -42,8 +47,8 @@ context instead of re-searching.
 
 ## Index freshness (you don't manage this)
 
-The index auto-syncs on startup and stays live via a file watcher —
-results reflect the current tree. `sync_codebase` is only for after
-large external changes (e.g. a branch switch); `get_index_status`
-reports health. You normally never need either — just call
-`search_code`.
+The index auto-syncs on startup and re-syncs periodically in the
+background (hash-incremental) — results reflect the recent tree.
+`sync_codebase` forces an immediate catch-up after large external
+changes (e.g. a branch switch); `get_index_status` reports health.
+You normally never need either — just call `search_code`.

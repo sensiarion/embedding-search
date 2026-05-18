@@ -3,7 +3,12 @@ mod mcp;
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use embedding_search_core::{
-    config::{CustomModel, EmbeddingProvider, RemoteConfig, SUPPORTED_MODELS},
+    config::{
+        normalize_hf_repo, CustomModel, EmbeddingProvider, Precision, RemoteConfig, DEFAULT_MODEL,
+        SUPPORTED_MODELS,
+    },
+    embedder::custom_model_cache_dir,
+    embedder::Embedder,
     Config, Inspector, SyncEngine, SyncEvent,
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -62,6 +67,12 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Delete a project's index (embeddings + metadata). The next
+    /// init/sync rebuilds from scratch.
+    Clear {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Start MCP server mode on stdio
     Serve,
     /// Inspection helpers
@@ -97,6 +108,11 @@ enum ModelsCmd {
     List,
     /// Set the default model (requires re-index)
     SetDefault { model: String },
+    /// Unregister a custom/remote model and delete its cached weights.
+    /// Built-ins can't be removed. If it was active, the default
+    /// resets to the built-in default (re-index after).
+    #[command(alias = "rm")]
+    Remove { name: String },
     /// Register a custom model (auto-downloaded + cached like a
     /// built-in, then listed/selectable). Pass exactly one of --repo
     /// (Hugging Face id) or --url (direct .onnx). Re-index after.
@@ -115,6 +131,15 @@ enum ModelsCmd {
         /// Set if it's an e5-style model needing query:/passage:
         #[arg(long)]
         e5_prefix: bool,
+        /// ONNX precision to pull (HF --repo): fp16 | int8 | full.
+        /// Omitted ⇒ the global `[model] precision`.
+        #[arg(long)]
+        precision: Option<Precision>,
+        /// Exact ONNX file in the repo, e.g. model_q4f16.onnx or
+        /// onnx/model_q4.onnx. Overrides --precision; for repos with
+        /// quantizations the precision mapping doesn't cover.
+        #[arg(long)]
+        onnx_file: Option<String>,
     },
     /// Switch to an external OpenAI-compatible embeddings API
     /// (sets provider=openai + the [remote] section). Re-index after.
@@ -139,6 +164,43 @@ enum ModelsCmd {
         #[arg(long)]
         e5_prefix: bool,
     },
+}
+
+/// Is the (normalized) HF repo still referenced by a remaining custom
+/// model or a built-in? Guards `models remove` from deleting an
+/// hf-hub cache dir shared via `models--{repo}` (one dir per repo, no
+/// precision/file in the path) — call AFTER removing the target entry.
+fn repo_still_used(cfg: &Config, repo_norm: &str) -> bool {
+    cfg.custom_models
+        .iter()
+        .filter_map(|m| m.repo.as_deref())
+        .any(|r| normalize_hf_repo(r) == repo_norm)
+        || SUPPORTED_MODELS
+            .iter()
+            .any(|s| s.hf_repo == Some(repo_norm))
+}
+
+/// Verify a freshly selected model end-to-end *before* persisting it:
+/// `Embedder::new` downloads the weights (HF progress on stderr) and
+/// runs a probe embed, so a bad repo/URL/endpoint fails here with an
+/// actionable error and the config is left untouched.
+fn verify_and_save(cfg: &Config, name: &str) -> Result<()> {
+    let remote = cfg.model.provider == EmbeddingProvider::Openai;
+    let how = if remote {
+        "endpoint reachability + test embed"
+    } else {
+        "model download + test embed"
+    };
+    eprintln!("Verifying '{name}' ({how})…");
+    let emb = Embedder::new(cfg)
+        .with_context(|| format!("'{name}' failed verification — nothing saved"))?;
+    cfg.save().context("save config")?;
+    let kind = if remote { " (remote)" } else { "" };
+    println!(
+        "\u{2713} '{name}'{kind} verified — {} dims. Run `embedding-search sync --force` to re-index.",
+        emb.dimensions
+    );
+    Ok(())
 }
 
 fn engine(path: &Path) -> Result<SyncEngine> {
@@ -216,12 +278,27 @@ fn run_sync(eng: &SyncEngine, force: bool, report: Report) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // ort routes ONNX Runtime logs through `tracing` (target `ort`):
+    // CoreML graph-partition / "iOS 17.4+ required" / node-assignment
+    // WARNs are pure noise (and a real failure surfaces as our own
+    // error anyway). Silence the `ort` target unless the user opted
+    // into it explicitly via RUST_LOG.
+    let base = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into());
+    // Only skip the override if RUST_LOG carries an explicit `ort`
+    // *directive* (target `ort` / `ort::…`) — a plain substring test
+    // would also match unrelated targets like `report`/`support`.
+    let has_ort_directive = base.split(',').any(|d| {
+        let target = d.split('=').next().unwrap_or("").trim();
+        target == "ort" || target.starts_with("ort::")
+    });
+    let filter = if has_ort_directive {
+        base
+    } else {
+        format!("{base},ort=off")
+    };
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .init();
 
     let cli = Cli::parse();
@@ -236,6 +313,18 @@ fn main() -> Result<()> {
     };
     match cmd {
         Command::Serve => return mcp::run(),
+        Command::Clear { path } => {
+            use embedding_search_core::{config::PROJECT_INDEX_DIR, sync::wipe_index};
+            let dir = std::fs::canonicalize(&path)
+                .context("resolve path")?
+                .join(PROJECT_INDEX_DIR);
+            if dir.is_dir() {
+                wipe_index(&dir);
+                println!("Cleared index at {}", dir.display());
+            } else {
+                println!("No index at {} (nothing to clear)", dir.display());
+            }
+        }
         Command::Init { path } => {
             let eng = engine(&path)?;
             println!("Index at {}", eng.index_dir().display());
@@ -391,37 +480,76 @@ fn main() -> Result<()> {
             }
             ModelsCmd::SetDefault { model } => {
                 let mut cfg = Config::load_or_init().context("load config")?;
-                let provider = cfg.select_model(&model)?;
-                cfg.save()?;
-                let kind = if provider == EmbeddingProvider::Openai {
-                    " (remote)"
+                cfg.select_model(&model)?;
+                verify_and_save(&cfg, &model)?;
+            }
+            ModelsCmd::Remove { name } => {
+                let mut cfg = Config::load_or_init().context("load config")?;
+                let was_active = cfg.model.default == name;
+
+                if let Some(i) = cfg.custom_models.iter().position(|m| m.name == name) {
+                    let cm = cfg.custom_models.remove(i);
+                    let root = cfg.model_cache_dir().context("cache dir")?;
+                    if let Some(dir) = custom_model_cache_dir(&root, &cm) {
+                        let still_used = cm
+                            .repo
+                            .as_deref()
+                            .map(normalize_hf_repo)
+                            .is_some_and(|r| repo_still_used(&cfg, &r));
+                        if still_used {
+                            println!("Kept shared cache {} (still in use).", dir.display());
+                        } else if dir.is_dir() {
+                            std::fs::remove_dir_all(&dir)
+                                .with_context(|| format!("delete {}", dir.display()))?;
+                            println!("Deleted cached weights {}", dir.display());
+                        }
+                    }
+                    println!("Removed custom model '{name}'.");
+                } else if let Some(i) = cfg.remote_models.iter().position(|r| r.name == name) {
+                    cfg.remote_models.remove(i);
+                    println!("Removed remote '{name}' (no local weights).");
                 } else {
-                    ""
-                };
-                println!("Active model set to {model}{kind}.");
-                println!("Run `embedding-search sync --force` to re-index.");
+                    anyhow::bail!(
+                        "no custom or remote model named '{name}' \
+                         (built-ins can't be removed — see `models list`)"
+                    );
+                }
+
+                if was_active {
+                    cfg.model.default = DEFAULT_MODEL.to_string();
+                    cfg.model.provider = EmbeddingProvider::Local;
+                    println!(
+                        "Was active — default reset to {DEFAULT_MODEL}. \
+                         Run `embedding-search sync --force` to re-index."
+                    );
+                }
+                cfg.save().context("save config")?;
             }
             ModelsCmd::Add {
                 name,
                 repo,
                 url,
                 e5_prefix,
+                precision,
+                onnx_file,
             } => {
                 // clap's `source` ArgGroup guarantees exactly one of
-                // --repo / --url is set.
+                // --repo / --url is set. A `--repo` value may be a full
+                // HF URL (copied from the browser) — canonicalize to
+                // the bare `org/name` id `hf-hub` expects.
                 let mut cfg = Config::load_or_init().context("load config")?;
                 cfg.custom_models.retain(|m| m.name != name);
                 cfg.custom_models.push(CustomModel {
                     name: name.clone(),
-                    repo,
+                    repo: repo.map(|r| normalize_hf_repo(&r)),
                     url,
                     e5_prefix,
+                    precision,
+                    onnx_file,
                 });
                 // Same activation path as add-remote / set-default.
                 cfg.select_model(&name)?;
-                cfg.save()?;
-                println!("Registered custom model '{name}' and set it as default.");
-                println!("Run `embedding-search sync --force` to re-index.");
+                verify_and_save(&cfg, &name)?;
             }
             ModelsCmd::AddRemote {
                 name,
@@ -446,9 +574,7 @@ fn main() -> Result<()> {
                 cfg.remote_models.retain(|r| r.name != name);
                 cfg.remote_models.push(entry);
                 cfg.select_model(&name)?; // copies into [remote], provider=openai
-                cfg.save()?;
-                println!("Registered remote '{name}' ({model} @ {base_url}) and selected it.");
-                println!("Run `embedding-search sync --force` to re-index.");
+                verify_and_save(&cfg, &name)?;
             }
         },
     }

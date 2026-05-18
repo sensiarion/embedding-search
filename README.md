@@ -10,11 +10,14 @@ conceptual lookups. Also usable directly as a CLI.
 One self-contained binary: `embedding-search` is the CLI, and
 `embedding-search --mcp` runs the stdio MCP server (no separate
 binary). It ships through [mcp-bin](https://github.com/sensiarion/mcp-bin):
-`npx -y mcp-bin sensiarion/embedding-search@latest --mcp` auto-resolves
-the right binary from GitHub releases on first launch — no pre-install.
-Editors spawn it with the workspace as cwd, so it indexes the open
-project automatically. (The `--mcp` trailing arg is what flips the
-binary into server mode.)
+`npx -y mcp-bin sensiarion/embedding-search --mcp` resolves the right
+binary from the latest GitHub release on first launch — no pre-install.
+The bare `owner/repo` spec tracks the newest release; mcp-bin caches it
+and reuses it (run `npx mcp-bin expire sensiarion/embedding-search` to
+move to a newer release, or pin one with `@vX.Y.Z`). Editors spawn it
+with the workspace as cwd, so it indexes the open project
+automatically. (The `--mcp` trailing arg flips the binary into server
+mode.)
 
 Prebuilt release binaries: **macOS arm64, Linux x86_64, Linux arm64**.
 Intel macOS and Windows are not prebuilt (their onnxruntime toolchain
@@ -39,7 +42,7 @@ Just want the `search_code` tool without the auto-use nudge:
 
 ```bash
 claude mcp add --scope user --env RUST_LOG=warn embedding-search \
-  -- npx -y mcp-bin sensiarion/embedding-search@latest --mcp
+  -- npx -y mcp-bin sensiarion/embedding-search --mcp
 ```
 
 ### OpenCode
@@ -54,7 +57,7 @@ repo) — note OpenCode uses `mcp`/`type: local`/`environment`, not the
   "mcp": {
     "embedding-search": {
       "type": "local",
-      "command": ["npx", "-y", "mcp-bin", "sensiarion/embedding-search@latest", "--mcp"],
+      "command": ["npx", "-y", "mcp-bin", "sensiarion/embedding-search", "--mcp"],
       "enabled": true,
       "environment": { "RUST_LOG": "warn" }
     }
@@ -79,12 +82,14 @@ embedding-search init [path]                     create the index, first sync
 embedding-search sync [path] [--force]           re-index (progress bar)
 embedding-search search <query> [-n N] [--json] [--in DIR|FILE] [--no-sync]
 embedding-search status [path]                   index/sync health
+embedding-search clear [path]                     delete the index (rebuild on next sync)
 embedding-search serve | --mcp                   run MCP server on stdio
 embedding-search debug files [path]              list indexed files
 embedding-search debug chunks <file> [--path .]  show a file's chunks
 embedding-search models list                     built-in + custom models
 embedding-search models set-default <name>       switch model (re-index)
-embedding-search models add --name X --repo ORG/M | --url URL   add + select a model
+embedding-search models add --name X --repo ORG/M [--precision P | --onnx-file F] | --url URL
+embedding-search models remove <name>            unregister + delete cached weights (alias: rm)
 embedding-search models add-remote --name N --base-url U --model M   add + select a remote
 ```
 
@@ -98,8 +103,8 @@ command (CLI or MCP), so it's there to edit. Delete it to reset.
 
 ```toml
 [model]
-default   = "intfloat/multilingual-e5-base"  # multilingual + code
-precision = "fp16"                            # fp16 | int8 | full
+default   = "minishlab/potion-multilingual-128M"  # Model2Vec static, multilingual
+precision = "fp16"                            # fp16 | int8 | full (ONNX models only)
 max_length = 512                              # token cap; keep ≈ max_chunk_bytes/4
 # onnx_path = "/path/to/model-dir"            # custom local ONNX (see below)
 # onnx_e5_prefix = false                      # true if custom model is e5
@@ -118,7 +123,16 @@ exclude = []
 
 [search]
 exact_below = 50000           # < this many vectors → exact (brute) search, not HNSW
+hybrid      = true            # fuse cosine with a BM25 lexical re-rank (RRF)
 ```
+
+**Hybrid search** (on by default): the embedding neighborhood is
+over-fetched, then re-ranked by Reciprocal Rank Fusion of the cosine
+ranking and a BM25 lexical ranking of the same candidates — so an
+exact-identifier query (`validate_bearer_token`) surfaces the literal
+match that pure-vector ranking buries, while conceptual queries still
+ride the embeddings. No separate full-text index; `score` then reports
+the fused relevance. Set `hybrid = false` for vector-only.
 
 Every sync is hash-incremental: a file whose mtime+size are unchanged
 is skipped before any read/hash/parse (the cheap node of a blake3 file
@@ -176,21 +190,28 @@ streamed in byte-bounded batches.
 
 `ml` rating covers non-English (incl. Russian): ★★★★★ = full, ★★ = English-centric.
 
-All built-in models are pulled (and cached) from **Hugging Face** as
-ONNX. The e5 family loads from the [`Xenova`](https://huggingface.co/Xenova)
-org — a community account on huggingface.co that re-publishes popular
-models exported to ONNX (e.g.
-[`Xenova/multilingual-e5-base`](https://huggingface.co/Xenova/multilingual-e5-base)),
-which is what makes the fp16 / int8 variants available. Not a GitHub
-repo — it's a Hugging Face namespace.
+Built-in models are pulled (and cached) from **Hugging Face**. The
+default and `potion-base-32M` are [Model2Vec](https://github.com/MinishLab/model2vec)
+static models (a token-embedding matrix — no transformer/ONNX, tiny
+RAM, very fast, no precision knob). The e5 family is ONNX from the
+[`Xenova`](https://huggingface.co/Xenova) org (community ONNX
+re-publishes — what makes the fp16 / int8 variants available); jina /
+nomic are fastembed built-ins (f32).
 
-| model | dim | code | ml | RAM≈ f32 / fp16 / int8 |
-|-------|-----|------|----|------------------------|
-| intfloat/multilingual-e5-base **(default, fp16)** | 768 | ★★★★ | ★★★★★ | ~1462 / ~906 / ~628 MB |
+| model | dim | code | ml | RAM≈ |
+|-------|-----|------|----|------|
+| minishlab/potion-multilingual-128M **(default, static)** | 256 | ★★★ | ★★★★★ | ~542 MB |
+| minishlab/potion-base-32M (static, English) | 512 | ★★★ | ★★ | ~158 MB |
+| intfloat/multilingual-e5-base | 768 | ★★★★ | ★★★★★ | ~1462 / ~906 / ~628 MB (f32/fp16/int8) |
 | intfloat/multilingual-e5-small | 384 | ★★★ | ★★★★★ | ~822 / ~586 / ~468 MB |
 | intfloat/multilingual-e5-large | 1024 | ★★★ | ★★★★★ | ~2590 / ~1470 / ~910 MB |
 | jinaai/jina-embeddings-v2-base-code | 768 | ★★★★★ | ★★ | ~994 MB (f32 only) |
 | nomic-ai/nomic-embed-text-v1.5 | 768 | ★★★★ | ★★★ | ~898 MB (f32 only) |
+
+Default is the multilingual Model2Vec (incl. Russian) — fastest +
+lowest RAM, good general semantic recall. For strongest pure-code
+retrieval switch to `jinaai/jina-embeddings-v2-base-code`; for max
+multilingual quality `intfloat/multilingual-e5-large`.
 
 ### Selecting a model
 
@@ -243,14 +264,30 @@ Most popular embedding models already have an ONNX build on Hugging
 Face (look for a `model.onnx` / `onnx/` folder, or a `Xenova/<name>`
 mirror).
 
-**Easiest — register it by one command.** `models add` downloads and
-caches it like a built-in, lists it in `models list`, **and selects it
-as the active model** (marked `*`). Pass a Hugging Face repo id **or**
-a direct `.onnx` URL:
+**Easiest — register it by one command.** `models add` **downloads
+the model and runs a test embed right then** — if the repo/URL is bad
+or missing files the command fails and **nothing is written to
+config** (no broken state to clean up later). On success it's cached
+like a built-in, listed in `models list`, **and selected as the active
+model** (marked `*`). `--repo` takes a Hugging Face repo id **or** a
+full `huggingface.co` URL (paste straight from the browser — it's
+canonicalized to the `org/name` id):
 
 ```bash
-# HF repo id (precision-specific ONNX + tokenizer pulled from the repo)
+# HF repo id …
 embedding-search models add --name bge-small --repo Xenova/bge-small-en-v1.5
+# … or the full page URL (with or without /tree/main) — both work
+embedding-search models add --name e5 --repo https://huggingface.co/Xenova/multilingual-e5-base
+
+# onnx-community / large models: weights split into a .onnx_data
+# sidecar — fetched automatically. --precision picks the variant.
+embedding-search models add --name gemma \
+  --repo onnx-community/embeddinggemma-300m-ONNX --precision int8
+
+# pick an EXACT quantization the precision mapping can't reach
+# (q4 / q4f16 / bnb4 / uint8 …) with --onnx-file
+embedding-search models add --name qwen3 \
+  --repo onnx-community/Qwen3-Embedding-0.6B-ONNX --onnx-file model_q4f16.onnx
 
 # …or a direct .onnx URL (the 4 tokenizer files must sit next to it)
 embedding-search models add --name my-model \
@@ -259,13 +296,31 @@ embedding-search models add --name my-model \
 embedding-search sync --force   # re-index with the new model
 ```
 
-Add `--e5-prefix` if it's an e5-style model. The required files are
-`model.onnx` (precision variant for `--repo`) **plus all four
-tokenizer files**: `tokenizer.json`, `config.json`,
-`special_tokens_map.json`, `tokenizer_config.json`. If any is missing
-the loader fails with an explicit message naming the exact repo/URL
-and the missing file. Stored under `[[custom_model]]` in
-`config.toml`; output dimensions are probed at load.
+Add `--e5-prefix` if it's an e5-style model. `--precision fp16 | int8
+| full` selects which ONNX variant to pull, per model (a big model can
+be `int8` without changing the others); omit it to use the global
+`[model] precision`. `--onnx-file model_q4f16.onnx` (or
+`onnx/model_q4.onnx`) pulls that exact file instead — for repos whose
+quantizations (q4, q4f16, bnb4, uint8…) the precision mapping doesn't
+cover; it overrides `--precision`.
+Required in the repo: ONNX weights **plus all four tokenizer files**
+(`tokenizer.json`, `config.json`, `special_tokens_map.json`,
+`tokenizer_config.json`). The `.onnx` graph plus any `.onnx_data`
+external-weights sidecar (onnx-community / models >2 GB) are both
+fetched. For `--repo` the loader tries the requested precision then
+falls back to `onnx/model.onnx` / `model.onnx`, so a repo that ships
+only full-precision ONNX still works. A PyTorch-only repo (no ONNX) or
+a missing tokenizer file fails with an explicit message naming the
+repo and every path tried. A language-model-head export
+(`*ForMaskedLM`/`CausalLM`…) is rejected up front (it's not an
+embedding model and ALiBi long-context ones OOM at tens of GB).
+Stored under `[[custom_model]]`; output dimensions probed at load.
+
+**Model2Vec / `StaticModel`** repos (e.g. `minishlab/potion-*`) are
+supported via a built-in static backend — no ONNX/transformer: the
+`model.safetensors` token-embedding matrix + tokenizer are loaded and
+mean-pooled (+ L2 per the model's `Normalize`). Tiny and fast, lowest
+RAM. Just `models add --name potion --repo minishlab/potion-multilingual-128M`.
 
 **Offline / local files — `[model] onnx_path`** (no download):
 

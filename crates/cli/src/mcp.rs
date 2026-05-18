@@ -86,11 +86,23 @@ impl Server {
     }
 }
 
-/// Tool-usage guide handed to the client as MCP server instructions —
-/// authored as Markdown, embedded at compile time so it stays in sync.
+/// Tool-usage guide, embedded at compile time. This is the SINGLE
+/// source: the same file is symlinked as the plugin's Skill
+/// (`skills/embedding-search/SKILL.md`), which requires YAML
+/// frontmatter — stripped here so the MCP client sees only the guide.
 const SKILL: &str = include_str!("SKILL.md");
 
-#[tool_handler(name = "embedding-search", version = "0.1.0")]
+fn skill_instructions() -> &'static str {
+    match SKILL
+        .strip_prefix("---\n")
+        .and_then(|r| r.split_once("\n---\n"))
+    {
+        Some((_front, body)) => body.trim_start(),
+        None => SKILL,
+    }
+}
+
+#[tool_handler(name = "embedding-search", version = "0.2.0")]
 impl ServerHandler for Server {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo::new(
@@ -100,9 +112,9 @@ impl ServerHandler for Server {
         )
         .with_server_info(rmcp::model::Implementation::new(
             "embedding-search",
-            "0.1.0",
+            env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions(SKILL.to_string())
+        .with_instructions(skill_instructions().to_string())
     }
 }
 
@@ -175,4 +187,19 @@ pub fn run() -> Result<()> {
         .build()
         .context("tokio runtime")?;
     rt.block_on(serve_async())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_instructions_strips_plugin_frontmatter() {
+        // SKILL.md is the single source; it carries plugin-Skill YAML
+        // frontmatter that must not leak into MCP instructions.
+        assert!(SKILL.starts_with("---\n"));
+        let body = skill_instructions();
+        assert!(body.starts_with("# embedding-search"));
+        assert!(!body.contains("description:"));
+    }
 }

@@ -1,5 +1,5 @@
 use crate::error::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -293,6 +293,32 @@ impl Db {
                 map_chunk_row,
             )
             .optional()?)
+    }
+
+    /// Batch form of `chunk_by_vector_id`: one prepared `IN (...)`
+    /// query (one lock, one scan) keyed by `vector_id`. The search hot
+    /// path materializes the whole over-fetched neighborhood at once —
+    /// per-id round-trips would be O(candidates) Mutex+SQL hits.
+    pub fn chunks_by_vector_ids(&self, ids: &[u64]) -> Result<HashMap<u64, ChunkRow>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ph = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT c.id, c.file_id, f.path, c.chunk_index, c.content,
+                    c.start_byte, c.end_byte, c.node_type, c.language, c.vector_id
+             FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE c.vector_id IN ({ph})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let bound = ids.iter().map(|&v| v as i64);
+        let rows = stmt.query_map(params_from_iter(bound), map_chunk_row)?;
+        let mut m = HashMap::with_capacity(ids.len());
+        for r in rows {
+            let c = r?;
+            m.insert(c.vector_id, c);
+        }
+        Ok(m)
     }
 
     pub fn chunks_for_file(&self, path: &str) -> Result<Vec<ChunkRow>> {

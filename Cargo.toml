@@ -6,7 +6,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 authors = ["sensiarion"]
 repository = "https://github.com/sensiarion/embedding-search"
@@ -32,6 +32,11 @@ indicatif = "0.18"
 rusqlite = { version = "0.39", features = ["bundled"] }
 ureq = { version = "3", features = ["json"] }
 fastembed = "5.13"
+# Model2Vec/StaticModel backend: static token-embedding matrix
+# (`model.safetensors`) + HF tokenizer, mean-pool + L2. Already in the
+# build graph transitively via fastembed, so no extra compile cost.
+safetensors = "0.7"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # default-features=false drops the optional `numkong` SIMD C kernels:
 # numkong 7.6's dynamic-dispatch C fails to compile on the older
 # GCC/Clang on CI runners (avx512fp16 / NEON SDOT inlining). usearch

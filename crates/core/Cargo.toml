@@ -21,6 +21,8 @@ chrono.workspace = true
 rusqlite.workspace = true
 ureq.workspace = true
 fastembed.workspace = true
+safetensors.workspace = true
+tokenizers.workspace = true
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"] }
 usearch.workspace = true
 tree-sitter.workspace = true

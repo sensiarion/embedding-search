@@ -1,7 +1,7 @@
 use embedding_search_core::chunker::Chunker;
 use embedding_search_core::config::{
-    model_spec, Config, EmbeddingProvider, ExecutionProvider, Precision, RemoteConfig,
-    DEFAULT_MODEL, SUPPORTED_MODELS,
+    model_spec, normalize_hf_repo, Config, EmbeddingProvider, ExecutionProvider, Precision,
+    RemoteConfig, DEFAULT_MODEL, SUPPORTED_MODELS,
 };
 use embedding_search_core::db::{Db, NewChunk};
 use std::path::Path;
@@ -23,10 +23,12 @@ fn config_defaults_are_sane() {
     assert_eq!(c.backend.execution_provider, ExecutionProvider::Auto);
     assert!(c.sync.embed_batch_bytes >= 4096);
     let spec = c.model_spec().expect("default model known");
-    assert_eq!(spec.dimensions, 768);
+    // default is the Model2Vec potion-multilingual-128M
+    assert_eq!(spec.dimensions, 256);
     assert_eq!(spec.multilingual, 5);
-    assert!(spec.supports_precision()); // default is a Xenova HF model
-                                        // local in-process backend by default
+    assert!(spec.static_model);
+    assert!(!spec.supports_precision()); // static matrix: precision N/A
+                                         // local in-process backend by default
     assert_eq!(c.model.provider, EmbeddingProvider::Local);
     // no custom ONNX override by default
     assert!(c.model.onnx_path.is_none());
@@ -91,6 +93,28 @@ fn select_model_builtin_is_local() {
 #[test]
 fn select_model_rejects_unknown_name() {
     assert!(Config::default().select_model("nope/nope").is_err());
+}
+
+#[test]
+fn normalize_hf_repo_strips_url_forms_to_id() {
+    let id = "Xenova/multilingual-e5-base";
+    assert_eq!(normalize_hf_repo(id), id);
+    assert_eq!(
+        normalize_hf_repo("https://huggingface.co/Xenova/multilingual-e5-base"),
+        id
+    );
+    assert_eq!(
+        normalize_hf_repo("http://www.huggingface.co/Xenova/multilingual-e5-base/tree/main"),
+        id
+    );
+    assert_eq!(
+        normalize_hf_repo("  hf.co/Xenova/multilingual-e5-base/  "),
+        id
+    );
+    assert_eq!(
+        normalize_hf_repo("https://huggingface.co/Xenova/multilingual-e5-base/blob/main/onnx"),
+        id
+    );
 }
 
 #[test]

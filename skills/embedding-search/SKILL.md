@@ -1,0 +1,1 @@
+../../crates/cli/src/SKILL.md
