@@ -36,7 +36,9 @@ claude plugin marketplace add sensiarion/embedding-search \
 
 That's the full setup. Restart the session (or open a new one) for the
 plugin to take effect. `claude plugin uninstall embedding-search-autouse`
-removes the MCP server and the hooks together. Everything below is
+removes the MCP server and the hooks together. The hooks are Node (not
+shell) so Windows, macOS and Linux all work — Node is already required by
+the `npx` MCP launcher, so no extra dependency. Everything below is
 optional / for understanding.
 
 #### MCP server only

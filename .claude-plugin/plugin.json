@@ -11,7 +11,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/prefer-search-session.sh\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/prefer-search-session.js\"",
             "timeout": 5,
             "statusMessage": "Loading embedding-search preference..."
           }
@@ -23,7 +23,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/prefer-search-turn.sh\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/prefer-search-turn.js\"",
             "timeout": 5
           }
         ]
