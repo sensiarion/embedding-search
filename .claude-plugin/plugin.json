@@ -1,0 +1,33 @@
+{
+  "name": "embedding-search-autouse",
+  "description": "Auto-directs Claude to prefer the embedding-search MCP (semantic code search) over grep/find for conceptual lookups, every session and every turn.",
+  "author": {
+    "name": "sensiarion",
+    "url": "https://github.com/sensiarion"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/prefer-search-session.sh\"",
+            "timeout": 5,
+            "statusMessage": "Loading embedding-search preference..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/prefer-search-turn.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

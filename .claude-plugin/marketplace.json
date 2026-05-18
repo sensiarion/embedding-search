@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "embedding-search",
+  "description": "Semantic code search MCP for Claude Code, plus a companion plugin that makes Claude use it automatically.",
+  "owner": {
+    "name": "sensiarion",
+    "url": "https://github.com/sensiarion"
+  },
+  "plugins": [
+    {
+      "name": "embedding-search-autouse",
+      "description": "Always prefer embedding-search semantic search over grep/find for conceptual code lookups.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

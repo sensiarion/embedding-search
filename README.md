@@ -23,7 +23,26 @@ paths are unreliable) — build from source there: `cargo build
 
 ### Claude Code
 
-One command (`--scope user` = available in every project):
+Install the plugin — that's it. The plugin bundles **both** the MCP
+server (`.mcp.json`) and the auto-use hooks (`SessionStart` +
+`UserPromptSubmit`), so this single install registers the `search_code`
+tool at user scope **and** makes Claude actually reach for it instead of
+grep/find. No separate `claude mcp add`.
+
+```bash
+claude plugin marketplace add sensiarion/embedding-search \
+&& claude plugin install embedding-search-autouse@embedding-search
+```
+
+That's the full setup. Restart the session (or open a new one) for the
+plugin to take effect. `claude plugin uninstall embedding-search-autouse`
+removes the MCP server and the hooks together. Everything below is
+optional / for understanding.
+
+#### MCP server only
+
+If you only want the `search_code` tool and will steer Claude to it
+yourself:
 
 ```bash
 claude mcp add --scope user --env RUST_LOG=warn embedding-search \
@@ -44,6 +63,18 @@ Or hand-edit `~/.claude.json`:
 }
 ```
 
+#### Why the companion plugin
+
+The MCP exposes `search_code`, but Claude still has to *choose* it over
+grep/find — and a deferred tool schema makes grep the path of least
+resistance. The `embedding-search-autouse` plugin fixes that: a
+`SessionStart` hook injects a standing "prefer semantic search" directive
+and a `UserPromptSubmit` hook reinforces it every turn (same mechanism the
+caveman plugin uses, so it survives context compaction).
+
+Turn it off any time by telling Claude "stop using embedding search", or
+`claude plugin uninstall embedding-search-autouse`.
+
 ### OpenCode
 
 Edit `~/.config/opencode/opencode.json` (global) or `opencode.json` (per
@@ -62,6 +93,26 @@ repo) — note OpenCode uses `mcp`/`type: local`/`environment`, not the
     }
   }
 }
+```
+
+#### Make OpenCode use it automatically
+
+OpenCode has no plugin-bundled-MCP and no `SessionStart`/`UserPromptSubmit`
+hooks, so it can't be a single install like Claude Code — the MCP block
+above is required either way. To get the auto-use nudge on top, pick one:
+
+**A. Plugin (per-turn nudge, the `chat.message` hook — closest OpenCode
+equivalent).** Copy [`opencode/prefer-search.js`](opencode/prefer-search.js)
+from this repo to `~/.config/opencode/plugin/` (global) or
+`.opencode/plugin/` (per repo), then restart OpenCode. It prepends a
+"prefer semantic search" directive to every user message.
+
+**B. Instructions file (no plugin, simplest).** OpenCode reads `AGENTS.md`.
+Add a line there:
+
+```md
+For code exploration prefer the embedding-search semantic search tool over
+grep/find; use grep/find only for exact known strings.
 ```
 
 ## CLI
