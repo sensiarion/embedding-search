@@ -215,6 +215,21 @@ fn chunker_unknown_ext_line_window() {
     assert_eq!(chunks[0].node_type, "lines");
 }
 
+#[test]
+fn chunker_crlf_multibyte_does_not_panic() {
+    // CRLF + Cyrillic (2-byte) over the 100-line window: the old
+    // `len()+1` offset drift sliced mid-char and panicked. >120 lines
+    // so the windowing slice (not just one full-content chunk) runs.
+    let txt = "импорт SPage из \"@apps/portal\";\r\n".repeat(150);
+    let ck = Chunker::new(4096);
+    let (_lang, chunks) = ck.chunk_file(Path::new("a.xyz"), &txt);
+    assert!(chunks.len() >= 2, "expected windowed chunks");
+    // every chunk's bytes are valid UTF-8 (no mid-char split)
+    for c in &chunks {
+        assert!(std::str::from_utf8(c.content.as_bytes()).is_ok());
+    }
+}
+
 fn chunk(idx: i32, content: &str, hash: &str) -> NewChunk {
     NewChunk {
         chunk_index: idx,

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- Fix: indexing panicked ("byte index N is not a char boundary") on
+  files with CRLF line endings and multibyte (e.g. Cyrillic) content
+  — the line-window chunker miscounted `\r\n` as one byte. Such files
+  (common in frontend repos) now index correctly.
+
 ## 0.2.0
 
 - **BREAKING:** the default model is now `minishlab/potion-multilingual-128M`

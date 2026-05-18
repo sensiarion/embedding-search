@@ -102,7 +102,7 @@ fn skill_instructions() -> &'static str {
     }
 }
 
-#[tool_handler(name = "embedding-search", version = "0.2.0")]
+#[tool_handler(name = "embedding-search", version = "0.2.1")]
 impl ServerHandler for Server {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo::new(

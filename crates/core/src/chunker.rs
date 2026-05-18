@@ -334,32 +334,39 @@ impl Chunker {
     fn line_chunk(&self, content: &str, base_offset: usize) -> Vec<Chunk> {
         const LINES_PER: usize = 100;
         const OVERLAP: usize = 20;
-        let lines: Vec<&str> = content.lines().collect();
-        if lines.is_empty() {
+        // Byte offset of each line start. `split_inclusive('\n')`
+        // keeps the terminator so piece lengths are exact for `\n`
+        // AND `\r\n` (the old `len()+1` drifted on CRLF, landing a
+        // slice mid-char on multibyte text → panic). A line start is
+        // right after `\n` (ASCII) so every offset is a char boundary.
+        let mut line_starts = Vec::new();
+        let mut pos = 0usize;
+        for piece in content.split_inclusive('\n') {
+            line_starts.push(pos);
+            pos += piece.len();
+        }
+        let n = line_starts.len();
+        if n == 0 {
             return Vec::new();
         }
-        // byte offset of each line start within `content`
-        let mut line_starts = Vec::with_capacity(lines.len() + 1);
-        let mut pos = 0usize;
-        for l in &lines {
-            line_starts.push(pos);
-            pos += l.len() + 1; // assume \n
-        }
-        line_starts.push(content.len());
 
         let mut out = Vec::new();
         let mut i = 0;
-        while i < lines.len() {
-            let end = (i + LINES_PER).min(lines.len());
+        while i < n {
+            let end = (i + LINES_PER).min(n);
             let s = line_starts[i];
-            let e = line_starts[end].min(content.len());
+            let e = if end < n {
+                line_starts[end]
+            } else {
+                content.len()
+            };
             out.push(Chunk {
                 content: content[s..e].to_string(),
                 start_byte: (base_offset + s) as i64,
                 end_byte: (base_offset + e) as i64,
                 node_type: NodeKind::Lines.as_str().into(),
             });
-            if end == lines.len() {
+            if end == n {
                 break;
             }
             i += LINES_PER - OVERLAP;
