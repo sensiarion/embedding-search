@@ -421,32 +421,88 @@ impl SyncEngine {
     }
 
     fn collect_files(&self) -> Vec<PathBuf> {
-        let mut out = Vec::new();
         // Nested git linked worktrees are duplicate checkouts of the
         // same code — resolve their roots once and prune those subtrees
         // (only the working tree being synced is "the codebase").
         let worktrees = linked_worktree_roots(&self.project_dir);
-        let walk = ignore::WalkBuilder::new(&self.project_dir)
+        // Parallel walk (ripgrep's `ignore` is already the fastest
+        // gitignore-aware walker; the win is using its thread pool, not
+        // a different crate). Threads gather raw file paths via a
+        // channel — only `project_dir`-relative filtering and the
+        // deterministic sort happen on the collecting side, so the
+        // visitor needs no `&self`. `is_file()` (not the walker's
+        // dirent kind) so a symlinked source file is followed and
+        // still indexed, matching the pre-parallel behavior.
+        let (tx, rx) = std::sync::mpsc::channel();
+        ignore::WalkBuilder::new(&self.project_dir)
             .hidden(false)
             .git_ignore(true)
             .git_global(true)
             .parents(true)
             .filter_entry(move |e| !worktrees.iter().any(|w| e.path().starts_with(w)))
-            .build();
-        for entry in walk.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
+            .build_parallel()
+            .run(|| {
+                let tx = tx.clone();
+                Box::new(move |res| {
+                    if let Ok(entry) = res {
+                        let path = entry.into_path();
+                        if path.is_file() {
+                            let _ = tx.send(path);
+                        }
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+        drop(tx);
+        let mut out: Vec<PathBuf> = rx
+            .into_iter()
+            .filter(|path| {
+                path.strip_prefix(&self.project_dir)
+                    .is_ok_and(|rel| !self.is_excluded(rel))
+            })
+            .collect();
+        // Parallel traversal yields a run-dependent order; sort so the
+        // file list (and any downstream merkle/diff) is deterministic.
+        out.sort();
+        // A git-tracked symlink whose target is also walked (e.g.
+        // `skills/x -> crates/.../x`) would embed the same content
+        // twice. Dedup by canonical path, but never pay a per-file
+        // `canonicalize` (O(path-depth) syscalls) on the symlink-free
+        // common case: resolve `project_dir` once, key each real file
+        // as `canon_root + rel` (no syscall, still matches when the
+        // project has a symlinked ancestor), and `canonicalize` only
+        // actual symlinks. A symlink is dropped only when its target is
+        // itself a walked real file (out-of-tree targets are kept); the
+        // real file's path is the one indexed, so search hits the
+        // canonical location. Reals stay ahead of kept links and both
+        // keep the sorted order, so vector-id allocation is stable.
+        let canon_root = std::fs::canonicalize(&self.project_dir)
+            .unwrap_or_else(|_| self.project_dir.clone());
+        let mut seen: HashSet<PathBuf> = HashSet::with_capacity(out.len());
+        let mut reals: Vec<PathBuf> = Vec::with_capacity(out.len());
+        let mut links: Vec<PathBuf> = Vec::new();
+        for path in out {
+            if path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                links.push(path);
+            } else {
+                let rel = path.strip_prefix(&self.project_dir).unwrap_or(path.as_path());
+                seen.insert(canon_root.join(rel));
+                reals.push(path);
             }
-            let Ok(rel) = path.strip_prefix(&self.project_dir) else {
-                continue;
-            };
-            if self.is_excluded(rel) {
-                continue;
-            }
-            out.push(path.to_path_buf());
         }
-        out
+        if links.is_empty() {
+            return reals;
+        }
+        for link in links {
+            let target = std::fs::canonicalize(&link).unwrap_or_else(|_| link.clone());
+            if seen.insert(target) {
+                reals.push(link);
+            }
+        }
+        reals
     }
 
     fn rel_str(&self, path: &Path) -> String {
@@ -687,10 +743,20 @@ impl SyncEngine {
 
         let existing = self.db.lock().unwrap().file_states()?;
 
-        // Bounded windows cap peak memory at O(window) chunked files,
-        // not O(repo). Window order is preserved so vector-id allocation
-        // stays deterministic. `self.pool` (private, not the global
-        // pool) bounds CPU to `sync_threads`.
+        // Chunking (CPU: file read + tree-sitter parse) and embedding
+        // (GPU, blocking) run as a bounded producer/consumer pipeline so
+        // they overlap instead of idling each other's hardware: a
+        // producer parallel-classifies one window at a time and forwards
+        // results; the consumer (this thread) batches + embeds + writes.
+        // The producer runs ahead while the consumer embeds, which also
+        // keeps the encoder's length-sorter fed with a continuously
+        // refilled candidate pool. `sync_channel(window)` bounds the
+        // in-flight chunked files (backpressure) so peak memory stays
+        // O(window), not O(repo). Each window is `collect`ed in order
+        // and sent sequentially, and the consumer drains in receive
+        // order, so vector-id allocation is identical to the serial
+        // path (deterministic index). `self.pool` (private, not the
+        // global pool) bounds chunking CPU to `sync_threads`.
         use rayon::prelude::*;
         let batch_chunks = self.config.embed_batch().max(1);
         let batch_bytes = self.config.sync.embed_batch_bytes.max(4096);
@@ -703,14 +769,29 @@ impl SyncEngine {
         let mut seen: HashSet<String> = HashSet::with_capacity(total);
         let mut done = 0usize;
         let mut discovered = 0usize;
-        for win in files.chunks(window) {
-            let classified: Vec<(String, Option<FileWork>)> = self.pool.install(|| {
-                win.par_iter()
-                    .map(|p| self.classify(p, &existing, force))
-                    .collect()
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Option<FileWork>)>(window);
+        let files_ref = &files;
+        let existing_ref = &existing;
+        std::thread::scope(|s| -> Result<()> {
+            let producer = s.spawn(move || {
+                for win in files_ref.chunks(window) {
+                    let classified: Vec<(String, Option<FileWork>)> = self.pool.install(|| {
+                        win.par_iter()
+                            .map(|p| self.classify(p, existing_ref, force))
+                            .collect()
+                    });
+                    for item in classified {
+                        // Err only if the consumer stopped early (flush
+                        // failed): nothing left to feed, so exit.
+                        if tx.send(item).is_err() {
+                            return;
+                        }
+                    }
+                }
             });
 
-            for (rel, work) in classified {
+            for (rel, work) in rx {
                 done += 1;
                 let changed = work.is_some();
                 match work {
@@ -745,12 +826,16 @@ impl SyncEngine {
                     });
                 }
             }
-        }
-        stats.chunks_total += self.flush_group(group)?;
-        progress(SyncEvent::Chunks {
-            embedded: stats.chunks_total,
-            discovered,
-        });
+            stats.chunks_total += self.flush_group(std::mem::take(&mut group))?;
+            progress(SyncEvent::Chunks {
+                embedded: stats.chunks_total,
+                discovered,
+            });
+            producer
+                .join()
+                .map_err(|_| Error::Index("sync classify thread panicked".into()))?;
+            Ok(())
+        })?;
 
         let to_delete: Vec<String> = existing
             .keys()

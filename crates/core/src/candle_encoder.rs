@@ -10,11 +10,12 @@
 
 use crate::embedder::load_tokenizer;
 use crate::error::{Error, Result};
+use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::nomic_bert::{Config as NomicConfig, NomicBertModel};
 use std::path::Path;
-use tokenizers::Tokenizer;
+use tokenizers::{Encoding, Tokenizer};
 
 /// candle tensor-op errors are uniform ("a GPU op failed") on the hot
 /// path — one `From` lets `run()` use `?`. `build()` keeps explicit
@@ -65,8 +66,25 @@ impl CandleEncoder {
         let device = metal_device()?;
         let cfg: NomicConfig = serde_json::from_slice(config_json)
             .map_err(|e| Error::Embed(format!("candle: nomic config: {e}")))?;
+        // Load weights at their native precision: an f16/bf16 export
+        // runs half-precision (matmul-bandwidth win) for free, an f32
+        // export stays f32 (no silent lossy downcast). Read the dtype
+        // off the safetensors header rather than forcing one. The L2
+        // norm in `run` is upcast to f32 regardless.
+        // SAFETY: same contract as `from_mmaped_safetensors` below —
+        // the file must not be mutated for the mmap's lifetime, which
+        // holds for our immutable HF cache.
+        let native = unsafe { MmapedSafetensors::new(safetensors) }
+            .map_err(|e| Error::Embed(format!("candle: safetensors open: {e}")))?
+            .tensors()
+            .first()
+            .map(|(_, v)| v.dtype())
+            .ok_or_else(|| Error::Embed("candle: empty safetensors".into()))?;
+        let dtype = DType::try_from(native).map_err(|e| {
+            Error::Embed(format!("candle: unsupported safetensors dtype {native:?}: {e}"))
+        })?;
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[safetensors], DType::F32, &device)
+            VarBuilder::from_mmaped_safetensors(&[safetensors], dtype, &device)
                 .map_err(|e| Error::Embed(format!("candle: safetensors: {e}")))?
         };
         let model = NomicBertModel::load(vb, &cfg)
@@ -91,21 +109,34 @@ impl CandleEncoder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let mut out = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(CANDLE_BATCH) {
-            out.extend(self.run(chunk)?);
+        // Tokenize once, then sub-batch by ascending token length:
+        // NomicBert attention is O(seq^2) and every row in a sub-batch
+        // pads up to its longest, so a single long chunk mixed with
+        // short ones makes the short ones pay the long seq. Sorting
+        // groups similar lengths; results are scattered back to the
+        // caller's order so this stays transparent to the collector.
+        let encs = self
+            .tok
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|e| Error::Embed(format!("candle: tokenize: {e}")))?;
+        let mut order: Vec<usize> = (0..encs.len()).collect();
+        order.sort_unstable_by_key(|&i| encs[i].get_ids().len());
+
+        let mut out = vec![Vec::new(); texts.len()];
+        for window in order.chunks(CANDLE_BATCH) {
+            let batch: Vec<&Encoding> = window.iter().map(|&i| &encs[i]).collect();
+            for (&slot, vec) in window.iter().zip(self.forward(&batch)?) {
+                out[slot] = vec;
+            }
         }
         Ok(out)
     }
 
-    /// One forward on `[chunk, seq]` (seq = chunk's longest, already
-    /// truncated to `max_length`). candle is not the ONNX CoreML EP, so
-    /// a per-call dynamic shape is fine — no graph-per-shape blowup.
-    fn run(&self, chunk: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let encs = self
-            .tok
-            .encode_batch(chunk.to_vec(), true)
-            .map_err(|e| Error::Embed(format!("candle: tokenize: {e}")))?;
+    /// One forward on a length-homogeneous sub-batch (`seq` = its
+    /// longest, already truncated to `max_length`). candle is not the
+    /// ONNX CoreML EP, so a per-call dynamic shape is fine — no
+    /// graph-per-shape blowup.
+    fn forward(&self, encs: &[&Encoding]) -> Result<Vec<Vec<f32>>> {
         let b = encs.len();
         let seq = encs
             .iter()
@@ -127,7 +158,9 @@ impl CandleEncoder {
         let mask = Tensor::from_vec(mask, (b, seq), &self.device)?;
 
         let hidden = self.model.forward(&ids, None, Some(&mask))?; // [b, seq, n_embd]
-        let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?; // CLS = token 0
+        // Upcast CLS to f32: L2 norm + readback stay full-precision
+        // regardless of the model dtype (no-op when weights are f32).
+        let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
         let norm = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
         Ok(cls.broadcast_div(&norm)?.to_vec2::<f32>()?)
     }
