@@ -30,8 +30,21 @@ impl From<candle_core::Error> for Error {
 /// (which is small on purpose to bound the ONNX CoreML/CUDA per-shape
 /// graph cache — a constraint candle does NOT have). A wider batch
 /// amortizes tokenize/upload/readback and raises GPU occupancy;
-/// working set is `BATCH * seq * n_embd * 4 B` ≈ 50 MB at seq 512.
-const CANDLE_BATCH: usize = 32;
+/// working set is `BATCH * seq * n_embd * 4 B` ≈ 50 MB at seq 512 per
+/// 32. Overridable via `EMBEDDING_SEARCH_CANDLE_BATCH` for tuning
+/// without a rebuild (default 32; the GPU-occupancy sweet spot is
+/// hardware-dependent).
+fn candle_batch() -> usize {
+    use std::sync::OnceLock;
+    static BATCH: OnceLock<usize> = OnceLock::new();
+    *BATCH.get_or_init(|| {
+        std::env::var("EMBEDDING_SEARCH_CANDLE_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(32)
+    })
+}
 
 /// CodeRankEmbed on Metal. CLS-pooled + L2-normalized; the query/doc
 /// prefix is applied by the caller (`Contract`), exactly as for the
@@ -122,10 +135,18 @@ impl CandleEncoder {
         let mut order: Vec<usize> = (0..encs.len()).collect();
         order.sort_unstable_by_key(|&i| encs[i].get_ids().len());
 
+        // ids/mask host staging reused across sub-batches (one alloc,
+        // grown to the largest window, instead of two `vec!`s per
+        // forward).
+        let mut ids_buf: Vec<u32> = Vec::new();
+        let mut mask_buf: Vec<u8> = Vec::new();
         let mut out = vec![Vec::new(); texts.len()];
-        for window in order.chunks(CANDLE_BATCH) {
+        for window in order.chunks(candle_batch()) {
             let batch: Vec<&Encoding> = window.iter().map(|&i| &encs[i]).collect();
-            for (&slot, vec) in window.iter().zip(self.forward(&batch)?) {
+            for (&slot, vec) in window
+                .iter()
+                .zip(self.forward(&batch, &mut ids_buf, &mut mask_buf)?)
+            {
                 out[slot] = vec;
             }
         }
@@ -136,7 +157,12 @@ impl CandleEncoder {
     /// longest, already truncated to `max_length`). candle is not the
     /// ONNX CoreML EP, so a per-call dynamic shape is fine — no
     /// graph-per-shape blowup.
-    fn forward(&self, encs: &[&Encoding]) -> Result<Vec<Vec<f32>>> {
+    fn forward(
+        &self,
+        encs: &[&Encoding],
+        ids_buf: &mut Vec<u32>,
+        mask_buf: &mut Vec<u8>,
+    ) -> Result<Vec<Vec<f32>>> {
         let b = encs.len();
         let seq = encs
             .iter()
@@ -144,18 +170,22 @@ impl CandleEncoder {
             .max()
             .unwrap_or(1)
             .max(1);
-        let mut ids = vec![0u32; b * seq];
-        let mut mask = vec![0u8; b * seq];
+        // resize(.., 0) reuses the existing capacity after the first
+        // window and re-zeros it (pad positions must be 0).
+        ids_buf.clear();
+        ids_buf.resize(b * seq, 0);
+        mask_buf.clear();
+        mask_buf.resize(b * seq, 0);
         for (r, e) in encs.iter().enumerate() {
             for (j, (&id, &m)) in e.get_ids().iter().zip(e.get_attention_mask()).enumerate() {
-                ids[r * seq + j] = id;
-                mask[r * seq + j] = m as u8;
+                ids_buf[r * seq + j] = id;
+                mask_buf[r * seq + j] = m as u8;
             }
         }
-        let ids = Tensor::from_vec(ids, (b, seq), &self.device)?;
+        let ids = Tensor::from_slice(&ids_buf[..b * seq], (b, seq), &self.device)?;
         // U8 mask: candle's NomicBert masking uses `where_cond`, whose
         // predicate must be an integer dtype, not f32.
-        let mask = Tensor::from_vec(mask, (b, seq), &self.device)?;
+        let mask = Tensor::from_slice(&mask_buf[..b * seq], (b, seq), &self.device)?;
 
         let hidden = self.model.forward(&ids, None, Some(&mask))?; // [b, seq, n_embd]
         // Upcast CLS to f32: L2 norm + readback stay full-precision

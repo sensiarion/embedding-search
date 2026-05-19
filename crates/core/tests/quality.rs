@@ -381,3 +381,50 @@ fn natural_language_query_lands_on_right_file_with_default_model() {
         hits.iter().map(|h| &h.file_path).collect::<Vec<_>>()
     );
 }
+
+// Embed-bound encoder throughput (isolates the candle/ONNX forward
+// from sync's fixed overhead — a clean step-by-step signal for the
+// CANDLE_BATCH / staging-reuse work). Sweep the GPU sub-batch without
+// rebuilding:
+//   for B in 16 32 48 64 96; do
+//     EMBEDDING_SEARCH_CANDLE_BATCH=$B cargo test -p embedding-search-core \
+//       --release --test quality candle_encoder_throughput -- \
+//       --ignored --exact --nocapture
+//   done
+#[test]
+#[ignore = "loads the real default model; embed-bound benchmark"]
+fn candle_encoder_throughput() {
+    use embedding_search_core::embedder::Embedder;
+    use std::time::Instant;
+
+    let cfg = Config::default();
+    let emb = Embedder::new(&cfg).expect("default model must load");
+
+    // 600 code-ish chunks, lengths fanned 1..=~480 tokens so the
+    // length-sorter and padding both get exercised like a real repo.
+    let snippet = "pub fn handle(req: Request) -> Result<Response> { \
+                   let ctx = build_context(&req)?; validate(&ctx)?; \
+                   Ok(dispatch(ctx).await?) } ";
+    let chunks: Vec<String> = (0..600)
+        .map(|i| snippet.repeat(1 + (i % 30)))
+        .collect();
+    let refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+
+    // Warm up (model already resident; this primes pipelines/caches).
+    emb.embed_documents(&refs[..32], cfg.embed_batch()).unwrap();
+
+    let iters = 3;
+    let t = Instant::now();
+    for _ in 0..iters {
+        emb.embed_documents(&refs, cfg.embed_batch()).unwrap();
+    }
+    let per = t.elapsed().as_secs_f64() / iters as f64;
+    let batch = std::env::var("EMBEDDING_SEARCH_CANDLE_BATCH")
+        .unwrap_or_else(|_| "32 (default)".into());
+    eprintln!(
+        "candle_batch={batch}  {} chunks  {:.3} s/run  {:.0} chunks/s",
+        refs.len(),
+        per,
+        refs.len() as f64 / per
+    );
+}
