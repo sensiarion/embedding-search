@@ -1,5 +1,5 @@
 use crate::chunker::{Chunk, Chunker};
-use crate::config::{Config, PROJECT_INDEX_DIR};
+use crate::config::{Config, ModelSpec, PROJECT_INDEX_DIR};
 use crate::db::{Db, NewChunk};
 use crate::embedder::Embedder;
 use crate::error::{Error, Result};
@@ -305,9 +305,10 @@ impl SyncEngine {
         let model_name = embedder.model_name.as_str();
         let dims = embedder.dimensions;
 
-        // Any change that makes existing chunks/vectors invalid (model,
-        // dims, precision, token cap, chunk byte cap, chunker logic)
-        // shifts the fingerprint → wipe stale index before reopening.
+        // Any change that makes existing chunks/vectors invalid (model
+        // + resolved weight variant, dims, token cap, chunk byte cap,
+        // chunker logic) shifts the fingerprint → wipe stale index
+        // before reopening.
         let fingerprint = config.index_fingerprint(model_name, dims, &embedder.fingerprint_tag());
         if index_dir.exists() {
             let probe = Db::open_or_create(&index_dir)?;
@@ -349,7 +350,7 @@ impl SyncEngine {
         // download/session entirely is what makes the default path
         // zero-cost.
         #[cfg(not(feature = "bench-stub"))]
-        let reranker = if config.rerank.enabled {
+        let reranker = if config.rerank_enabled() {
             Some(crate::rerank::Reranker::load(&config)?)
         } else {
             None
@@ -371,6 +372,19 @@ impl SyncEngine {
 
     pub fn index_dir(&self) -> &Path {
         &self.index_dir
+    }
+
+    /// The configured model name (`[model] default`, untagged) — the
+    /// value a user passes to `set` / `models set-default`.
+    pub fn configured_model(&self) -> &str {
+        &self.config.model.default
+    }
+
+    /// Whether the active model is a static Model2Vec (no transformer
+    /// /ONNX): cheap, no per-batch attention. A custom/remote model
+    /// (no spec) is treated as heavy. Drives the large-repo hint.
+    pub fn model_is_static(&self) -> bool {
+        crate::config::model_spec(&self.config.model.default).is_some_and(ModelSpec::is_static)
     }
 
     pub fn project_dir(&self) -> &Path {
@@ -438,6 +452,12 @@ impl SyncEngine {
             .hidden(false)
             .git_ignore(true)
             .git_global(true)
+            // `ignore` defaults `require_git(true)`: .gitignore / global
+            // git excludes are applied ONLY inside a git work tree, so a
+            // plain directory (or a repo before its first commit) would
+            // index files the user clearly meant to exclude. Honor
+            // .gitignore regardless of a .git dir (ripgrep --no-require-git).
+            .require_git(false)
             .parents(true)
             .filter_entry(move |e| !worktrees.iter().any(|w| e.path().starts_with(w)))
             .build_parallel()

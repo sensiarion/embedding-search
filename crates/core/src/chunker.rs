@@ -247,7 +247,7 @@ impl Chunker {
             let chunks = if chunks.is_empty() {
                 self.line_chunk(content, 0)
             } else {
-                chunks
+                self.merge_small(chunks, content)
             };
             (spec.label.to_string(), chunks)
         } else {
@@ -292,6 +292,70 @@ impl Chunker {
                 off = end;
             }
         }
+        out
+    }
+
+    /// Coalesce adjacent AST chunks whose combined span stays within
+    /// `max_chunk_bytes` (semble's strategy). One-chunk-per-leaf
+    /// fragments a file into many tiny vectors — a 3-line fn becomes
+    /// its own chunk — which retrieves poorly (especially for the
+    /// static bag-of-token-means models, where a longer span is far
+    /// more discriminative) and bloats the index. Merged content is
+    /// re-sliced from `src`, so the span is contiguous: inter-node
+    /// comments / blank lines between two merged nodes are kept rather
+    /// than dropped. A homogeneous run keeps its node type (e.g.
+    /// several functions → `function`, signature = the first); a mixed
+    /// run becomes `block`; `symbol` is cleared once a run is merged
+    /// (no single declaration owns it). Single chunks pass through
+    /// unchanged — `src[start..end]` equals their original content,
+    /// since every AST-path chunk is exactly its byte span.
+    fn merge_small(&self, mut chunks: Vec<Chunk>, src: &str) -> Vec<Chunk> {
+        if chunks.len() < 2 {
+            return chunks;
+        }
+        // collect_node emits in pre-order (already ascending), but a
+        // defensive sort makes the greedy pass independent of that.
+        chunks.sort_by_key(|c| c.start_byte);
+        let target = self.max_chunk_bytes.max(256);
+        let mut out: Vec<Chunk> = Vec::with_capacity(chunks.len());
+        let mut start = chunks[0].start_byte;
+        let mut end = chunks[0].end_byte;
+        let mut node_type = std::mem::take(&mut chunks[0].node_type);
+        let mut symbol = chunks[0].symbol.take();
+        let mut merged = false;
+        let mut flush = |s: i64, e: i64, nt: String, sym: Option<String>, m: bool| {
+            out.push(Chunk {
+                // Single chunk: the slice == its original content (every
+                // AST-path chunk is exactly its span), so re-slicing is
+                // not a behavior change, just a uniform code path.
+                content: src[s as usize..e as usize].to_string(),
+                start_byte: s,
+                end_byte: e,
+                node_type: nt,
+                symbol: if m { None } else { sym },
+            });
+        };
+        for c in chunks.into_iter().skip(1) {
+            // Only fold a strictly-following node in (collect_node never
+            // overlaps, but a nested/duplicate span must start a new
+            // run) and never past the cap, so enforce_cap can't later
+            // split a merged run mid-node.
+            if c.start_byte >= end && (c.end_byte - start) as usize <= target {
+                if c.node_type != node_type {
+                    node_type = NodeKind::Block.as_str().to_string();
+                }
+                end = c.end_byte;
+                merged = true;
+            } else {
+                flush(start, end, std::mem::take(&mut node_type), symbol.take(), merged);
+                start = c.start_byte;
+                end = c.end_byte;
+                node_type = c.node_type;
+                symbol = c.symbol;
+                merged = false;
+            }
+        }
+        flush(start, end, node_type, symbol, merged);
         out
     }
 

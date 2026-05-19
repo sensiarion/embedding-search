@@ -9,8 +9,24 @@
 
 use anyhow::{Context, Result};
 use embedding_search_core::{Config, SyncEngine};
+// `eval` runs only in a real (non-stub) build (`run_eval` re-execs out
+// of the bench-stub alias). The `rerank` core module + a real Embedder
+// don't exist under `bench-stub`, so the whole eval cluster is gated —
+// otherwise the alias build (`cargo xtask bench`/`bump`) won't compile.
+#[cfg(not(feature = "bench-stub"))]
+use embedding_search_core::{embedder::Embedder, rerank::Reranker};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+/// Models the effectiveness eval compares: the two static Model2Vec
+/// builtins + the default f16 transformer. Kept to these per the
+/// project decision (no code-specialized potion builtin).
+#[cfg(not(feature = "bench-stub"))]
+const EVAL_MODELS: &[&str] = &[
+    "minishlab/potion-multilingual-128M",
+    "minishlab/potion-base-32M",
+    "sensiarion/CodeRankEmbed-f16",
+];
 
 fn arg(args: &[String], key: &str, default: &str) -> String {
     args.iter()
@@ -151,17 +167,24 @@ fn bench(files: usize, seed: u64) -> Result<()> {
     let results = root.join("benchmarks/results");
     std::fs::create_dir_all(&results)?;
     let hist = results.join("history.jsonl");
-    let mut line = serde_json::to_string(&rec)?;
-    line.push('\n');
-    use std::io::Write;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&hist)?
-        .write_all(line.as_bytes())?;
+    append_jsonl(&hist, &rec)?;
 
     println!("{}", serde_json::to_string_pretty(&rec)?);
     println!("appended -> {}", hist.display());
+    Ok(())
+}
+
+/// Append one JSON record as a line to a `.jsonl` history file
+/// (created if absent). Shared by `bench` and `eval`.
+fn append_jsonl(path: &Path, rec: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
+    let mut line = serde_json::to_string(rec)?;
+    line.push('\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(line.as_bytes())?;
     Ok(())
 }
 
@@ -248,6 +271,354 @@ fn bump(new: &str) -> Result<()> {
     Ok(())
 }
 
+/// A (natural-language query, code) retrieval pair from CodeSearchNet.
+#[cfg(not(feature = "bench-stub"))]
+struct Pair {
+    query: String,
+    code: String,
+}
+
+/// Local cache of the CodeSearchNet python test pairs (jsonl). Kept
+/// out of git (see `.gitignore`); fetched once from the HF
+/// datasets-server, then reused so `eval` is offline-repeatable.
+#[cfg(not(feature = "bench-stub"))]
+fn load_csn(root: &Path, n: usize) -> Result<Vec<Pair>> {
+    let dir = root.join("benchmarks/csn");
+    std::fs::create_dir_all(&dir)?;
+    let cache = dir.join("python_test.jsonl");
+
+    let mut pairs: Vec<Pair> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&cache) {
+        for line in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line)?;
+            pairs.push(Pair {
+                query: v["q"].as_str().unwrap_or("").to_string(),
+                code: v["c"].as_str().unwrap_or("").to_string(),
+            });
+        }
+    }
+    if pairs.len() >= n {
+        pairs.truncate(n);
+        return Ok(pairs);
+    }
+
+    // datasets-server caps `length` at 100 — page through until `n`.
+    let agent = ureq::Agent::new_with_defaults();
+    let mut out = String::new();
+    pairs.clear();
+    let mut offset = 0usize;
+    while pairs.len() < n {
+        let url = format!(
+            "https://datasets-server.huggingface.co/rows?dataset=code-search-net%2Fcode_search_net\
+             &config=python&split=test&offset={offset}&length=100"
+        );
+        let body = agent
+            .get(&url)
+            .call()
+            .with_context(|| format!("fetch CSN rows @{offset}"))?
+            .into_body()
+            .read_to_string()?;
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        let rows = v["rows"].as_array().context("CSN: no rows")?;
+        if rows.is_empty() {
+            break;
+        }
+        for r in rows {
+            let row = &r["row"];
+            let q = row["func_documentation_string"].as_str().unwrap_or("");
+            let c = row["func_code_string"].as_str().unwrap_or("");
+            if q.trim().is_empty() || c.trim().is_empty() {
+                continue;
+            }
+            out.push_str(&serde_json::json!({ "q": q, "c": c }).to_string());
+            out.push('\n');
+            pairs.push(Pair {
+                query: q.to_string(),
+                code: c.to_string(),
+            });
+            if pairs.len() >= n {
+                break;
+            }
+        }
+        offset += 100;
+    }
+    std::fs::write(&cache, &out).context("write CSN cache")?;
+    Ok(pairs)
+}
+
+#[cfg(not(feature = "bench-stub"))]
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let d = (na.sqrt() * nb.sqrt()).max(1e-12);
+    dot / d
+}
+
+/// Single-relevant retrieval metrics accumulator. The gold doc is the
+/// code at the query's own index, so NDCG@10 reduces to `1/log2(rank+1)`
+/// and MRR to `1/rank`.
+#[cfg(not(feature = "bench-stub"))]
+#[derive(Default)]
+struct Metrics {
+    n: usize,
+    mrr: f64,
+    r1: usize,
+    r5: usize,
+    ndcg: f64,
+}
+
+#[cfg(not(feature = "bench-stub"))]
+impl Metrics {
+    fn add(&mut self, rank: usize) {
+        self.n += 1;
+        if rank == 1 {
+            self.r1 += 1;
+        }
+        if rank <= 5 {
+            self.r5 += 1;
+        }
+        if rank <= 10 {
+            self.mrr += 1.0 / rank as f64;
+            self.ndcg += 1.0 / ((rank as f64) + 1.0).log2();
+        }
+    }
+
+    fn record(&self, extra: serde_json::Value) -> serde_json::Value {
+        let nf = self.n.max(1) as f64;
+        let round4 = |x: f64| (x * 1e4).round() / 1e4;
+        let mut v = serde_json::json!({
+            "n": self.n,
+            "mrr@10": round4(self.mrr / nf),
+            "recall@1": round4(self.r1 as f64 / nf),
+            "recall@5": round4(self.r5 as f64 / nf),
+            "ndcg@10": round4(self.ndcg / nf),
+        });
+        let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) else {
+            return v;
+        };
+        for (k, val) in e {
+            o.insert(k.clone(), val.clone());
+        }
+        v
+    }
+}
+
+/// Retrieval metrics for one model over the pairs. Always emits the
+/// `base` (pure cosine ranking) record; when `reranker` is `Some`,
+/// also emits a `rerank` record — the cross-encoder re-scores the
+/// model's top-`top_n` cosine candidates (exactly the optional
+/// `[rerank]` search stage), so the benchmark shows what enabling it
+/// buys per model. Every evaluated query is reranked (the exact set
+/// the `base` cosine record measures), so `base` vs `rerank` is a
+/// like-for-like delta — no subsampled pseudo-baseline. Cost is
+/// O(queries · top_n · seq²) (independent of corpus size); the fast
+/// ModernBERT reranker (candle Metal / int8 CPU) keeps it tractable.
+#[cfg(not(feature = "bench-stub"))]
+fn eval_model(
+    name: &str,
+    pairs: &[Pair],
+    queries_n: usize,
+    reranker: Option<&Reranker>,
+) -> Result<Vec<serde_json::Value>> {
+    let mut cfg = Config::default();
+    cfg.model.default = name.to_string();
+    let emb = Embedder::new(&cfg).with_context(|| format!("load {name}"))?;
+
+    // The corpus (distractor pool) is every loaded pair's code; only
+    // the first `queries_n` docstrings are used as queries. A large
+    // pool with far fewer queries is the realistic, discriminating
+    // setup — ranking the gold among thousands, not among the handful
+    // of queries.
+    let t0 = Instant::now();
+    let codes: Vec<&str> = pairs.iter().map(|p| p.code.as_str()).collect();
+    let doc_vecs = emb
+        .embed_documents(&codes, cfg.embed_batch())
+        .context("embed corpus")?;
+    let embed_ms = t0.elapsed().as_millis() as u64;
+
+    let mut base = Metrics::default();
+    let mut reranked = Metrics::default();
+    let mut rerank_ms = 0u64;
+    let top_n = reranker.map_or(0, Reranker::top_n);
+
+    for (i, p) in pairs.iter().take(queries_n).enumerate() {
+        let q = emb.embed_query(&p.query)?;
+        // Full cosine ranking (stable: ties keep corpus order).
+        let mut sims: Vec<(usize, f32)> = doc_vecs
+            .iter()
+            .enumerate()
+            .map(|(j, d)| (j, cosine(&q, d)))
+            .collect();
+        sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let pos = |order: &[(usize, f32)]| {
+            order.iter().position(|(j, _)| *j == i).map_or(order.len(), |r| r) + 1
+        };
+        base.add(pos(&sims));
+
+        // Rerank every query — `base` and `rerank` then measure the
+        // exact same set (honest delta, no subsample illusion).
+        let Some(rr) = reranker else {
+            continue;
+        };
+        // Re-score the top-n cosine candidates jointly (query, code),
+        // reorder that prefix, keep the cosine tail — mirrors
+        // search::rerank_fused.
+        let n = top_n.min(sims.len());
+        let cand: Vec<usize> = sims[..n].iter().map(|(j, _)| *j).collect();
+        let passages: Vec<&str> = cand.iter().map(|&j| pairs[j].code.as_str()).collect();
+        let t = Instant::now();
+        let scores = rr.score(&p.query, &passages)?;
+        rerank_ms += t.elapsed().as_millis() as u64;
+        let mut prefix: Vec<usize> = (0..n).collect();
+        prefix.sort_by(|&a, &b| {
+            scores[b]
+                .partial_cmp(&scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let rank = match prefix.iter().position(|&k| cand[k] == i) {
+            Some(r) => r + 1,
+            // Gold fell outside the reranked window: keep its cosine
+            // position, shifted past the n reranked slots.
+            None => n + sims[n..].iter().position(|(j, _)| *j == i).map_or(0, |r| r + 1),
+        };
+        reranked.add(rank);
+    }
+
+    let mut out = vec![base.record(serde_json::json!({
+        "model": name,
+        "variant": "base",
+        "corpus": pairs.len(),
+        "queries": queries_n,
+        "embed_ms": embed_ms,
+        "dims": emb.dimensions,
+    }))];
+    if reranker.is_some() {
+        // Same query set as `base` above (every query reranked) — read
+        // the two together for the cross-encoder's like-for-like delta.
+        out.push(reranked.record(serde_json::json!({
+            "model": name,
+            "variant": "rerank",
+            "corpus": pairs.len(),
+            "queries": queries_n,
+            "reranker": cfg.rerank.model,
+            "top_n": top_n,
+            "rerank_ms": rerank_ms,
+            "dims": emb.dimensions,
+        })));
+    }
+    Ok(out)
+}
+
+/// bench-stub builds never reach this: `run_eval` re-execs a real
+/// build and `process::exit`s first. Present only so `main` compiles
+/// under the alias feature.
+#[cfg(feature = "bench-stub")]
+fn eval(_cn: usize, _qn: usize, _rr: bool, _tn: usize, _ml: usize) -> Result<()> {
+    unreachable!("eval re-execs into a non-stub build via run_eval")
+}
+
+#[cfg(not(feature = "bench-stub"))]
+fn eval(
+    corpus_n: usize,
+    queries_n: usize,
+    do_rerank: bool,
+    rerank_top_n: usize,
+    rerank_max_len: usize,
+) -> Result<()> {
+    let root = workspace_root();
+    let pairs = load_csn(&root, corpus_n).context("load CodeSearchNet")?;
+    anyhow::ensure!(!pairs.is_empty(), "no CSN pairs loaded");
+    let queries_n = queries_n.min(pairs.len());
+    println!(
+        "CodeSearchNet python/test — {} corpus docs, {} queries\n",
+        pairs.len(),
+        queries_n,
+    );
+
+    let results = root.join("benchmarks/results");
+    std::fs::create_dir_all(&results)?;
+    let hist = results.join("effectiveness.jsonl");
+    let commit = git_short();
+    let date = chrono::Utc::now().to_rfc3339();
+    let host = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+
+    // Rerank is OFF unless `--rerank`. The cross-encoder is
+    // model-independent (scores raw query↔code), so load once. Every
+    // evaluated query is reranked → cost O(queries · top_n · seq²)
+    // (independent of corpus size); the default ModernBERT reranker
+    // (candle Metal / int8 CPU) keeps it tractable.
+    // `Reranker`'s ORT batch is `cfg.embed_batch()`;
+    // the default embed model (CodeRankEmbed) has rec_batch 4 → tiny
+    // batches, and the reranker never touches the embedder, so point
+    // the cfg at a static model (rec_batch 64) purely for a sane batch
+    // and cap its seq.
+    let reranker = if !do_rerank {
+        None
+    } else {
+        eprintln!(
+            "rerank ON: ~{} cross-encodes ({} models × {} queries × \
+             top_n {}), seq≤{}.",
+            EVAL_MODELS.len() * queries_n * rerank_top_n,
+            EVAL_MODELS.len(),
+            queries_n,
+            rerank_top_n,
+            rerank_max_len,
+        );
+        let mut rcfg = Config::default();
+        rcfg.model.default = "minishlab/potion-base-32M".to_string();
+        rcfg.model.max_length = rerank_max_len;
+        rcfg.rerank.top_n = rerank_top_n;
+        match Reranker::load(&rcfg) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("reranker unavailable ({e}); base only");
+                None
+            }
+        }
+    };
+
+    for name in EVAL_MODELS {
+        for mut rec in eval_model(name, &pairs, queries_n, reranker.as_ref())? {
+            let obj = rec.as_object_mut().unwrap();
+            obj.insert("commit".into(), serde_json::json!(commit));
+            obj.insert("date".into(), serde_json::json!(date));
+            obj.insert("host".into(), serde_json::json!(host));
+            println!("{}", serde_json::to_string_pretty(&rec)?);
+            append_jsonl(&hist, &rec)?;
+        }
+    }
+    println!("\nappended -> {}", hist.display());
+    Ok(())
+}
+
+/// Under the `cargo xtask` alias the build carries `bench-stub` (the
+/// deterministic hash embedder) — meaningless for a retrieval metric.
+/// Re-exec the eval through a real (non-stub) build once.
+#[cfg(feature = "bench-stub")]
+fn run_eval(args: &[String]) -> Result<()> {
+    if std::env::var_os("ES_EVAL_REAL").is_some() {
+        // Shouldn't happen (a real build has no bench-stub), but guard
+        // against an infinite re-exec loop regardless.
+        anyhow::bail!("eval re-exec still has bench-stub — check the cargo alias");
+    }
+    eprintln!("eval needs a real model; rebuilding xtask without bench-stub…");
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["run", "-p", "xtask", "--release", "--"])
+        .args(args)
+        .env("ES_EVAL_REAL", "1")
+        .status()
+        .context("re-exec cargo run for eval")?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+#[cfg(not(feature = "bench-stub"))]
+fn run_eval(_args: &[String]) -> Result<()> {
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
@@ -260,14 +631,32 @@ fn main() -> Result<()> {
             println!("generated {n} files in {out}");
         }
         "bench" => bench(files, seed)?,
+        "eval" => {
+            // No-op on a real build; on the bench-stub alias build it
+            // re-execs a real build and exits, so the line below only
+            // runs with a genuine model.
+            run_eval(&args)?;
+            // Large distractor pool, far fewer queries — the
+            // discriminating setup (rank the gold among thousands).
+            let corpus = arg(&args, "--corpus", "5000").parse().unwrap_or(5000);
+            let queries = arg(&args, "--queries", "200").parse().unwrap_or(200);
+            // Rerank is opt-in and CPU-heavy: off unless `--rerank`,
+            // then bounded by these (intentionally small) defaults.
+            let do_rerank = args.iter().any(|a| a == "--rerank");
+            let rr_top_n = arg(&args, "--rerank-top-n", "20").parse().unwrap_or(20);
+            let rr_max_len = arg(&args, "--rerank-max-len", "256").parse().unwrap_or(256);
+            eval(corpus, queries, do_rerank, rr_top_n, rr_max_len)?;
+        }
         "bump" => {
             let v = args.get(1).context("usage: cargo xtask bump <version>")?;
             bump(v)?;
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <gen-corpus|bench|bump> \
-                 [--files N] [--seed S] [--out DIR]"
+                "usage: cargo xtask <gen-corpus|bench|eval|bump> \
+                 [--files N] [--seed S] [--corpus N] [--queries N] \
+                 [--rerank [--rerank-top-n N] \
+                 [--rerank-max-len N]] [--out DIR]"
             );
             std::process::exit(2);
         }

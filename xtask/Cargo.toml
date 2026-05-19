@@ -22,3 +22,6 @@ anyhow.workspace = true
 chrono.workspace = true
 tempfile = "3"
 libc = "0.2"
+# `eval` pulls the CodeSearchNet retrieval set from the HF
+# datasets-server (cached locally after the first run).
+ureq.workspace = true

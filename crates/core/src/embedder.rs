@@ -5,7 +5,7 @@ use std::sync::Mutex;
 #[cfg(not(feature = "bench-stub"))]
 use {
     crate::config::{
-        BackendConfig, EmbeddingProvider, ExecutionProvider, ModelArch, Precision, RemoteConfig,
+        BackendConfig, EmbeddingProvider, ExecutionProvider, ModelArch, RemoteConfig,
     },
     fastembed::{InitOptions, TokenizerFiles, UserDefinedEmbeddingModel},
     ort::{
@@ -226,7 +226,10 @@ fn read(path: &Path) -> Result<Vec<u8>> {
 /// Model2Vec routes. Callers build the trivial `fetch` closure from
 /// `r` (it must borrow `r`, so it can't be returned here).
 #[cfg(not(feature = "bench-stub"))]
-fn hf_repo(repo: &str, cache_dir: &Path) -> Result<(String, hf_hub::api::sync::ApiRepo)> {
+pub(crate) fn hf_repo(
+    repo: &str,
+    cache_dir: &Path,
+) -> Result<(String, hf_hub::api::sync::ApiRepo)> {
     // Defensive: a pre-existing config / copy-pasted browser URL may
     // hold a full HF URL where an id is expected.
     let repo = crate::config::normalize_hf_repo(repo);
@@ -282,19 +285,17 @@ fn user_defined_from(
     Ok(m)
 }
 
-/// Repo-relative ONNX candidates, first match wins. `explicit` (an
-/// exact file like `model_q4f16.onnx`) overrides the precision→file
-/// mapping; a bare name is also tried under `onnx/`.
+/// Repo-relative ONNX candidates, first match wins. `explicit` pins an
+/// exact file (a bare name is also tried under `onnx/`); absent ⇒ the
+/// conventional `onnx/model.onnx` with a flat `model.onnx` fallback.
 #[cfg(not(feature = "bench-stub"))]
-fn onnx_candidates(precision: Precision, explicit: Option<&str>) -> Vec<String> {
+fn onnx_candidates(explicit: Option<&str>) -> Vec<String> {
     match explicit {
         Some(f) if f.contains('/') => vec![f.to_string()],
         Some(f) => vec![f.to_string(), format!("onnx/{f}")],
         None => vec![
-            precision.onnx_file().to_string(),
             "onnx/model.onnx".to_string(),
             "model.onnx".to_string(),
-            "onnx/model_quantized.onnx".to_string(),
         ],
     }
 }
@@ -538,11 +539,10 @@ fn try_candle(
 }
 
 /// Download (cached) the chosen ONNX + tokenizer files from the HF
-/// repo. `explicit` pins an exact file; else the precision mapping.
+/// repo. `explicit` pins an exact file; else `onnx/model.onnx`.
 #[cfg(not(feature = "bench-stub"))]
 pub(crate) fn load_user_defined(
     repo: &str,
-    precision: Precision,
     cache_dir: &Path,
     explicit: Option<&str>,
 ) -> Result<UserDefinedEmbeddingModel> {
@@ -572,19 +572,18 @@ pub(crate) fn load_user_defined(
         assert_loadable_embedding(&repo, &fetch("config.json")?)?;
     }
 
-    // Explicit file (if any) overrides the precision mapping; first
-    // present candidate that fetches wins; all-miss → one actionable
-    // error. Many repos ship only `onnx/model.onnx` or flat
-    // `model.onnx`, so the precision path also falls back.
-    let candidates = onnx_candidates(precision, explicit);
+    // Explicit file (if any) is tried first; else the conventional
+    // `onnx/model.onnx` / flat `model.onnx`. First present candidate
+    // that fetches wins; all-miss → one actionable error.
+    let candidates = onnx_candidates(explicit);
     let (model_file, onnx) = candidates
         .iter()
         .filter(|f| present(f))
         .find_map(|f| fetch(f).ok().map(|b| (f.clone(), b)))
         .ok_or_else(|| {
             // Surface the repo's actual `.onnx` files so a wrong
-            // --onnx-file / unmapped precision is a pick-from-this list,
-            // not a dead end. (Listing absent only when offline.)
+            // --onnx-file is a pick-from-this list, not a dead end.
+            // (Listing absent only when offline.)
             let avail = listing.as_ref().map(|l| {
                 let mut v: Vec<&str> = l
                     .iter()
@@ -636,10 +635,7 @@ pub(crate) fn load_user_defined(
 /// Resolve a user `onnx_path` (file or directory) to the actual model
 /// file + the directory holding its tokenizer files.
 #[cfg(not(feature = "bench-stub"))]
-fn resolve_onnx(
-    path: &Path,
-    precision: Precision,
-) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+fn resolve_onnx(path: &Path) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     if path.is_file() {
         let dir = path
             .parent()
@@ -653,24 +649,14 @@ fn resolve_onnx(
             path.display()
         )));
     }
-    let pf = precision.onnx_file(); // e.g. "onnx/model_fp16.onnx"
-    let base = Path::new(pf)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model.onnx");
-    let candidates = [
-        path.join(pf),
-        path.join(base),
-        path.join("onnx/model.onnx"),
-        path.join("model.onnx"),
-    ];
+    let candidates = [path.join("onnx/model.onnx"), path.join("model.onnx")];
     let onnx = candidates
         .iter()
         .find(|p| p.is_file())
         .cloned()
         .ok_or_else(|| {
             Error::Embed(format!(
-                "no ONNX file under {} (looked for {pf} or model.onnx)",
+                "no ONNX file under {} (looked for onnx/model.onnx or model.onnx)",
                 path.display()
             ))
         })?;
@@ -778,11 +764,8 @@ fn load_url_user_defined(
 /// fingerprint busts and re-embeds), while a touch / checkout with
 /// identical bytes does not — unlike an mtime/size signature.
 #[cfg(not(feature = "bench-stub"))]
-fn load_local_user_defined(
-    path: &Path,
-    precision: Precision,
-) -> Result<(UserDefinedEmbeddingModel, String)> {
-    let (onnx_path, dir) = resolve_onnx(path, precision)?;
+fn load_local_user_defined(path: &Path) -> Result<(UserDefinedEmbeddingModel, String)> {
+    let (onnx_path, dir) = resolve_onnx(path)?;
     let onnx = read(&onnx_path)?;
     let digest = blake3::hash(&onnx).to_hex();
     let name = format!("custom:{}#{}", onnx_path.display(), &digest[..16]);
@@ -1314,7 +1297,7 @@ impl Embedder {
 
         // User-provided local ONNX model: bypass the registry entirely.
         if let Some(custom) = &cfg.model.onnx_path {
-            let (udm, name) = load_local_user_defined(custom, cfg.model.precision)?;
+            let (udm, name) = load_local_user_defined(custom)?;
             return Self::finish_user_defined(
                 udm,
                 cfg,
@@ -1337,21 +1320,16 @@ impl Embedder {
                         let name = format!("model2vec:{}", crate::config::normalize_hf_repo(repo));
                         return Ok(Self::from_static(sm, name, Contract::from_custom(cm)));
                     }
-                    // Per-model precision overrides the global one (so a
-                    // big model can be int8 without changing the rest);
-                    // an explicit `onnx_file` overrides precision.
-                    let precision = cm.precision.unwrap_or(cfg.model.precision);
+                    // The `onnx_file` (if set) is the sole weight
+                    // selector; absent ⇒ `onnx/model.onnx`.
                     let explicit = cm.onnx_file.as_deref();
                     // `load_user_defined`'s error already names the repo
                     // and every path tried; the CLI adds the model-name
                     // context — no extra wrap (avoids a nested prefix).
-                    let udm = load_user_defined(repo, precision, &cache_dir, explicit)?;
+                    let udm = load_user_defined(repo, &cache_dir, explicit)?;
                     // The identity (→ index fingerprint) tracks the
-                    // actual weights pulled: the exact file, else the
-                    // precision label.
-                    let tag = explicit
-                        .map(|f| format!("#{f}"))
-                        .unwrap_or_else(|| format!("@{}", precision.label()));
+                    // actual weights pulled: the exact file.
+                    let tag = format!("#{}", explicit.unwrap_or("onnx/model.onnx"));
                     (udm, format!("custom:{repo}{tag}"))
                 }
                 (None, Some(url)) => load_url_user_defined(&cm.name, url, &cache_dir)?,
@@ -1417,8 +1395,7 @@ impl Embedder {
                 // f32 file; otherwise the int8 file is pinned to CPU.
                 let accel = accel_active(&cfg.backend);
                 let (file, pin_cpu) = spec.onnx.resolve(accel);
-                let precision = spec.effective_precision(cfg.model.precision);
-                let udm = load_user_defined(repo()?, precision, &cache_dir, file)?;
+                let udm = load_user_defined(repo()?, &cache_dir, file)?;
                 let enc = OnnxEncoder::build(udm, cfg, pin_cpu, spec.pooling)?;
                 return Ok(Self {
                     dimensions: enc.dim,
@@ -1622,21 +1599,21 @@ mod tests {
     }
 
     #[test]
-    fn onnx_candidates_explicit_overrides_precision() {
+    fn onnx_candidates_explicit_then_default() {
         // bare explicit name also tried under onnx/
         assert_eq!(
-            onnx_candidates(Precision::Fp16, Some("model_q4f16.onnx")),
+            onnx_candidates(Some("model_q4f16.onnx")),
             vec!["model_q4f16.onnx", "onnx/model_q4f16.onnx"]
         );
         // explicit with a path is used verbatim
         assert_eq!(
-            onnx_candidates(Precision::Full, Some("onnx/model_q4.onnx")),
+            onnx_candidates(Some("onnx/model_q4.onnx")),
             vec!["onnx/model_q4.onnx"]
         );
-        // no explicit ⇒ precision mapping + fallbacks
+        // no explicit ⇒ conventional default + flat fallback
         assert_eq!(
-            onnx_candidates(Precision::Fp16, None)[0],
-            "onnx/model_fp16.onnx"
+            onnx_candidates(None),
+            vec!["onnx/model.onnx", "model.onnx"]
         );
     }
 

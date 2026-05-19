@@ -1,6 +1,7 @@
 /target
 .embedding-search/
 benchmarks/corpus/
+benchmarks/csn/
 benchmarks/results/*.jsonl
 *.usearch
 .idea/

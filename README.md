@@ -82,13 +82,14 @@ embedding-search init [path]                     create the index, first sync
 embedding-search sync [path] [--force]           re-index (progress bar)
 embedding-search search <query> [-n N] [--json] [--in DIR|FILE] [--no-sync]
 embedding-search status [path]                   index/sync health
+embedding-search set <model> [path]              per-project model override (re-index)
 embedding-search clear [path]                     delete the index (rebuild on next sync)
 embedding-search serve | --mcp                   run MCP server on stdio
 embedding-search debug files [path]              list indexed files
 embedding-search debug chunks <file> [--path .]  show a file's chunks
 embedding-search models list                     built-in + custom models
 embedding-search models set-default <name>       switch model (re-index)
-embedding-search models add --name X --repo ORG/M [--precision P|--onnx-file F] [--query-prefix .. --doc-prefix .. --pooling mean|cls|last-token | --e5_prefix] | --url URL
+embedding-search models add --name X --repo ORG/M [--onnx-file F] [--query-prefix .. --doc-prefix .. --pooling mean|cls|last-token | --e5_prefix] | --url URL
 embedding-search models remove <name>            unregister + delete cached weights (alias: rm)
 embedding-search models add-remote --name N --base-url U --model M   add + select a remote
 ```
@@ -104,7 +105,6 @@ command (CLI or MCP), so it's there to edit. Delete it to reset.
 ```toml
 [model]
 default   = "sensiarion/CodeRankEmbed-f16"    # SOTA code (f16 Metal / int8 CPU)
-precision = "fp16"                            # fp16 | int8 | full (ONNX models only)
 max_length = 512                              # token cap; keep ≈ max_chunk_bytes/4
 # onnx_path = "/path/to/model-dir"            # custom local ONNX (see below)
 # onnx_query_prefix = "query: "               # e.g. e5; omit for none
@@ -126,8 +126,10 @@ exclude = []
 exact_below = 50000           # < this many vectors → exact (brute) search, not HNSW
 
 [rerank]
-enabled = false               # opt-in cross-encoder re-rank (off = previous behavior)
-# model = "Xenova/bge-reranker-base"   # int8 ONNX cross-encoder
+# enabled unspecified ⇒ model-driven: ON for the static potion
+# models (big quality rescue), OFF for CodeRank/jina (≈neutral).
+# Force it: enabled = true | false
+# model = "cross-encoder/ettin-reranker-68m-v1"  # default; Apple Silicon → Metal GPU via candle (as-is f32)
 # top_n = 50                            # how many fused candidates to re-score
 ```
 
@@ -142,13 +144,27 @@ ranking buries, while conceptual queries still ride the embeddings.
 `path::symbol (kind) — signature` header so natural-language queries
 bridge to code; the stored/returned snippet stays raw.
 
-**Cross-encoder re-rank** (opt-in, `[rerank] enabled = true`): the top
-`top_n` fused candidates are re-scored jointly `(query, passage)` by a
-small int8 reranker and reordered before truncation — sharper top
-results when recall is already good. Off by default: no second model
-download, no added latency, and results are exactly the pre-rerank
-behavior. It does not affect the index (ordering only), so toggling it
-never triggers a rebuild.
+**Cross-encoder re-rank**: the top `top_n` fused candidates are
+re-scored jointly `(query, passage)` by
+`cross-encoder/ettin-reranker-68m-v1` (a sentence-transformers
+CrossEncoder over the Ettin/ModernBERT 68M encoder) and reordered
+before truncation — sharper top results when recall is already good.
+**Default is model-driven** (override with `[rerank] enabled`): ON
+for the fast static potion models (a large measured quality rescue —
+they reach ≈ a transformer's top-1), OFF for the SOTA CodeRank/jina
+bi-encoders (≈neutral there, not worth the second model + latency)
+and for custom/remote models. It does not affect the index (ordering
+only), so toggling it never triggers a rebuild. At ~68M params it is
+the smallest strong code-capable reranker (vs 278M
+`bge-reranker-base`). On **Apple Silicon** it runs **as-is** (native
+f32 safetensors, no cast — ModernBERT is unstable in f16) on the
+**Metal GPU via candle**. Off Apple Silicon the candle path is
+unavailable and the int8 ONNX export is encoder-only (the ST head
+ships as separate modules), so re-rank is a no-op there for now —
+search still returns the fused ranking unchanged. A code-blind
+web-text cross-encoder (e.g. ms-marco MiniLM) badly degrades code
+ranking — measured by `cargo xtask eval --rerank` — so the default is
+this code-strong model.
 
 Every sync is hash-incremental: a file whose mtime+size are unchanged
 is skipped before any read/hash/parse (the cheap node of a blake3 file
@@ -201,26 +217,24 @@ error). Changing remote model/endpoint triggers a one-time re-index.
 ## Models
 
 Quality: ★ = code relevance / multilingual. RAM≈ = resident memory
-(weights at the chosen precision + ~350MB ONNX Runtime/tokenizer
-overhead). Large files are never skipped — chunks are hard-capped and
-streamed in byte-bounded batches.
+(weights + ~350MB ONNX Runtime/tokenizer overhead; ~30MB for the
+static models). Large files are never skipped — chunks are hard-capped
+and streamed in byte-bounded batches.
 
 `ml` rating covers non-English (incl. Russian): ★★★★★ = full, ★★ = English-centric.
 
-Built-in models are pulled (and cached) from **Hugging Face**. Each
-declares an *architecture* that decides how it is loaded:
+Built-in models are pulled (and cached) from **Hugging Face**. A model
+is identified by its concrete `.onnx` file — there is **no precision
+knob**. Each declares an *architecture* that decides how it is loaded:
 
 - **static** — [Model2Vec](https://github.com/MinishLab/model2vec)
-  token-embedding matrix (no transformer/ONNX): tiny RAM, very fast,
-  no precision knob. The default + `potion-base-32M`.
-- **onnx** — transformer encoder from an HF ONNX repo, mean-pooled;
-  the `fp16` / `int8` precision knob applies. The e5 / nomic models,
-  and jina-code (pinned to its int8 export).
+  token-embedding matrix (no transformer/ONNX): tiny RAM, very fast.
+  The two `potion-*` models.
+- **onnx** — transformer encoder from an HF ONNX repo, mean/CLS
+  pooled, weights from the pinned `.onnx` file. CodeRank (int8 on CPU,
+  f32 on CUDA, candle on Metal) and jina-code (pinned int8).
 - **fastembed** — encoder served by fastembed's bundled ONNX (a
   fallback arch; no built-in currently needs it).
-
-`peak RSS` below is measured indexing a real ~12k-chunk repo (auto
-per-model batch); `sync` is that first full sync (incremental after).
 
 Each model has a fixed input/output **contract** (query/doc prefix +
 pooling) — applied automatically; `pool` = mean / cls. `peak RSS` is
@@ -233,12 +247,6 @@ measured indexing a real ~12k-chunk repo (auto per-model batch).
 | jinaai/jina-embeddings-v2-base-code | onnx (int8) | 768 | ★★★★★ | ★★ | mean | ~0.76 GB |
 | minishlab/potion-multilingual-128M | static | 256 | ★★★ | ★★★★★ | mean | ~0.85 GB |
 | minishlab/potion-base-32M | static | 512 | ★★★ | ★★ | mean | ~0.36 GB |
-| intfloat/multilingual-e5-small | onnx | 384 | ★★★ | ★★★★★ | mean | ~1.1 GB |
-| intfloat/multilingual-e5-base | onnx | 768 | ★★★ | ★★★★★ | mean | ~1.4 GB |
-| intfloat/multilingual-e5-large | onnx | 1024 | ★★★ | ★★★★★ | mean | ~2.2 GB |
-| nomic-ai/nomic-embed-text-v1.5 | onnx | 768 | ★★★★ | ★★★ | mean | ~0.8 GB |
-| Snowflake/snowflake-arctic-embed-m-v2.0 | onnx | 768 | ★★★ | ★★★★★ | cls | ~1.2 GB |
-| jamie8johnson/e5-base-v2-code-search | onnx (f32, CPU) | 768 | ★★★★ | ★★ | mean | ~1.1 GB |
 
 **The default `sensiarion/CodeRankEmbed-f16`** is SOTA code retrieval
 (CLS-pooled). It is a pure **f16 cast** of the official
@@ -249,57 +257,91 @@ On **Apple Silicon** it runs on the **Metal GPU** via candle at ~0.57 GB
 ONNX, on CUDA the f32 ONNX. For exact upstream provenance pick the
 official f32 weights: `models set-default nomic-ai/CodeRankEmbed`
 (~2x RAM on Metal, same embeddings; identical to the default off
-Apple-Silicon). `jinaai/jina-embeddings-v2-base-code`
-is a lighter code alternative (~0.76 GB). For multilingual / Russian
-use an e5 model or the static `potion-multilingual-128M` (fastest, full
-sync of a big repo in seconds at <1 GB). The static models are
-bag-of-token-means (weaker code relevance) but cheap; the onnx encoders
-are slower on the first sync of a large repo (incremental after).
-`models add` registers any other HF model — set
-`--query-prefix`/`--doc-prefix`/`--pooling` (or `--e5_prefix`) for its
-contract; its `config.json` architecture is checked at add time and an
-unsupported one (LM-head / KV-cache decoder) is rejected up front.
+Apple-Silicon). `jinaai/jina-embeddings-v2-base-code` is a lighter
+code alternative (~0.76 GB). For multilingual / Russian (or the
+fastest possible sync of a big repo, in seconds at <1 GB) use the
+static `potion-multilingual-128M` — bag-of-token-means (weaker raw
+code relevance, but re-rank is **on by default** for it and largely
+closes the gap); the onnx encoders are slower on the first sync of a
+large repo (incremental after). `models add` registers any other HF
+model — set `--query-prefix`/`--doc-prefix`/`--pooling` (or
+`--e5_prefix`) for its contract, and `--onnx-file` to pick a specific
+quantization; its `config.json` architecture is checked at add time
+and an unsupported one (LM-head / KV-cache decoder) is rejected up
+front.
 
-(Qwen3-Embedding decoder models need a candle backend that does not
-exist yet.)
+### Retrieval quality (CodeSearchNet)
+
+One run, `cargo xtask eval --rerank` on CodeSearchNet python/test: a
+**5000-function distractor pool**, 200 real docstrings as queries,
+each retrieving its own function out of the 5000 (higher = better) — a
+large pool is the discriminating setup (a tiny pool saturates the
+metric). `base` and the `+rerank` column are the **same 200 queries /
+5000-doc pool** (every query reranked) so the delta is honest. `index`
+= corpus embed throughput (the dominant sync cost). macOS aarch64:
+
+| model | MRR@10 | R@1 | NDCG@10 | MRR@10 +rerank | index (docs/s) | rerank default |
+|-------|-------|-----|---------|----------------|----------------|----------------|
+| sensiarion/CodeRankEmbed-f16 **(default)** | 0.929 | 0.910 | 0.937 | 0.928 | ~21 | off |
+| minishlab/potion-base-32M | 0.730 | 0.660 | 0.759 | **0.849** | ~11 000 | on |
+| minishlab/potion-multilingual-128M | 0.716 | 0.635 | 0.749 | **0.858** | ~7 600 | on |
+
+The default transformer is markedly more accurate; the static models
+trade ~0.20 MRR for a **~500× faster index** (the right pick on a
+large repo or when sync speed matters). Cross-encoder re-rank
+(`ettin-reranker-68m-v1`, ~68M, candle Metal, top-20) is a **major
+rescue for the static retrievers** (+0.12–0.14 MRR, +0.17–0.21 R@1 —
+they reach ≈ a transformer's top-1) but **~neutral on the SOTA
+default** (−0.001 MRR: the bi-encoder already has the gold in the
+top-20, the cross-encoder can only reshuffle). So re-rank defaults
+**on for the static models, off for CodeRank/jina** — auto, per the
+active model; an explicit `[rerank] enabled` overrides. A code-blind
+web reranker (ms-marco MiniLM) instead *collapses* this to ~0.56 MRR
+— why the default is a code-strong cross-encoder. Reproduce / track:
+`cargo xtask eval [--corpus N] [--queries N] [--rerank]`;
+`benchmarks/results/effectiveness.jsonl` holds exactly this one
+matched run so every comparison in it is honest.
 
 ### Selecting a model
 
-Pick by name from the table — there is one name per model; precision
-is **not** encoded in the name, it's a separate config knob (same name,
-different ONNX weights). Two ways:
+Pick by name from the table — one name per model, identified by its
+concrete `.onnx` file (no precision knob). Two ways:
 
 ```
-embedding-search models set-default intfloat/multilingual-e5-small
-embedding-search models list           # shows table + active precision/RAM
+embedding-search models set-default minishlab/potion-base-32M
+embedding-search models list           # shows the table + RAM estimate
 ```
 
 or edit `~/.embedding-search/config.toml` directly:
 
 ```toml
 [model]
-default   = "intfloat/multilingual-e5-small"
-precision = "int8"
+default = "minishlab/potion-base-32M"
 ```
 
-Changing model or precision shifts the index fingerprint → the index
+Changing the model shifts the index fingerprint → the index
 auto-rebuilds on next run (or force it: `embedding-search sync --force`).
 
-### Precision
+#### Per-project override
 
-`[model] precision` — e5 family only (loaded as user-defined ONNX from
-the Hugging Face `Xenova/*` repos, which ship `model.onnx` /
-`model_fp16.onnx` / `model_quantized.onnx`):
+`models set-default` is global. To pin a model for **one repo only**:
 
-- `fp16` — **default**. ≈½ the RAM of f32, quality loss negligible
-  (<0.5% on retrieval). Recommended for every codebase.
-- `int8` — ≈¼ RAM. Small quality loss (~1–3% recall); fine for large
-  repos / low-RAM machines.
-- `full` — f32 reference quality, highest RAM.
+```
+embedding-search set minishlab/potion-base-32M [path]
+```
 
-The static Model2Vec models (the default + `potion-base-32M`) have no
-precision knob — a single f32 matrix; `models list` shows `f32` and
-`precision` is ignored for them.
+This writes a minimal `<project>/.embedding-search/config.toml` that is
+**deep-merged over** the global `~/.embedding-search/config.toml`
+(project keys win; everything you didn't override still comes from
+global). Other projects are unaffected; `embedding-search status` shows
+`project config:` when an override is active. The model is verified
+(download + test embed) before anything is written, and the project
+re-indexes on the next sync. Useful on a large repo where the default
+heavy transformer is slow to index — a static model (`potion-base-32M`,
+or `potion-multilingual-128M` for non-English) syncs the same tree
+~150× faster. The MCP server exposes the same switch as a `set_model`
+tool (and hints toward it on a large repo), so an agent can do this
+itself on the first sync.
 
 ### Using any Hugging Face model
 
@@ -331,12 +373,12 @@ embedding-search models add --name bge-small --repo Xenova/bge-small-en-v1.5
 embedding-search models add --name e5 --repo https://huggingface.co/Xenova/multilingual-e5-base
 
 # onnx-community / large models: weights split into a .onnx_data
-# sidecar — fetched automatically. --precision picks the variant.
+# sidecar — fetched automatically. --onnx-file picks the variant.
 embedding-search models add --name gemma \
-  --repo onnx-community/embeddinggemma-300m-ONNX --precision int8
+  --repo onnx-community/embeddinggemma-300m-ONNX --onnx-file onnx/model_quantized.onnx
 
-# pick an EXACT quantization the precision mapping can't reach
-# (q4 / q4f16 / bnb4 / uint8 …) with --onnx-file
+# pick an EXACT quantization (q4 / q4f16 / bnb4 / uint8 …) by its
+# concrete filename with --onnx-file
 embedding-search models add --name qwen3 \
   --repo onnx-community/Qwen3-Embedding-0.6B-ONNX --onnx-file model_q4f16.onnx
 
@@ -347,22 +389,17 @@ embedding-search models add --name my-model \
 embedding-search sync --force   # re-index with the new model
 ```
 
-Add `--e5-prefix` if it's an e5-style model. `--precision fp16 | int8
-| full` selects which ONNX variant to pull, per model (a big model can
-be `int8` without changing the others); omit it to use the global
-`[model] precision`. `--onnx-file model_q4f16.onnx` (or
-`onnx/model_q4.onnx`) pulls that exact file instead — for repos whose
-quantizations (q4, q4f16, bnb4, uint8…) the precision mapping doesn't
-cover; it overrides `--precision`.
+Add `--e5-prefix` if it's an e5-style model. `--onnx-file
+model_q4f16.onnx` (or `onnx/model_q4.onnx`) pulls that exact file —
+the **sole weight selector** (q4, q4f16, bnb4, uint8, quantized…);
+omit it and the loader uses `onnx/model.onnx` with a flat
+`model.onnx` fallback, so a repo that ships only one ONNX still works.
 Required in the repo: ONNX weights **plus all four tokenizer files**
 (`tokenizer.json`, `config.json`, `special_tokens_map.json`,
 `tokenizer_config.json`). The `.onnx` graph plus any `.onnx_data`
 external-weights sidecar (onnx-community / models >2 GB) are both
-fetched. For `--repo` the loader tries the requested precision then
-falls back to `onnx/model.onnx` / `model.onnx`, so a repo that ships
-only full-precision ONNX still works. A PyTorch-only repo (no ONNX) or
-a missing tokenizer file fails with an explicit message naming the
-repo and every path tried. A language-model-head export
+fetched. A PyTorch-only repo (no ONNX) or a missing tokenizer file
+fails with an explicit message naming the repo and every path tried. A language-model-head export
 (`*ForMaskedLM`/`CausalLM`…) is rejected up front (it's not an
 embedding model and ALiBi long-context ones OOM at tens of GB).
 Stored under `[[custom_model]]`; output dimensions probed at load.
@@ -380,12 +417,11 @@ RAM. Just `models add --name potion --repo minishlab/potion-multilingual-128M`.
 onnx_path        = "/models/bge-small-en" # dir or direct .onnx file
 # onnx_query_prefix = "query: "           # e.g. e5; omit for none
 # onnx_doc_prefix   = "passage: "         # e.g. e5; omit for none
-precision        = "fp16"                 # picks onnx/model_fp16.onnx if present
 ```
 
-Same file requirements as above (a directory with `model.onnx` or
-`onnx/model_fp16.onnx` / `model_quantized.onnx` matching `precision`,
-plus the four tokenizer files; or the `.onnx` with them alongside).
+Same file requirements as above (a directory with `onnx/model.onnx`
+or `model.onnx`, plus the four tokenizer files; or the `.onnx` with
+them alongside).
 `[model] default` is then ignored; swapping the file busts the index
 fingerprint → auto-rebuild. Fetch the files yourself with e.g.
 `pip install -U "huggingface_hub[cli]" && hf download
@@ -510,21 +546,3 @@ advances that tag with the crate version so an updated plugin pulls
 the matching server. (Standalone `claude mcp add` / OpenCode users on
 the bare spec refresh with `npx mcp-bin expire sensiarion/embedding-search`.)
 
-
-## TODO
-
-1. [ ] skill/tool for usage
-2. [x] installation scripts for claude/cursor
-3. [ ] test usage for big model, like https://huggingface.co/majentik/Qwen3-Embedding-8B-ONNX-INT8/tree/main
-4. [ ] restrict concurrency to N threads
-5. [ ] match with cursor approach https://www.digitalapplied.com/blog/cursor-semantic-search-coding-ai-guide
-  - sync every 10 min
-  - check latencies and indexes for vector search (for small codebase it's better to not use indexes, cause it's heuristics either way)
-  - merkle tree hash tree for file states
-  - allow to specify search to be more concrete (args to search concrete directory or concrete file)
-  - add guidelines to use semantic search
-    - Conceptual questions ("how does auth work?")
-    - Finding related code across files
-    - Exploring unfamiliar codebases
-    - Identifying patterns and relationships
-    - Queries with varying terminology

@@ -12,19 +12,120 @@
 //! (batch × seq) — the same memory-bounding fix as `OnnxEncoder`.
 #![cfg(not(feature = "bench-stub"))]
 
-use crate::config::{Config, Precision};
+use crate::config::Config;
 use crate::embedder::{build_onnx_session, fill_fixed_batch, load_user_defined, seq_buckets};
 use crate::error::{Error, Result};
 use ort::{session::Session, value::Tensor};
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
 
+/// Cross-encoder reranker. Public façade over the backend the host
+/// can actually accelerate: candle on the Metal GPU (Apple Silicon)
+/// or the int8 ONNX on CPU everywhere else — the same
+/// accelerate-or-CPU split as the embedder. Higher logit = more
+/// relevant; only the ordering is used, so no sigmoid is applied.
+pub struct Reranker {
+    backend: Backend,
+    /// How many top fused candidates the caller should re-score.
+    top_n: usize,
+}
+
+enum Backend {
+    /// Apple-Silicon Metal GPU (f32 `ettin-reranker-68m-v1`
+    /// CrossEncoder via candle).
+    #[cfg(candle_backend)]
+    Candle(Box<crate::candle_rerank::CandleReranker>),
+    /// int8 ONNX on CPU (the QDQ graph gets no GPU EP — same as the
+    /// embedder; this is the universal fallback).
+    Onnx(Box<OnnxReranker>),
+}
+
+/// candle (Metal) safetensors source for the default reranker. ettin
+/// is loaded **as-is** from its own repo (native f32 safetensors — no
+/// precision cast), so the candle source is just the default repo
+/// itself. A user-set custom `[rerank] model` has no known
+/// candle-loadable mate ⇒ `None` (ONNX CPU).
+#[cfg(candle_backend)]
+fn candle_rerank_repo(onnx_model: &str) -> Option<&'static str> {
+    (onnx_model == crate::config::DEFAULT_RERANK_MODEL)
+        .then_some("cross-encoder/ettin-reranker-68m-v1")
+}
+
+/// Fetch the candle base-repo files and build the Metal reranker.
+#[cfg(candle_backend)]
+fn build_candle(cfg: &Config, repo: &str) -> Result<crate::candle_rerank::CandleReranker> {
+    let cache_dir = cfg.model_cache_dir()?;
+    std::fs::create_dir_all(&cache_dir)?;
+    let (_repo, api) = crate::embedder::hf_repo(repo, &cache_dir)?;
+    let get = |f: &str| {
+        api.get(f)
+            .map_err(|e| Error::Embed(format!("hf-hub get {f}: {e}")))
+    };
+    let read = |f: &str| -> Result<Vec<u8>> {
+        std::fs::read(get(f)?).map_err(|e| Error::Embed(format!("read {f}: {e}")))
+    };
+    // ettin is a sentence-transformers CrossEncoder: a bare
+    // `ModernBertModel` (root `model.safetensors`) + a 3-module head
+    // saved in its own sub-dirs (`2_Dense` / `3_LayerNorm` /
+    // `4_Dense`). All four are fetched and assembled by candle.
+    crate::candle_rerank::CandleReranker::build(
+        &get("model.safetensors")?,
+        &get("2_Dense/model.safetensors")?,
+        &get("3_LayerNorm/model.safetensors")?,
+        &get("4_Dense/model.safetensors")?,
+        &read("config.json")?,
+        &read("tokenizer.json")?,
+        cfg.model.max_length.max(1),
+    )
+}
+
+impl Reranker {
+    /// Build the reranker behind the best available backend. Only
+    /// called when `[rerank] enabled`. candle (Metal) is tried first
+    /// for the default model on Apple Silicon; any failure (no Metal,
+    /// download/weights) transparently falls back to int8 ONNX CPU.
+    pub fn load(cfg: &Config) -> Result<Self> {
+        let top_n = cfg.rerank.top_n.max(1);
+        #[cfg(candle_backend)]
+        if let Some(repo) = candle_rerank_repo(&cfg.rerank.model) {
+            match build_candle(cfg, repo) {
+                Ok(c) => {
+                    return Ok(Self {
+                        backend: Backend::Candle(Box::new(c)),
+                        top_n,
+                    })
+                }
+                Err(e) => tracing::warn!(
+                    "candle Metal reranker unavailable ({e}); int8 ONNX CPU fallback"
+                ),
+            }
+        }
+        Ok(Self {
+            backend: Backend::Onnx(Box::new(OnnxReranker::load(cfg)?)),
+            top_n,
+        })
+    }
+
+    /// How many top fused candidates `run` should hand to `score`.
+    pub fn top_n(&self) -> usize {
+        self.top_n
+    }
+
+    /// Relevance logit of `query` against each passage, input order.
+    pub fn score(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>> {
+        match &self.backend {
+            #[cfg(candle_backend)]
+            Backend::Candle(c) => c.score(query, passages),
+            Backend::Onnx(o) => o.score(query, passages),
+        }
+    }
+}
+
 /// ONNX cross-encoder reranker: tokenizes each `(query, passage)` pair,
 /// runs one fixed-shape `[batch, seq]` session call, and reads the
 /// single relevance logit (`*ForSequenceClassification`, `num_labels =
-/// 1`). Higher logit = more relevant; only the ordering is used, so no
-/// sigmoid is applied.
-pub struct Reranker {
+/// 1`).
+struct OnnxReranker {
     session: Mutex<Session>,
     tok: Tokenizer,
     pad_id: i64,
@@ -34,15 +135,13 @@ pub struct Reranker {
     /// mirroring `OnnxEncoder` so the EP compiles `buckets.len()`
     /// graphs total, not one per partial batch.
     batch: usize,
-    /// How many top fused candidates the caller should re-score.
-    top_n: usize,
 }
 
-impl Reranker {
+impl OnnxReranker {
     /// Download (cached) the configured cross-encoder and build the
-    /// session. Only called when `[rerank] enabled` — the LM-head /
-    /// KV-cache guards run inside `load_user_defined`.
-    pub fn load(cfg: &Config) -> Result<Self> {
+    /// session. The LM-head / KV-cache guards run inside
+    /// `load_user_defined`.
+    fn load(cfg: &Config) -> Result<Self> {
         let cache_dir = cfg.model_cache_dir()?;
         std::fs::create_dir_all(&cache_dir)?;
         // Pinned to the int8 export: a reranker runs alongside the
@@ -50,7 +149,6 @@ impl Reranker {
         // bounded by `[sync] max_rss_mb`).
         let udm = load_user_defined(
             &cfg.rerank.model,
-            Precision::Int8,
             &cache_dir,
             Some("onnx/model_quantized.onnx"),
         )?;
@@ -72,18 +170,12 @@ impl Reranker {
             need_type_ids,
             buckets: seq_buckets(max_length),
             batch: cfg.embed_batch().max(1),
-            top_n: cfg.rerank.top_n.max(1),
         })
-    }
-
-    /// How many top fused candidates `run` should hand to `score`.
-    pub fn top_n(&self) -> usize {
-        self.top_n
     }
 
     /// Relevance logit of `query` against each passage, in input order.
     /// One fixed-shape ORT call per `self.batch` slice.
-    pub fn score(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>> {
+    fn score(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>> {
         if passages.is_empty() {
             return Ok(Vec::new());
         }

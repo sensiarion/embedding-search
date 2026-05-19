@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.2.6
+
+- **BREAKING:** the predefined model list is trimmed to five:
+  `sensiarion/CodeRankEmbed-f16` (default), `nomic-ai/CodeRankEmbed`,
+  `jinaai/jina-embeddings-v2-base-code`, `minishlab/potion-base-32M`,
+  `minishlab/potion-multilingual-128M`. The e5 / arctic / nomic-embed
+  / jamie8johnson built-ins are gone — if your config `[model] default`
+  named one, set a remaining built-in (or register it yourself with
+  `models add --repo …`). Any other HF model still works via
+  `models add`.
+- **BREAKING:** the `fp16 | int8 | full` precision knob is removed —
+  `[model] precision`, the `models add --precision` flag and per-model
+  `precision` no longer exist. A model is identified solely by its
+  concrete `.onnx` file: built-ins pin one; for `models add` use
+  `--onnx-file <name>` (default `onnx/model.onnx`). A stale
+  `precision = …` line in an old config is ignored. The index
+  fingerprint changed, so the next sync re-embeds once automatically.
+- **BREAKING:** cross-encoder re-rank now defaults **on for the static
+  potion models** (a large measured quality rescue) and **off for the
+  SOTA CodeRank/jina bi-encoders** (≈neutral there). Previously it was
+  off for everyone. `[rerank] enabled` is now unspecified by default
+  (model-driven); set `enabled = true | false` to force it either way.
+- Better search results: adjacent small declarations are now coalesced
+  into larger chunks (was one chunk per function/struct), so each hit
+  carries more surrounding context and ranking improves. The
+  per-project index re-embeds itself once automatically on upgrade.
+- Fix: files matched by `.gitignore` were still indexed when the
+  project is **not a git repository** (or before its first commit) —
+  e.g. secrets/build output in a plain directory. They are now
+  excluded correctly; the next sync drops any that had slipped in.
+- Per-project model: `embedding-search set <model> [path]` pins a
+  model for one repo only — it writes
+  `<project>/.embedding-search/config.toml`, which overrides the
+  global default without affecting other projects. `status` shows
+  when a project override is active.
+- The CLI now prints the previous/next chunk around each hit for
+  immediate context. The MCP/agent output is unchanged (still
+  refs-only, so agent searches stay token-lean).
+- Large repos: the CLI suggests (and the MCP server exposes a
+  `set_model` tool plus a `hint` on status/sync) switching to a fast
+  static model (`minishlab/potion-base-32M`) when a heavy model is
+  slow to index — an agent can do this itself on the first sync of a
+  big repo, no restart needed.
+- The optional `[rerank]` cross-encoder is now
+  `cross-encoder/ettin-reranker-68m-v1` — at ~68M params the smallest
+  strong code-capable reranker (4× smaller than the previous 278M
+  `bge-reranker-base`), and stronger on code. On Apple Silicon it runs
+  on the **Metal GPU via candle** as-is (native f32, no cast). Off
+  Apple Silicon re-rank is a no-op for now (the int8 ONNX export is
+  encoder-only) — search returns the fused ranking unchanged, as
+  before. Measured lift (`cargo xtask eval --rerank`, 5000-doc pool /
+  200 queries, base and rerank on the identical set): a major rescue
+  for fast static retrievers — potion-32M 0.730→**0.849** MRR@10,
+  Recall@1 0.660→**0.830** (now ≈ a transformer's top-1) — and
+  ~neutral on the already-SOTA default (CodeRankEmbed 0.929→0.928), so
+  it is the lever that makes a static model viable on a big repo —
+  hence the new model-driven default (on for potion, off for
+  CodeRank/jina; see the BREAKING note above).
+- New `cargo xtask eval`: CodeSearchNet retrieval quality
+  (MRR@10 / Recall@1 / NDCG@10) over a large distractor pool —
+  `--corpus N` (default 5000) sets the pool, `--queries N` (default
+  200) the evaluated queries; `--rerank` adds an opt-in cross-encoder
+  pass on the same set so `base` vs `rerank` is a like-for-like delta
+  (dev-only).
+
 ## 0.2.5
 
 - **The default model is now `sensiarion/CodeRankEmbed-f16`** — an f16

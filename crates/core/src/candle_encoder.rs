@@ -34,7 +34,7 @@ impl From<candle_core::Error> for Error {
 /// 32. Overridable via `EMBEDDING_SEARCH_CANDLE_BATCH` for tuning
 /// without a rebuild (default 32; the GPU-occupancy sweet spot is
 /// hardware-dependent).
-fn candle_batch() -> usize {
+pub(crate) fn candle_batch() -> usize {
     use std::sync::OnceLock;
     static BATCH: OnceLock<usize> = OnceLock::new();
     *BATCH.get_or_init(|| {
@@ -63,7 +63,7 @@ pub(crate) struct CandleEncoder {
 /// `Device::new_metal` panics (it indexes an empty device list) when
 /// no GPU is reachable — e.g. a headless/CI context. Convert that into
 /// an `Err` so the caller can fall back to the ONNX path.
-fn metal_device() -> Result<Device> {
+pub(crate) fn metal_device() -> Result<Device> {
     std::panic::catch_unwind(|| Device::new_metal(0))
         .map_err(|_| Error::Embed("candle: Metal device unavailable (headless?)".into()))?
         .map_err(|e| Error::Embed(format!("candle: Metal init: {e}")))
@@ -122,16 +122,14 @@ impl CandleEncoder {
         Ok(enc)
     }
 
-    /// Index-identity suffix: the real loaded precision, so switching
-    /// the candle repo's dtype (f32 base ↔ f16 export) busts the index.
-    /// Every distinct weight precision must yield a distinct tag — f16
+    /// Index-identity suffix: the real loaded weight dtype, so
+    /// switching the candle repo's dtype (f32 base ↔ f16 export) busts
+    /// the index. Every distinct dtype must yield a distinct tag — f16
     /// and bf16 are deliberately NOT merged (different embeddings ⇒
-    /// must re-embed separately), which is why this does not route
-    /// through `Precision::label` (it has no bf16 and would collide
-    /// the two). Only F16/BF16/F32/F64 are reachable (the float dtypes
-    /// `DType::try_from` yields for a safetensors model); `candle-other`
-    /// is an exhaustiveness sentinel that is never taken in practice
-    /// and still cannot collide with a real precision tag.
+    /// must re-embed separately). Only F16/BF16/F32/F64 are reachable
+    /// (the float dtypes `DType::try_from` yields for a safetensors
+    /// model); `candle-other` is an exhaustiveness sentinel that is
+    /// never taken in practice.
     pub fn variant(&self) -> &'static str {
         match self.dtype {
             DType::F16 => "candle-f16",

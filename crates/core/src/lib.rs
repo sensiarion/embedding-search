@@ -2,6 +2,8 @@
 // `candle_backend` is set by build.rs (macOS+aarch64, non-bench-stub).
 #[cfg(candle_backend)]
 mod candle_encoder;
+#[cfg(candle_backend)]
+mod candle_rerank;
 pub mod chunker;
 pub mod config;
 pub mod db;

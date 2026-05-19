@@ -1,7 +1,7 @@
 use embedding_search_core::chunker::Chunker;
 use embedding_search_core::config::{
-    model_spec, normalize_hf_repo, Config, EmbeddingProvider, ExecutionProvider, Precision,
-    RemoteConfig, DEFAULT_MODEL, SUPPORTED_MODELS,
+    model_spec, normalize_hf_repo, Config, EmbeddingProvider, ExecutionProvider, RemoteConfig,
+    DEFAULT_MODEL, SUPPORTED_MODELS,
 };
 use embedding_search_core::db::{Db, NewChunk};
 use std::path::Path;
@@ -10,7 +10,6 @@ use std::path::Path;
 fn config_defaults_are_sane() {
     let c = Config::default();
     assert_eq!(c.model.default, DEFAULT_MODEL);
-    assert_eq!(c.model.precision, Precision::Fp16);
     assert_eq!(c.sync.max_chunk_bytes, 2048);
     // 0 = auto: resolves to the active model's per-model rec_batch.
     assert_eq!(c.sync.embed_batch_size, 0);
@@ -44,8 +43,7 @@ fn config_defaults_are_sane() {
     assert_eq!(spec.dimensions, 768);
     assert_eq!(spec.code, 5);
     assert!(!spec.is_static());
-    assert!(spec.supports_precision()); // ONNX encoder: precision honored
-                                        // local in-process backend by default
+    // local in-process backend by default
     assert_eq!(c.model.provider, EmbeddingProvider::Local);
     // no custom ONNX override by default
     assert!(c.model.onnx_path.is_none());
@@ -63,9 +61,6 @@ fn chunk_param_change_invalidates_index() {
     assert_ne!(base, c.index_fingerprint("m", 768, "ct"));
     let mut c = Config::default();
     c.model.max_length += 1;
-    assert_ne!(base, c.index_fingerprint("m", 768, "ct"));
-    let mut c = Config::default();
-    c.model.precision = Precision::Int8;
     assert_ne!(base, c.index_fingerprint("m", 768, "ct"));
     // model name / dims also part of identity
     assert_ne!(
@@ -166,23 +161,22 @@ fn remote_api_key_expands_env_var() {
 }
 
 #[test]
-fn ram_estimate_scales_with_precision() {
-    let e5 = model_spec("intfloat/multilingual-e5-small").unwrap();
-    let f32 = e5.ram_mb(Precision::Full);
-    let f16 = e5.ram_mb(Precision::Fp16);
-    let i8 = e5.ram_mb(Precision::Int8);
-    assert!(f32 > f16 && f16 > i8, "{f32} {f16} {i8}");
-    // fp16 default must be well under the old 32GB / f32 blowup
-    assert!(f16 < 1200, "fp16 RAM estimate {f16}MB too high");
+fn ram_estimate_is_bounded_and_distinguishes_arch() {
+    // ONNX-encoder built-in (int8 on CPU): weights + ORT overhead,
+    // still well under the old multi-GB blowup.
+    let jina = model_spec("jinaai/jina-embeddings-v2-base-code").unwrap();
+    let onnx_ram = jina.ram_mb();
+    assert!(onnx_ram < 1200, "ONNX RAM estimate {onnx_ram}MB too high");
 
-    // a static (Model2Vec) model ignores precision — single f32 matrix
-    let potion = model_spec("minishlab/potion-multilingual-128M").unwrap();
-    assert!(!potion.supports_precision());
-    assert_eq!(
-        potion.ram_mb(Precision::Int8),
-        potion.ram_mb(Precision::Full)
+    // a static (Model2Vec) model: tiny tokenizer overhead, no ORT.
+    let potion = model_spec("minishlab/potion-base-32M").unwrap();
+    assert!(potion.is_static());
+    assert!(
+        potion.ram_mb() < onnx_ram,
+        "static {} should be lighter than ONNX {onnx_ram}",
+        potion.ram_mb()
     );
-    assert!(SUPPORTED_MODELS.iter().any(|m| m.supports_precision()));
+    assert!(SUPPORTED_MODELS.iter().all(|m| m.ram_mb() > 0));
 }
 
 #[test]
@@ -205,7 +199,11 @@ fn unknown_model_rejected() {
 }
 
 #[test]
-fn chunker_extracts_rust_functions() {
+fn chunker_merges_adjacent_small_nodes() {
+    // semble-style: small adjacent declarations are coalesced into one
+    // bigger chunk (was one-chunk-per-leaf). Three tiny decls well
+    // under the 4096 cap → a single merged chunk; a mixed run is typed
+    // `block` and the contiguous span keeps the blank lines between.
     let code = r#"
 fn alpha() -> i32 { 1 }
 
@@ -218,21 +216,30 @@ impl Point {
     let ck = Chunker::new(4096);
     let (lang, chunks) = ck.chunk_file(Path::new("sample.rs"), code);
     assert_eq!(lang, "rust");
-    assert!(!chunks.is_empty());
-    let kinds: Vec<_> = chunks.iter().map(|c| c.node_type.as_str()).collect();
-    assert!(kinds.contains(&"function"));
-    assert!(kinds.iter().any(|k| *k == "struct" || *k == "impl"));
+    assert_eq!(chunks.len(), 1, "tiny decls must merge into one chunk");
+    let m = &chunks[0];
+    assert_eq!(m.node_type, "block"); // heterogeneous run
+    assert!(m.symbol.is_none()); // no single decl owns a merged run
+    assert!(m.content.contains("fn alpha"));
+    assert!(m.content.contains("struct Point"));
+    assert!(m.content.contains("fn beta"));
 }
 
 #[test]
 fn chunker_captures_symbol_name_for_enrichment_header() {
     // The code↔NL embed header needs the declared name: `name` field
-    // for fn/struct, first type_identifier for an `impl` (no name field).
-    let code = "fn alpha() -> i32 { 1 }\n\
-                struct Point { x: i32 }\n\
-                impl Point { fn beta(&self) {} }\n";
+    // for fn/struct, first type_identifier for an `impl` (no name
+    // field). Bodies are padded past half the cap so no two nodes
+    // merge — each stays its own typed, symboled chunk.
+    let pad = "x".repeat(3000);
+    let fields = (0..400).map(|i| format!("f{i}: i64,")).collect::<String>();
+    let code = format!(
+        "fn alpha() -> i32 {{ let _p = \"{pad}\"; 1 }}\n\
+         struct Point {{ {fields} }}\n\
+         impl Point {{ fn beta(&self) -> i32 {{ let _p = \"{pad}\"; self.x }} }}\n"
+    );
     let ck = Chunker::new(4096);
-    let (_lang, chunks) = ck.chunk_file(Path::new("sample.rs"), code);
+    let (_lang, chunks) = ck.chunk_file(Path::new("sample.rs"), &code);
     let sym = |nt: &str| {
         chunks
             .iter()

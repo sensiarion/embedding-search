@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use fastembed::EmbeddingModel;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_MODEL: &str = "sensiarion/CodeRankEmbed-f16";
 
@@ -9,8 +9,9 @@ pub const DEFAULT_MODEL: &str = "sensiarion/CodeRankEmbed-f16";
 /// (AST kinds, line window, structured split, the code↔NL embed
 /// header). Part of the index fingerprint so the change forces a
 /// one-time full re-index. v2: chunk-enrichment header prepended to
-/// the embedded text.
-pub const CHUNKER_VERSION: u32 = 2;
+/// the embedded text. v3: adjacent small AST nodes are merged up to
+/// `max_chunk_bytes` (semble-style) instead of one chunk per leaf.
+pub const CHUNKER_VERSION: u32 = 3;
 
 /// Per-project index directory name (`<project>/.embedding-search`).
 /// Single owner of this literal — also the global state dir's basename
@@ -49,8 +50,8 @@ pub struct CustomModel {
     /// Label used to select it (`[model] default = "<name>"`).
     pub name: String,
     /// Hugging Face repo id, e.g. `Xenova/bge-small-en-v1.5`. The
-    /// precision-specific ONNX + the four tokenizer files are pulled
-    /// from it (cached). Mutually exclusive with `url`.
+    /// `onnx_file` (or `onnx/model.onnx`) + the four tokenizer files
+    /// are pulled from it (cached). Mutually exclusive with `url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// Direct URL to a `.onnx` file. The four tokenizer files are
@@ -70,15 +71,10 @@ pub struct CustomModel {
     /// Encoder output pooling (`mean` default; `cls` / `last-token`).
     #[serde(default)]
     pub pooling: Pooling,
-    /// ONNX precision to pull for this model (HF `--repo` only). `None`
-    /// ⇒ the global `[model] precision`. Per-model so registering a
-    /// big model at int8 doesn't change precision for the others.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub precision: Option<Precision>,
     /// Exact ONNX file to pull from the repo, e.g. `model_q4f16.onnx`
-    /// or `onnx/model_q4.onnx` — overrides the `precision`→file
-    /// mapping for repos with quantizations it doesn't cover (q4,
-    /// q4f16, bnb4, uint8…). A bare name is also tried under `onnx/`.
+    /// or `onnx/model_q4.onnx`. Absent ⇒ `onnx/model.onnx` (with a
+    /// flat `model.onnx` fallback). A bare name is also tried under
+    /// `onnx/`. This filename is the sole weight selector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onnx_file: Option<String>,
 }
@@ -101,25 +97,52 @@ impl Default for SearchConfig {
     }
 }
 
-/// Default ONNX cross-encoder for the optional re-rank stage:
-/// XLM-RoBERTa `*ForSequenceClassification` (one relevance logit),
-/// pinned to its int8 export.
-pub const DEFAULT_RERANK_MODEL: &str = "Xenova/bge-reranker-base";
+/// Default cross-encoder for the optional re-rank stage:
+/// `cross-encoder/ettin-reranker-68m-v1` — a sentence-transformers
+/// CrossEncoder over the Ettin (ModernBERT-recipe) 68M encoder, at
+/// only ~68M params the smallest strong code-capable reranker (vs
+/// 278M `bge-reranker-base`). On Apple Silicon it runs **as-is**
+/// (native f32 safetensors, no precision cast) on the **Metal GPU via
+/// candle**: the bare `ModernBertModel` encoder + the model's
+/// sentence-transformers head (CLS pool → Dense·GELU → LayerNorm →
+/// Dense → one relevance logit, no softmax). Off Apple Silicon the
+/// candle path is unavailable and the int8 ONNX export is encoder-only
+/// (the ST head lives in separate modules), so re-rank is a no-op
+/// there for now — search still returns the fused ranking unchanged.
+/// A code-blind web-text cross-encoder (e.g. ms-marco MiniLM) badly
+/// degrades code ranking — measured — so the default stays a
+/// code-strong model.
+pub const DEFAULT_RERANK_MODEL: &str = "cross-encoder/ettin-reranker-68m-v1";
 
 /// Optional cross-encoder re-rank of the fused candidate neighborhood
 /// before truncating to the result limit (selection precision is the
-/// dominant lever once recall is adequate). **Off by default**:
-/// disabled ⇒ byte-for-byte the pre-rerank behavior, no second model
-/// download, no added latency. It does NOT affect the index
-/// fingerprint — re-rank changes ordering, not stored vectors, so
-/// toggling it never triggers a rebuild.
+/// dominant lever once recall is adequate). It does NOT affect the
+/// index fingerprint — re-rank changes ordering, not stored vectors,
+/// so toggling it never triggers a rebuild.
+///
+/// `enabled` is **unspecified by default** (not written to a generated
+/// config) and falls back per active model to
+/// `ModelSpec::rerank_default`: ON for the fast static potion models
+/// (re-rank is a large quality rescue for them — it lifts a static
+/// retriever to ≈ a transformer's top-1, measured), OFF for the SOTA
+/// CodeRank / jina bi-encoders (re-rank is ~neutral there and not
+/// worth the extra model + latency). A custom/remote model with no
+/// spec defaults OFF. An explicit `[rerank] enabled = true|false`
+/// always wins. Resolve via `Config::rerank_enabled()`, never the
+/// raw field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RerankConfig {
-    pub enabled: bool,
-    /// HF repo of the ONNX cross-encoder. A
-    /// `*ForSequenceClassification` reranker emitting a single
-    /// relevance logit; loaded from its int8 `model_quantized.onnx`.
+    /// `None` ⇒ model-driven (see `ModelSpec::rerank_default`); `Some`
+    /// is an explicit user override. Never read directly — go through
+    /// `Config::rerank_enabled()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// HF repo of the cross-encoder. The default
+    /// (`DEFAULT_RERANK_MODEL`, ettin) runs via the candle backend on
+    /// Apple Silicon; otherwise / for any other repo the **ONNX
+    /// fallback** loads its int8 `onnx/model_quantized.onnx` (a
+    /// `*ForSequenceClassification`-style single relevance logit).
     pub model: String,
     /// How many top fused candidates to re-score. Beyond this the
     /// cross-encoder's marginal gain no longer pays its linear cost.
@@ -129,7 +152,7 @@ pub struct RerankConfig {
 impl Default for RerankConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: None,
             model: DEFAULT_RERANK_MODEL.to_string(),
             top_n: 50,
         }
@@ -145,10 +168,6 @@ pub struct ModelConfig {
     /// the `[remote]` section is used and `[model]`/`[backend]` ONNX
     /// settings are ignored.
     pub provider: EmbeddingProvider,
-    /// Weight precision. fp16 ≈ half the RAM of f32 with negligible
-    /// quality loss; int8 ≈ quarter RAM with small loss. Ignored for
-    /// models that have no quantized ONNX (falls back to full).
-    pub precision: Precision,
     /// Max token sequence fed to the model. Caps the O(batch·seq²)
     /// attention tensor (a memory lever) AND the amount of each chunk
     /// the model actually sees — text past this many tokens is silently
@@ -258,57 +277,11 @@ impl RemoteConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Precision {
-    Full,
-    Fp16,
-    Int8,
-}
-
-impl Precision {
-    /// ONNX file inside the HF repo's `onnx/` dir.
-    pub fn onnx_file(self) -> &'static str {
-        match self {
-            Precision::Full => "onnx/model.onnx",
-            Precision::Fp16 => "onnx/model_fp16.onnx",
-            Precision::Int8 => "onnx/model_quantized.onnx",
-        }
-    }
-    /// Bytes per weight, for RAM estimation.
-    pub fn bytes_per_param(self) -> f32 {
-        match self {
-            Precision::Full => 4.0,
-            Precision::Fp16 => 2.0,
-            Precision::Int8 => 1.0,
-        }
-    }
-    /// Short display label (config uses lowercase serde names: full/fp16/int8).
-    pub fn label(self) -> &'static str {
-        match self {
-            Precision::Full => "f32",
-            Precision::Fp16 => "fp16",
-            Precision::Int8 => "int8",
-        }
-    }
-}
-
-/// Single source for string → `Precision` (CLI `--precision`, etc.):
-/// the serde names plus `f32` as an alias for `full`. clap derives its
-/// value parser from this automatically.
-impl std::str::FromStr for Precision {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "fp16" => Ok(Precision::Fp16),
-            "int8" => Ok(Precision::Int8),
-            "full" | "f32" => Ok(Precision::Full),
-            other => Err(Error::Config(format!(
-                "invalid precision {other:?} (expected fp16 | int8 | full)"
-            ))),
-        }
-    }
-}
+// (Removed `Precision`.) Model weights are no longer selected by a
+// fp16/int8/full knob; a model is identified solely by its concrete
+// `.onnx` filename — built-ins pin one in `ModelSpec::onnx`, a custom
+// model uses its `onnx_file` (default `onnx/model.onnx`). The
+// reranker pins `onnx/model_quantized.onnx` directly.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -387,7 +360,6 @@ impl Default for ModelConfig {
         Self {
             default: DEFAULT_MODEL.to_string(),
             provider: EmbeddingProvider::Local,
-            precision: Precision::Fp16,
             max_length: 512,
             onnx_path: None,
             onnx_query_prefix: None,
@@ -495,6 +467,72 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Per-project override file: `<project>/.embedding-search/config.toml`.
+    /// Deep-merged ON TOP of the global config (project keys win), so a
+    /// repo can pin its own model without touching the global default
+    /// or other projects.
+    pub fn project_override_path(project_dir: &Path) -> PathBuf {
+        project_dir.join(PROJECT_INDEX_DIR).join("config.toml")
+    }
+
+    /// Effective config for a project: the global `config.toml`
+    /// (materialized on first run, as `load_or_init`) with the
+    /// project's `.embedding-search/config.toml` deep-merged over it.
+    /// Used by every project-scoped entry point (sync engine,
+    /// inspector, MCP server) so a per-repo `set` is honored;
+    /// `models list`/`set-default` stay global via `load_or_init`.
+    pub fn load_for_project(project_dir: &Path) -> Result<Self> {
+        let global_path = Self::config_path()?;
+        if !global_path.exists() {
+            // Preserve first-run UX: a default global file is written
+            // so the user can see/edit it (best-effort, as load_or_init).
+            if let Err(e) = Self::default().save() {
+                tracing::warn!("could not write default config to {global_path:?}: {e}");
+            }
+        }
+        let mut merged = read_toml_table(&global_path);
+        // `read_toml_table` yields an empty table when the override is
+        // absent (merging it is a no-op) — no exists() race/stat.
+        merge_toml(&mut merged, read_toml_table(&Self::project_override_path(project_dir)));
+        merged
+            .try_into()
+            .map_err(|e| Error::Config(format!("merge project config: {e}")))
+    }
+
+    /// Write a MINIMAL project override (just the model selection, plus
+    /// the resolved `[remote]` block for a remote model) to
+    /// `<project>/.embedding-search/config.toml`. Minimal — not a full
+    /// snapshot — so unrelated global settings still flow through the
+    /// merge after the user edits them. Returns the file path.
+    pub fn save_project_override(&self, project_dir: &Path) -> Result<PathBuf> {
+        let dir = project_dir.join(PROJECT_INDEX_DIR);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("config.toml");
+        let mut model = toml::Table::new();
+        model.insert(
+            "default".into(),
+            toml::Value::String(self.model.default.clone()),
+        );
+        let mut root = toml::Table::new();
+        if self.model.provider == EmbeddingProvider::Openai {
+            model.insert(
+                "provider".into(),
+                toml::Value::try_from(self.model.provider)
+                    .map_err(|e| Error::Config(e.to_string()))?,
+            );
+            root.insert(
+                "remote".into(),
+                toml::Value::try_from(&self.remote)
+                    .map_err(|e| Error::Config(e.to_string()))?,
+            );
+        }
+        root.insert("model".into(), toml::Value::Table(model));
+        let doc = toml::to_string_pretty(&toml::Value::Table(root))
+            .map_err(|e| Error::Config(e.to_string()))?;
+        std::fs::write(&path, doc)?;
+        Ok(path)
+    }
+
     /// Write current config to the config file (creating parent dirs).
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path()?;
@@ -555,20 +593,31 @@ impl Config {
             .ok_or_else(|| Error::Config(format!("unknown model: {}", self.model.default)))
     }
 
+    /// Whether the cross-encoder re-rank stage runs. An explicit
+    /// `[rerank] enabled` wins; otherwise it is model-driven —
+    /// `ModelSpec::rerank_default` for the active built-in (ON for the
+    /// static potion models, OFF for the SOTA CodeRank/jina
+    /// bi-encoders), and OFF for a custom/remote model with no spec.
+    pub fn rerank_enabled(&self) -> bool {
+        self.rerank.enabled.unwrap_or_else(|| {
+            model_spec(&self.model.default).is_some_and(|s| s.rerank_default)
+        })
+    }
+
     /// Identity of everything that invalidates an existing index when
-    /// changed: model, output dims, precision, token cap, chunk byte
-    /// cap, chunker logic version, and the resolved input/output
+    /// changed: model (the resolved name carries the weight-file
+    /// variant via `tagged_model_name`), output dims, token cap, chunk
+    /// byte cap, chunker logic version, and the resolved input/output
     /// `contract` (query/doc prefix + pooling — changing a registered
     /// model's prefix or pooling must re-embed, model name alone won't
     /// shift). Stored in `meta.index_fingerprint`; a mismatch on
     /// startup wipes + rebuilds.
     pub fn index_fingerprint(&self, model_name: &str, dimensions: usize, contract: &str) -> String {
         format!(
-            "v{}|{}|{}|{}|{}|{}|{}",
+            "v{}|{}|{}|{}|{}|{}",
             CHUNKER_VERSION,
             model_name,
             dimensions,
-            self.model.precision.label(),
             self.model.max_length,
             self.sync.max_chunk_bytes,
             contract,
@@ -603,9 +652,45 @@ impl Config {
     }
 }
 
+/// Parse a TOML file into a `Value::Table`, or an empty table if the
+/// file is absent or unreadable/invalid (a broken project override
+/// must not wedge the engine — it just contributes nothing to merge).
+fn read_toml_table(path: &Path) -> toml::Value {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+        .filter(toml::Value::is_table)
+        .unwrap_or_else(|| toml::Value::Table(toml::Table::new()))
+}
+
+/// Recursively merge `over` INTO `base` (project wins): tables are
+/// merged key-by-key; any non-table value (scalar/array) replaces the
+/// base wholesale. Single source for the global←project overlay.
+fn merge_toml(base: &mut toml::Value, over: toml::Value) {
+    match (base, over) {
+        (toml::Value::Table(b), toml::Value::Table(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(slot) => merge_toml(slot, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o,
+    }
+}
+
 /// Auto-batch fallback for models with no static spec (custom ONNX /
 /// remote): small enough that an unknown heavy model can't OOM.
 pub const AUTO_EMBED_BATCH_FALLBACK: usize = 8;
+
+/// File count above which a repo is "large" for the speed nudge: on a
+/// heavy transformer model the first index is slow past roughly this
+/// many files, where a static model is far faster for the same tree.
+/// Single source for the CLI hint and the MCP `set_model` hint.
+pub const LARGE_REPO_FILES: i64 = 1_500;
 
 /// Sentence-vector pooling over the encoder's token states. Part of a
 /// model's input/output contract (alongside the query/doc prefixes):
@@ -667,14 +752,15 @@ pub const E5_PASSAGE: &str = "passage: ";
 #[derive(Debug, Clone)]
 pub enum ModelArch {
     /// Model2Vec / `StaticModel`: a static `[vocab, dim]` token-
-    /// embedding matrix, mean-pooled. No transformer/ONNX, tiny RAM,
-    /// precision N/A. (`config.json`: `model_type == "model2vec"` or
+    /// embedding matrix, mean-pooled. No transformer/ONNX, tiny RAM.
+    /// (`config.json`: `model_type == "model2vec"` or
     /// `architectures` ⊇ `StaticModel`.)
     Static,
     /// Transformer encoder loaded from an HF ONNX repo as a
-    /// user-defined model: mean-pooled `last_hidden_state`, precision
-    /// (fp16/int8) honored. (`config.json`: a BERT/RoBERTa/XLM-R/MPNet/
-    /// Nomic-BERT… encoder — NOT an `*ForMaskedLM/CausalLM` head.)
+    /// user-defined model: mean-pooled `last_hidden_state`, weights
+    /// from the pinned `.onnx` file. (`config.json`: a
+    /// BERT/RoBERTa/XLM-R/MPNet/Nomic-BERT… encoder — NOT an
+    /// `*ForMaskedLM/CausalLM` head.)
     OnnxEncoder,
     /// Transformer encoder served by fastembed's bundled registry —
     /// fastembed ships a known-good embedding ONNX + pooling. Used when
@@ -694,9 +780,9 @@ pub enum ModelArch {
 /// form and must always run on CPU.
 #[derive(Debug, Clone)]
 pub enum OnnxFiles {
-    /// One export for every provider. `None` ⇒ derive the file from
-    /// `[model] precision` (the fp16/int8 mapping); `Some` pins an
-    /// exact repo file (a non-standard quantized name).
+    /// One export for every provider. `Some` pins an exact repo file;
+    /// `None` ⇒ the default `onnx/model.onnx` (flat `model.onnx`
+    /// fallback). Static models use `None` (no ONNX is loaded).
     Single(Option<&'static str>),
     /// Distinct files per provider: the `accel` (f32) file when an
     /// accelerator that actually speeds it up is active (CUDA — see
@@ -710,7 +796,7 @@ pub enum OnnxFiles {
     /// No accelerable export — always pinned to the CPU provider
     /// (raw `torch.onnx.export`: low opset, hundreds of dynamic-shape
     /// nodes that balloon the CoreML/CUDA partitioner to multiple GB).
-    /// `None` ⇒ precision mapping.
+    /// `None` ⇒ the default `onnx/model.onnx`.
     CpuOnly(Option<&'static str>),
 }
 
@@ -734,8 +820,8 @@ impl OnnxFiles {
 
     /// `Some` short tag for the index fingerprint iff the resolved file
     /// can flip (`AccelCpu`: f32↔int8 = different vectors, must re-embed
-    /// when it changes). `None` for `Single`/`CpuOnly` — they never
-    /// flip, precision already covers them.
+    /// when it changes). `None` for `Single`/`CpuOnly` — a fixed file,
+    /// it never flips.
     pub fn variant_tag(&self, accel_active: bool) -> Option<&'static str> {
         match self {
             OnnxFiles::AccelCpu { .. } => Some(if accel_active { "accel" } else { "cpu" }),
@@ -765,7 +851,7 @@ pub struct ModelSpec {
     /// Sentence-vector pooling for this model's encoder output.
     pub pooling: Pooling,
     /// Source HF repo for `Static`/`OnnxEncoder` (Model2Vec safetensors
-    /// resp. precision-specific `onnx/model*.onnx` + tokenizer).
+    /// resp. the pinned `onnx/model*.onnx` + tokenizer).
     /// `None` for `Fastembed` (fastembed fetches its own bundle).
     pub hf_repo: Option<&'static str>,
     /// Which repo ONNX file to load per resolved execution provider
@@ -788,6 +874,12 @@ pub struct ModelSpec {
     /// the ~10 GB blow-up on a real repo) while the static Model2Vec
     /// models — no attention — get a large batch for throughput.
     pub rec_batch: u16,
+    /// Default for the optional cross-encoder re-rank when the user
+    /// leaves `[rerank] enabled` unspecified. `true` for the fast
+    /// static models (re-rank is a large measured quality rescue —
+    /// lifts them to ≈ a transformer's top-1); `false` for the SOTA
+    /// bi-encoders (re-rank is ~neutral there, not worth the latency).
+    pub rerank_default: bool,
     pub note: &'static str,
 }
 
@@ -797,30 +889,18 @@ impl ModelSpec {
         matches!(self.arch, ModelArch::Static)
     }
 
-    /// Whether `[model] precision` is honored. Only the user-defined
-    /// ONNX path has per-precision weight files; the static matrix is
-    /// f32-only and fastembed picks its own bundled weights.
-    pub fn supports_precision(&self) -> bool {
-        matches!(self.arch, ModelArch::OnnxEncoder)
-    }
-
-    /// Effective precision: requested if supported, else Full.
-    pub fn effective_precision(&self, want: Precision) -> Precision {
-        if self.supports_precision() {
-            want
+    /// Rough resident RAM in MB: weights + a fixed working-set
+    /// overhead. Model2Vec is a static f32 matrix with no ONNX Runtime
+    /// (~30 MB tokenizer overhead, 4 B/param); an `OnnxEncoder`
+    /// built-in ships its int8 export on CPU (~1 B/param) under ORT's
+    /// ~350 MB. A coarse estimate for `models list` display only.
+    pub fn ram_mb(&self) -> u32 {
+        let (overhead, bytes_per_param) = if self.is_static() {
+            (30.0, 4.0)
         } else {
-            Precision::Full
-        }
-    }
-
-    /// Rough resident RAM in MB: weights at the precision + a fixed
-    /// working-set overhead. Model2Vec has no ONNX Runtime, so only a
-    /// small tokenizer overhead vs. ORT's ~350 MB.
-    pub fn ram_mb(&self, precision: Precision) -> u32 {
-        let overhead = if self.is_static() { 30.0 } else { 350.0 };
-        let p = self.effective_precision(precision);
-        let weights = self.params_m as f32 * p.bytes_per_param();
-        (weights + overhead) as u32
+            (350.0, 1.0)
+        };
+        (self.params_m as f32 * bytes_per_param + overhead) as u32
     }
 }
 
@@ -862,6 +942,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_repo: Some("sensiarion/CodeRankEmbed-f16"),
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
+        rerank_default: false,
         note: "DEFAULT: SOTA code retrieval, English, CLS (f16 Metal / int8 CPU)",
     },
     ModelSpec {
@@ -884,6 +965,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_repo: Some("nomic-ai/CodeRankEmbed"),
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
+        rerank_default: false,
         note: "Official upstream f32 weights (Metal); ~2x f16 default RAM",
     },
     // jina-v2-base-code's HF ONNX config is `JinaBertForMaskedLM`, but
@@ -904,6 +986,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_repo: None,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
+        rerank_default: false,
         note: "Pure code, 30 prog langs, English (int8)",
     },
     ModelSpec {
@@ -921,6 +1004,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_repo: None,
         arch: ModelArch::Static,
         rec_batch: 64,
+        rerank_default: true,
         note: "Model2Vec static, multilingual incl. Russian, tiny+fast",
     },
     ModelSpec {
@@ -938,122 +1022,9 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_repo: None,
         arch: ModelArch::Static,
         rec_batch: 64,
+        rerank_default: true,
         note: "Model2Vec static, English, smallest+fastest, lowest RAM",
     },
-    ModelSpec {
-        name: "intfloat/multilingual-e5-small",
-        dimensions: 384,
-        code: 3,
-        multilingual: 5,
-        params_m: 118,
-        query_prefix: Some(E5_QUERY),
-        doc_prefix: Some(E5_PASSAGE),
-        pooling: Pooling::Mean,
-        hf_repo: Some("Xenova/multilingual-e5-small"),
-        onnx: OnnxFiles::Single(None),
-        candle_repo: None,
-        arch: ModelArch::OnnxEncoder,
-        rec_batch: 8,
-        note: "Multilingual incl. Russian, ONNX encoder (fp16/int8)",
-    },
-    ModelSpec {
-        name: "intfloat/multilingual-e5-base",
-        dimensions: 768,
-        code: 3,
-        multilingual: 5,
-        params_m: 278,
-        query_prefix: Some(E5_QUERY),
-        doc_prefix: Some(E5_PASSAGE),
-        pooling: Pooling::Mean,
-        hf_repo: Some("Xenova/multilingual-e5-base"),
-        onnx: OnnxFiles::Single(None),
-        candle_repo: None,
-        arch: ModelArch::OnnxEncoder,
-        rec_batch: 4,
-        note: "Multilingual incl. Russian, stronger than -small (fp16/int8)",
-    },
-    ModelSpec {
-        name: "intfloat/multilingual-e5-large",
-        dimensions: 1024,
-        code: 3,
-        multilingual: 5,
-        params_m: 560,
-        query_prefix: Some(E5_QUERY),
-        doc_prefix: Some(E5_PASSAGE),
-        pooling: Pooling::Mean,
-        hf_repo: Some("Xenova/multilingual-e5-large"),
-        onnx: OnnxFiles::Single(None),
-        candle_repo: None,
-        arch: ModelArch::OnnxEncoder,
-        rec_batch: 2,
-        note: "Strongest multilingual incl. Russian, heaviest (fp16/int8)",
-    },
-    // nomic-embed-text uses task-specific prefixes; without them
-    // retrieval is degraded (the prior latent bug — it ran prefix-less).
-    ModelSpec {
-        name: "nomic-ai/nomic-embed-text-v1.5",
-        dimensions: 768,
-        code: 4,
-        multilingual: 3,
-        params_m: 137,
-        query_prefix: Some("search_query: "),
-        doc_prefix: Some("search_document: "),
-        pooling: Pooling::Mean,
-        // Official ONNX export (onnx/model{,_fp16,_int8,_q4}.onnx).
-        hf_repo: Some("nomic-ai/nomic-embed-text-v1.5"),
-        onnx: OnnxFiles::Single(None),
-        candle_repo: None,
-        arch: ModelArch::OnnxEncoder,
-        rec_batch: 4,
-        note: "Fast, matryoshka dims, mostly English",
-    },
-    // Snowflake arctic-embed v2 (gte-multilingual-base): CLS-pooled, a
-    // query-only `query: ` prompt, documents raw. `-l-v2.0` is the same
-    // contract (add it identically if needed).
-    ModelSpec {
-        name: "Snowflake/snowflake-arctic-embed-m-v2.0",
-        dimensions: 768,
-        code: 3,
-        multilingual: 5,
-        params_m: 305,
-        query_prefix: Some("query: "),
-        doc_prefix: None,
-        pooling: Pooling::Cls,
-        hf_repo: Some("Snowflake/snowflake-arctic-embed-m-v2.0"),
-        onnx: OnnxFiles::Single(None),
-        candle_repo: None,
-        arch: ModelArch::OnnxEncoder,
-        rec_batch: 4,
-        note: "Multilingual incl. Russian + code, CLS (fp16/int8)",
-    },
-    // e5-base-v2 fine-tuned for code search. Its only HF artifact is a
-    // raw `torch.onnx.export` (opset 11, ~1.2k dynamic-shape nodes,
-    // f32-only — no quantized variant): the CoreML/CUDA partitioner
-    // OOMs at 6+ GB on it, so it is pinned to the CPU provider (bounded
-    // ~0.6 GB). e5 ⇒ needs the query:/passage: prefixes.
-    ModelSpec {
-        name: "jamie8johnson/e5-base-v2-code-search",
-        dimensions: 768,
-        code: 4,
-        multilingual: 2,
-        params_m: 110,
-        query_prefix: Some(E5_QUERY),
-        doc_prefix: Some(E5_PASSAGE),
-        pooling: Pooling::Mean,
-        hf_repo: Some("jamie8johnson/e5-base-v2-code-search"),
-        onnx: OnnxFiles::CpuOnly(None),
-        candle_repo: None,
-        arch: ModelArch::OnnxEncoder,
-        rec_batch: 8,
-        note: "e5-base-v2 tuned for code search, English (f32, CPU-only)",
-    },
-    // TODO(candle-qwen3): `Qwen/Qwen3-Embedding-0.6B` — a Qwen3 *decoder*
-    // embedder: `query_prefix` = "Instruct: Given a code search query,
-    // retrieve relevant code that answers the query\nQuery:" (literal
-    // \n, NO space after `Query:` — authored, tunable), `doc_prefix` =
-    // None, `pooling = LastToken`. NOT registerable yet: every public
-    // ONNX is a KV-cache decoder the ORT path rejects; enable as a
-    // one-line entry once the candle `qwen3` backend (ModelArch) lands.
 ];
 
 pub fn model_spec(name: &str) -> Option<&'static ModelSpec> {
@@ -1096,5 +1067,42 @@ pub fn normalize_hf_repo(input: &str) -> String {
         s.to_string()
     } else {
         segs.join("/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_toml_overlays_project_keys_and_keeps_the_rest() {
+        let mut base: toml::Value = toml::from_str(
+            "[model]\ndefault = \"global-model\"\nmax_length = 333\n\
+             [sync]\nmax_chunk_bytes = 2048\n",
+        )
+        .unwrap();
+        // Project overrides ONLY the model default; the other [model]
+        // keys + [sync] survive.
+        let over: toml::Value = toml::from_str("[model]\ndefault = \"proj-model\"\n").unwrap();
+        merge_toml(&mut base, over);
+        let cfg: Config = base.try_into().unwrap();
+        assert_eq!(cfg.model.default, "proj-model"); // project wins
+        assert_eq!(cfg.model.max_length, 333); // global [model] key kept
+        assert_eq!(cfg.sync.max_chunk_bytes, 2048); // untouched section kept
+    }
+
+    #[test]
+    fn save_project_override_writes_minimal_local_model_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.model.default = "minishlab/potion-base-32M".into();
+        let p = cfg.save_project_override(dir.path()).unwrap();
+        assert_eq!(p, Config::project_override_path(dir.path()));
+        let written = std::fs::read_to_string(&p).unwrap();
+        assert!(written.contains("minishlab/potion-base-32M"));
+        // Minimal: only the local model — no remote block, no full
+        // config dump ([sync] etc.).
+        assert!(!written.contains("[remote]"));
+        assert!(!written.contains("[sync]"));
     }
 }

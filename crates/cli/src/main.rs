@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use embedding_search_core::{
     config::{
-        normalize_hf_repo, CustomModel, EmbeddingProvider, Pooling, Precision, RemoteConfig,
+        normalize_hf_repo, CustomModel, EmbeddingProvider, Pooling, RemoteConfig,
         DEFAULT_MODEL, SUPPORTED_MODELS,
     },
     embedder::custom_model_cache_dir,
@@ -13,6 +13,16 @@ use embedding_search_core::{
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
+
+/// A sync slower than this (ms) on a non-static model triggers the
+/// "switch to a static model" speed hint. ~15 s is where a heavy
+/// transformer index starts to feel slow but a static one would not.
+const SLOW_SYNC_MS: u64 = 15_000;
+/// Char cap for the matched chunk's body in human search output.
+const HIT_PREVIEW: usize = 240;
+/// Char cap for each printed prev/next neighbor body — shorter than
+/// the hit so a result with two ~2 KB siblings can't flood the screen.
+const NEIGHBOR_PREVIEW: usize = 200;
 
 #[derive(Parser)]
 #[command(
@@ -70,6 +80,18 @@ enum Command {
     /// Delete a project's index (embeddings + metadata). The next
     /// init/sync rebuilds from scratch.
     Clear {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Set the embedding model for THIS project only. Writes
+    /// `<project>/.embedding-search/config.toml`, which is deep-merged
+    /// over (and wins against) the global default — other projects are
+    /// unaffected. The model is verified (download + test embed) before
+    /// anything is written; the project re-indexes on the next sync.
+    Set {
+        /// A built-in, or a globally-registered custom/remote model
+        /// name (see `models list`).
+        model: String,
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -144,13 +166,9 @@ enum ModelsCmd {
         /// Encoder output pooling: mean (default) | cls | last-token.
         #[arg(long)]
         pooling: Option<Pooling>,
-        /// ONNX precision to pull (HF --repo): fp16 | int8 | full.
-        /// Omitted ⇒ the global `[model] precision`.
-        #[arg(long)]
-        precision: Option<Precision>,
         /// Exact ONNX file in the repo, e.g. model_q4f16.onnx or
-        /// onnx/model_q4.onnx. Overrides --precision; for repos with
-        /// quantizations the precision mapping doesn't cover.
+        /// onnx/model_q4.onnx. Omitted ⇒ onnx/model.onnx. This
+        /// filename is the sole weight selector.
         #[arg(long)]
         onnx_file: Option<String>,
     },
@@ -189,7 +207,7 @@ enum ModelsCmd {
 /// Is the (normalized) HF repo still referenced by a remaining custom
 /// model or a built-in? Guards `models remove` from deleting an
 /// hf-hub cache dir shared via `models--{repo}` (one dir per repo, no
-/// precision/file in the path) — call AFTER removing the target entry.
+/// onnx-file in the path) — call AFTER removing the target entry.
 fn repo_still_used(cfg: &Config, repo_norm: &str) -> bool {
     cfg.custom_models
         .iter()
@@ -203,19 +221,29 @@ fn repo_still_used(cfg: &Config, repo_norm: &str) -> bool {
 /// Verify a freshly selected model end-to-end *before* persisting it:
 /// `Embedder::new` downloads the weights (HF progress on stderr) and
 /// runs a probe embed, so a bad repo/URL/endpoint fails here with an
-/// actionable error and the config is left untouched.
-fn verify_and_save(cfg: &Config, name: &str) -> Result<()> {
-    let remote = cfg.model.provider == EmbeddingProvider::Openai;
-    let how = if remote {
+/// actionable error and nothing is written. Shared by global
+/// `set-default`/`add` and per-project `set` (each persists its own
+/// way afterwards).
+fn verify_model(cfg: &Config, name: &str) -> Result<Embedder> {
+    let how = if cfg.model.provider == EmbeddingProvider::Openai {
         "endpoint reachability + test embed"
     } else {
         "model download + test embed"
     };
     eprintln!("Verifying '{name}' ({how})…");
-    let emb = Embedder::new(cfg)
-        .with_context(|| format!("'{name}' failed verification — nothing saved"))?;
+    Embedder::new(cfg).with_context(|| format!("'{name}' failed verification — nothing saved"))
+}
+
+/// Verify then persist to the GLOBAL config (`set-default`, `add`,
+/// `add-remote`).
+fn verify_and_save(cfg: &Config, name: &str) -> Result<()> {
+    let emb = verify_model(cfg, name)?;
     cfg.save().context("save config")?;
-    let kind = if remote { " (remote)" } else { "" };
+    let kind = if cfg.model.provider == EmbeddingProvider::Openai {
+        " (remote)"
+    } else {
+        ""
+    };
     println!(
         "\u{2713} '{name}'{kind} verified — {} dims. Run `embedding-search sync --force` to re-index.",
         emb.dimensions
@@ -224,14 +252,14 @@ fn verify_and_save(cfg: &Config, name: &str) -> Result<()> {
 }
 
 fn engine(path: &Path) -> Result<SyncEngine> {
-    let cfg = Config::load_or_init().context("load config")?;
     let dir = std::fs::canonicalize(path).context("resolve path")?;
+    let cfg = Config::load_for_project(&dir).context("load config")?;
     SyncEngine::new(dir, cfg).context("open engine")
 }
 
 fn inspector(path: &Path) -> Result<Inspector> {
-    let cfg = Config::load_or_init().context("load config")?;
     let dir = std::fs::canonicalize(path).context("resolve path")?;
+    let cfg = Config::load_for_project(&dir).context("load config")?;
     Inspector::open(&dir, cfg).context("open inspector")
 }
 
@@ -293,8 +321,31 @@ fn run_sync(eng: &SyncEngine, force: bool, report: Report) -> Result<()> {
             stats.elapsed_ms as f64 / 1000.0,
             stats.chunks_total
         );
+        // A heavy transformer model on a big repo dominates sync time.
+        // The static Model2Vec models index the same tree in a fraction
+        // of it; nudge the user (per-project, one command) when a sync
+        // actually ran long on a non-static model.
+        if stats.elapsed_ms > SLOW_SYNC_MS && !eng.model_is_static() {
+            println!(
+                "Tip: this repo is large and '{}' is a heavy model. For \
+                 much faster syncs:\n  embedding-search set \
+                 minishlab/potion-base-32M{}\n(per-project; re-indexes \
+                 once on the next sync).",
+                eng.configured_model(),
+                path_hint(eng.project_dir()),
+            );
+        }
     }
     Ok(())
+}
+
+/// ` <path>` suffix for the hint when the synced project is not the
+/// shell's CWD, so the suggested command targets the right repo.
+fn path_hint(project_dir: &Path) -> String {
+    match std::env::current_dir() {
+        Ok(cwd) if cwd == project_dir => String::new(),
+        _ => format!(" {}", project_dir.display()),
+    }
 }
 
 fn main() -> Result<()> {
@@ -332,6 +383,24 @@ fn main() -> Result<()> {
         return mcp::run();
     };
     match cmd {
+        Command::Set { model, path } => {
+            let dir = std::fs::canonicalize(&path).context("resolve path")?;
+            let mut cfg = Config::load_for_project(&dir).context("load config")?;
+            cfg.select_model(&model)?;
+            // Same pre-persist contract as `models set-default`: a bad
+            // name/repo fails here and the project override is untouched.
+            let emb = verify_model(&cfg, &model)?;
+            let p = cfg
+                .save_project_override(&dir)
+                .context("save project override")?;
+            println!(
+                "\u{2713} '{model}' set for this project ({} dims).\n  {}\n\
+                 Run `embedding-search sync --force` to re-index now \
+                 (otherwise it auto-rebuilds on the next sync).",
+                emb.dimensions,
+                p.display()
+            );
+        }
         Command::Serve => return mcp::run(),
         Command::Clear { path } => {
             use embedding_search_core::{config::PROJECT_INDEX_DIR, sync::wipe_index};
@@ -375,6 +444,10 @@ fn main() -> Result<()> {
             } else if res.is_empty() {
                 println!("No results.");
             } else {
+                // Cap neighbor bodies so a result with two ~2 KB
+                // siblings can't flood the terminal; the hit itself
+                // gets a longer preview than its context.
+                let clip = |s: &str, n: usize| s.chars().take(n).collect::<String>();
                 for r in res {
                     println!(
                         "\n\u{2022} {}:{}-{}  [{}/{}]  score={:.3}",
@@ -383,8 +456,21 @@ fn main() -> Result<()> {
                     if let Some(p) = &r.parent {
                         println!("  in {} {}", p.node_type, p.signature);
                     }
-                    let preview: String = r.content.chars().take(240).collect();
-                    println!("{preview}");
+                    if let (Some(pr), Some(body)) = (&r.prev, &r.prev_body) {
+                        println!(
+                            "  \u{2191} prev {} {}-{}",
+                            pr.node_type, pr.start_line, pr.end_line
+                        );
+                        println!("{}", clip(body, NEIGHBOR_PREVIEW));
+                    }
+                    println!("{}", clip(&r.content, HIT_PREVIEW));
+                    if let (Some(nx), Some(body)) = (&r.next, &r.next_body) {
+                        println!(
+                            "  \u{2193} next {} {}-{}",
+                            nx.node_type, nx.start_line, nx.end_line
+                        );
+                        println!("{}", clip(body, NEIGHBOR_PREVIEW));
+                    }
                 }
             }
         }
@@ -393,6 +479,12 @@ fn main() -> Result<()> {
             match Config::config_path() {
                 Ok(p) => println!("config:         {}", p.display()),
                 Err(e) => println!("config:         <unavailable: {e}>"),
+            }
+            if let Ok(dir) = std::fs::canonicalize(&path) {
+                let po = Config::project_override_path(&dir);
+                if po.exists() {
+                    println!("project config: {} (overrides global)", po.display());
+                }
             }
             println!("model:          {}", s.model);
             println!("files:          {}", s.files);
@@ -448,8 +540,8 @@ fn main() -> Result<()> {
                 let mark = |is_active: bool| if is_active { "*" } else { " " };
 
                 println!(
-                    " {:<37} {:>4} {:>4} {:>4} {:>6} {:>9}",
-                    "model", "dim", "code", "ml", "prec", "RAM~MB"
+                    " {:<37} {:>4} {:>4} {:>4} {:>9}",
+                    "model", "dim", "code", "ml", "RAM~MB"
                 );
                 for m in SUPPORTED_MODELS {
                     let active = !remote_active
@@ -457,14 +549,13 @@ fn main() -> Result<()> {
                         && cfg.custom_model().is_none()
                         && m.name == cfg.model.default;
                     println!(
-                        "{}{:<37} {:>4} {:>4} {:>4} {:>6} {:>9}",
+                        "{}{:<37} {:>4} {:>4} {:>4} {:>9}",
                         mark(active),
                         m.name,
                         m.dimensions,
                         m.code,
                         m.multilingual,
-                        m.effective_precision(cfg.model.precision).label(),
-                        m.ram_mb(cfg.model.precision),
+                        m.ram_mb(),
                     );
                 }
                 for cm in &cfg.custom_models {
@@ -494,9 +585,8 @@ fn main() -> Result<()> {
                     );
                 }
                 println!(
-                    "\n* = active model. [model] precision (f32/fp16/int8) \
-                     applies to ONNX-encoder models only (static + \
-                     fastembed ignore it). Add: `models add` / `models add-remote`."
+                    "\n* = active model. RAM~MB is a coarse estimate. \
+                     Add: `models add` / `models add-remote`."
                 );
             }
             ModelsCmd::SetDefault { model } => {
@@ -554,7 +644,6 @@ fn main() -> Result<()> {
                 query_prefix,
                 doc_prefix,
                 pooling,
-                precision,
                 onnx_file,
             } => {
                 // clap's `source` ArgGroup guarantees exactly one of
@@ -583,7 +672,6 @@ fn main() -> Result<()> {
                     query_prefix: qp,
                     doc_prefix: dp,
                     pooling: pooling.unwrap_or_default(),
-                    precision,
                     onnx_file,
                 });
                 // Same activation path as add-remote / set-default.

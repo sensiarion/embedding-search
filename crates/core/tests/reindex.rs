@@ -42,9 +42,9 @@ fn model_change_rebuilds_without_vector_id_collision() {
     assert!(s1.chunks_total > 0, "model A indexed nothing");
     drop(e1);
 
-    // Model B: different name AND dims (384) → fingerprint mismatch →
+    // Model B: different name AND dims (512) → fingerprint mismatch →
     // the on-disk index must be wiped and rebuilt, not appended to.
-    let e2 = SyncEngine::new(p.to_path_buf(), cfg_for("intfloat/multilingual-e5-small"))
+    let e2 = SyncEngine::new(p.to_path_buf(), cfg_for("minishlab/potion-base-32M"))
         .expect("engine B must rebuild on model change");
     let s2 = e2
         .sync(true, |_| {})
@@ -56,10 +56,10 @@ fn model_change_rebuilds_without_vector_id_collision() {
         .expect("search post-swap");
     assert!(!hits.is_empty(), "no results after model swap rebuild");
 
-    // Swapping back (and to a third) must stay clean too.
+    // Swapping back to model A must stay clean too.
     drop(e2);
-    let e3 =
-        SyncEngine::new(p.to_path_buf(), cfg_for("minishlab/potion-base-32M")).expect("engine C");
+    let e3 = SyncEngine::new(p.to_path_buf(), cfg_for("minishlab/potion-multilingual-128M"))
+        .expect("engine C");
     e3.sync(true, |_| {})
         .expect("third model swap must be clean");
 }

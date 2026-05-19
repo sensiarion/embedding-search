@@ -4,7 +4,7 @@
 //!   cargo test -p embedding-search-core --test quality -- --ignored
 //!
 //! Optionally point at a smaller/faster model:
-//!   ES_TEST_MODEL=intfloat/multilingual-e5-small cargo test ... -- --ignored
+//!   ES_TEST_MODEL=minishlab/potion-base-32M cargo test ... -- --ignored
 
 use embedding_search_core::{Config, SyncEngine};
 use std::path::PathBuf;
@@ -74,16 +74,14 @@ fn russian_query_matches_russian_doc() {
 }
 
 #[test]
-#[ignore = "downloads a real f32 ONNX model (~440 MB)"]
-fn predefined_e5_code_model_discriminates_via_forced_cpu() {
-    // Regression for the "memory blowing, no results" report: this
-    // built-in is a raw torch opset-11 export that OOMs the CoreML/CUDA
-    // partitioner — `ModelSpec::force_cpu` pins CPU so it loads at all.
-    // It is e5, so its `query: `/`passage: ` contract must apply for
-    // the embedding to separate the relevant code from the unrelated
-    // chunks.
+#[ignore = "downloads the jina int8 ONNX encoder (~0.76 GB)"]
+fn predefined_onnx_encoder_model_discriminates() {
+    // Smoke test for the pinned-`.onnx` ONNX-encoder built-in path
+    // (`OnnxFiles::Single` int8, mean-pooled, no prefix): the loaded
+    // weights + contract must separate the relevant code from the
+    // unrelated chunk.
     let mut cfg = Config::default();
-    cfg.model.default = "jamie8johnson/e5-base-v2-code-search".into();
+    cfg.model.default = "jinaai/jina-embeddings-v2-base-code".into();
     let (_d, eng) = common::build_repo_with(
         &[
             (
@@ -147,7 +145,7 @@ fn default_coderankembed_discriminates_with_accel_policy() {
 fn external_data_custom_model_loads_and_embeds() {
     // onnx-community / >2 GB models split weights into a `.onnx_data`
     // sidecar — proves it is fetched and wired so ORT initializes.
-    use embedding_search_core::config::{CustomModel, Precision};
+    use embedding_search_core::config::CustomModel;
     use embedding_search_core::embedder::Embedder;
     let mut cfg = Config::default();
     cfg.custom_models.push(CustomModel {
@@ -157,8 +155,7 @@ fn external_data_custom_model_loads_and_embeds() {
         query_prefix: None,
         doc_prefix: None,
         pooling: Default::default(),
-        precision: Some(Precision::Int8),
-        onnx_file: None,
+        onnx_file: Some("onnx/model_quantized.onnx".into()),
     });
     cfg.model.default = "gemma".into();
     let emb = Embedder::new(&cfg).expect("external-data model must load");
@@ -170,8 +167,8 @@ fn external_data_custom_model_loads_and_embeds() {
 #[test]
 #[ignore = "downloads a real quantized ONNX model (~570 MB)"]
 fn explicit_onnx_file_picks_exact_quantization() {
-    // A repo quantization the precision→file mapping can't reach
-    // (q4f16) is loaded via the exact-file override.
+    // An exact repo quantization (q4f16) is selected purely by its
+    // concrete .onnx filename (the sole weight selector).
     use embedding_search_core::config::CustomModel;
     use embedding_search_core::embedder::Embedder;
     let mut cfg = Config::default();
@@ -182,7 +179,6 @@ fn explicit_onnx_file_picks_exact_quantization() {
         query_prefix: None,
         doc_prefix: None,
         pooling: Default::default(),
-        precision: None,
         onnx_file: Some("model_q4f16.onnx".into()),
     });
     cfg.model.default = "qwen3".into();
@@ -207,7 +203,6 @@ fn model2vec_static_backend_loads_and_embeds() {
         query_prefix: None,
         doc_prefix: None,
         pooling: Default::default(),
-        precision: None,
         onnx_file: None,
     });
     cfg.model.default = "potion".into();
@@ -245,13 +240,13 @@ fn relevant_scores_beat_irrelevant() {
 // `bench-stub`), so this test only exists in a real build.
 #[cfg(not(feature = "bench-stub"))]
 #[test]
-#[ignore = "downloads the int8 cross-encoder reranker (~280 MB)"]
+#[ignore = "downloads the ettin cross-encoder reranker (~270 MB)"]
 fn reranker_scores_relevant_above_irrelevant() {
     // Cross-encoder sanity: the joint (query, passage) relevance logit
     // must rank a passage that answers the query above an unrelated one.
     use embedding_search_core::rerank::Reranker;
     let mut cfg = Config::default();
-    cfg.rerank.enabled = true;
+    cfg.rerank.enabled = Some(true);
     let rr = Reranker::load(&cfg).expect("reranker must load");
     let scores = rr
         .score(
@@ -271,7 +266,7 @@ fn reranker_scores_relevant_above_irrelevant() {
 }
 
 #[test]
-#[ignore = "loads the default model + the reranker (~280 MB extra)"]
+#[ignore = "loads the default model + the ettin reranker (~270 MB extra)"]
 fn rerank_enabled_keeps_relevant_file_top1() {
     // End-to-end with `[rerank] enabled = true`: the cross-encoder
     // re-orders the fused top-N and the semantically correct file must
@@ -294,7 +289,7 @@ fn rerank_enabled_keeps_relevant_file_top1() {
         ),
     ];
     let mut cfg = Config::default();
-    cfg.rerank.enabled = true;
+    cfg.rerank.enabled = Some(true);
     let (_d, eng) = common::build_repo_with(files, cfg);
     let hits = eng
         .search("authenticate a user from a JWT bearer token", 5, None)

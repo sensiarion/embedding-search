@@ -35,6 +35,14 @@ pub struct SearchResult {
     pub prev: Option<ChunkRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<ChunkRef>,
+    /// Full bodies of the prev/next siblings, for the human CLI to
+    /// print surrounding context. Deliberately `#[serde(skip)]`: the
+    /// MCP/JSON contract stays refs-only (the agent fetches a neighbor
+    /// on demand — ~98% fewer tokens than always inlining both).
+    #[serde(skip)]
+    pub prev_body: Option<String>,
+    #[serde(skip)]
+    pub next_body: Option<String>,
     pub score: f32,
 }
 
@@ -333,14 +341,12 @@ pub fn run(
             }
         };
         let pos = siblings.iter().position(|s| s.vector_id == cur.vector_id);
-        let prev = pos
+        let prev_row = pos
             .and_then(|i| i.checked_sub(1))
-            .and_then(|i| siblings.get(i))
-            .map(|c| chunk_ref(text, c));
-        let next = pos
-            .map(|i| i + 1)
-            .and_then(|i| siblings.get(i))
-            .map(|c| chunk_ref(text, c));
+            .and_then(|i| siblings.get(i));
+        let next_row = pos.map(|i| i + 1).and_then(|i| siblings.get(i));
+        let prev = prev_row.map(|c| chunk_ref(text, c));
+        let next = next_row.map(|c| chunk_ref(text, c));
         let parent = enclosing(siblings, &cur).map(|c| chunk_ref(text, c));
 
         out.push(SearchResult {
@@ -348,6 +354,8 @@ pub fn run(
             start_line: text.map_or(0, |t| line_at(t, cur.start_byte as usize)),
             end_line: text.map_or(0, |t| line_at(t, cur.end_byte as usize)),
             parent,
+            prev_body: prev_row.map(|c| c.content.clone()),
+            next_body: next_row.map(|c| c.content.clone()),
             prev,
             next,
             file_path: cur.file_path,
