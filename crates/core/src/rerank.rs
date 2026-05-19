@@ -63,7 +63,7 @@ impl Reranker {
         // keeping the short query intact.
         let max_length = cfg.model.max_length.max(1);
         let (session, tok, pad_id, need_type_ids) =
-            build_onnx_session(udm, &cfg.backend, false, max_length)?;
+            build_onnx_session(udm, &cfg.backend, false, max_length, &cache_dir)?;
 
         Ok(Self {
             session: Mutex::new(session),

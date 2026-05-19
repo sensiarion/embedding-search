@@ -684,6 +684,66 @@ pub enum ModelArch {
     Fastembed(EmbeddingModel),
 }
 
+/// Which repo ONNX file to load, resolved against the active execution
+/// provider. Replaces a blunt `force_cpu` bool: most models ship one
+/// export used on any provider; CodeRankEmbed keeps the small **int8**
+/// export for CPU/CoreML (the ORT CoreML EP can't accelerate it — and
+/// MLProgram miscompiles its NomicBert rotary — so Apple Silicon stays
+/// on int8/CPU) but switches to the **f32** export under CUDA, where
+/// it is genuinely accelerated; a few raw exports have no accelerable
+/// form and must always run on CPU.
+#[derive(Debug, Clone)]
+pub enum OnnxFiles {
+    /// One export for every provider. `None` ⇒ derive the file from
+    /// `[model] precision` (the fp16/int8 mapping); `Some` pins an
+    /// exact repo file (a non-standard quantized name).
+    Single(Option<&'static str>),
+    /// Distinct files per provider: the `accel` (f32) file when an
+    /// accelerator that actually speeds it up is active (CUDA — see
+    /// `embedder::accel_active`), else the smaller `cpu` (int8) file
+    /// pinned to the CPU provider (also the Apple-Silicon path: the
+    /// ORT CoreML EP cannot accelerate these graphs).
+    AccelCpu {
+        accel: &'static str,
+        cpu: &'static str,
+    },
+    /// No accelerable export — always pinned to the CPU provider
+    /// (raw `torch.onnx.export`: low opset, hundreds of dynamic-shape
+    /// nodes that balloon the CoreML/CUDA partitioner to multiple GB).
+    /// `None` ⇒ precision mapping.
+    CpuOnly(Option<&'static str>),
+}
+
+impl OnnxFiles {
+    /// Resolve to `(explicit repo file, pin the CPU provider?)` given
+    /// whether an accelerator that genuinely speeds these graphs up
+    /// (CUDA) is active. The single switch the embedder dispatches on.
+    pub fn resolve(&self, accel_active: bool) -> (Option<&'static str>, bool) {
+        match self {
+            OnnxFiles::Single(f) => (*f, false),
+            OnnxFiles::CpuOnly(f) => (*f, true),
+            OnnxFiles::AccelCpu { accel, cpu } => {
+                if accel_active {
+                    (Some(accel), false)
+                } else {
+                    (Some(cpu), true)
+                }
+            }
+        }
+    }
+
+    /// `Some` short tag for the index fingerprint iff the resolved file
+    /// can flip (`AccelCpu`: f32↔int8 = different vectors, must re-embed
+    /// when it changes). `None` for `Single`/`CpuOnly` — they never
+    /// flip, precision already covers them.
+    pub fn variant_tag(&self, accel_active: bool) -> Option<&'static str> {
+        match self {
+            OnnxFiles::AccelCpu { .. } => Some(if accel_active { "accel" } else { "cpu" }),
+            OnnxFiles::Single(_) | OnnxFiles::CpuOnly(_) => None,
+        }
+    }
+}
+
 /// Static metadata for a supported embedding model — the single source
 /// of truth shared by config, embedder and CLI.
 #[derive(Debug, Clone)]
@@ -708,19 +768,18 @@ pub struct ModelSpec {
     /// resp. precision-specific `onnx/model*.onnx` + tokenizer).
     /// `None` for `Fastembed` (fastembed fetches its own bundle).
     pub hf_repo: Option<&'static str>,
-    /// Exact ONNX file to pull (`OnnxEncoder` only), overriding the
-    /// precision→filename mapping. For a repo whose quantized export
-    /// has a non-standard name (jina's `onnx/model_quantized.onnx`).
-    /// `None` ⇒ derive from `[model] precision`.
-    pub onnx_file: Option<&'static str>,
-    /// Force the CPU execution provider for this model, ignoring
-    /// `[backend] execution_provider`. Some HF repos ship a raw
-    /// `torch.onnx.export` (low opset, hundreds of dynamic-shape
-    /// Shape/Gather/Concat nodes): the CoreML/CUDA graph partitioner
-    /// balloons to multiple GB on these and OOMs a real sync, while
-    /// CPU stays bounded. Set for such exports; false runs the normal
-    /// accelerator selection.
-    pub force_cpu: bool,
+    /// Which repo ONNX file to load per resolved execution provider
+    /// (`OnnxEncoder` only). Subsumes the old `onnx_file` + `force_cpu`:
+    /// pins an exact file and/or the CPU provider for raw exports that
+    /// fragment the CoreML/CUDA partitioner.
+    pub onnx: OnnxFiles,
+    /// Base HF repo with f32 `model.safetensors` for the candle Metal
+    /// backend (Apple Silicon only). `Some` ⇒ on aarch64 macOS this
+    /// model runs on the Metal GPU via candle (≈1.8x the int8 ONNX CPU
+    /// path; the ORT CoreML EP can't accelerate it), falling back to
+    /// the `onnx`/ONNX path if Metal is unreachable or off-Apple. Only
+    /// NomicBert (CodeRankEmbed) is wired today.
+    pub candle_repo: Option<&'static str>,
     /// How this model is loaded/run (the dispatch switch).
     pub arch: ModelArch,
     /// Recommended embed batch size for this model, used when
@@ -768,8 +827,12 @@ impl ModelSpec {
 pub const SUPPORTED_MODELS: &[ModelSpec] = &[
     // DEFAULT: nomic CodeRankEmbed — SOTA code retrieval (NomicBertModel
     // encoder, CLS-pooled, query-only instruction prefix). The base
-    // repo ships safetensors only; this is a community int8 ONNX export
-    // (`mrsladoje/CodeRankEmbed-onnx-int8`, `onnx/model.onnx`).
+    // repo ships safetensors only; this community export carries both
+    // the f32 `onnx/model.onnx` and the int8 `onnx/model_quantized.onnx`.
+    // Apple Silicon / CPU stays on int8 (the ORT CoreML EP can't
+    // accelerate NomicBert — int8 QDQ falls back to CPU and is *slower*
+    // there, and MLProgram miscompiles its rotary); CUDA gets the f32
+    // file where it is genuinely accelerated. See `OnnxFiles`.
     ModelSpec {
         name: "nomic-ai/CodeRankEmbed",
         dimensions: 768,
@@ -779,12 +842,19 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         query_prefix: Some("Represent this query for searching relevant code: "),
         doc_prefix: None,
         pooling: Pooling::Cls,
-        hf_repo: Some("mrsladoje/CodeRankEmbed-onnx-int8"),
-        onnx_file: Some("onnx/model.onnx"),
-        // NomicBert + rotary export fragments the CoreML/CUDA
-        // partitioner: pathologically slow + macOS "Context leak"
-        // os_log spam under `auto`. CPU is bounded, faster, quiet.
-        force_cpu: true,
+        hf_repo: Some("jalipalo/CodeRankEmbed-onnx"),
+        // One repo, both files: f32 for CUDA (accelerated), int8 for
+        // CPU/Apple-Silicon (fastest correct path there — ~0.7 s/10
+        // batches vs the f32's CPU-equal CoreML run; MLProgram crashes
+        // the rotary). `accel_active` is CUDA-only, so on a Mac this
+        // resolves to int8/CPU automatically.
+        onnx: OnnxFiles::AccelCpu {
+            accel: "onnx/model.onnx",
+            cpu: "onnx/model_quantized.onnx",
+        },
+        // Apple Silicon: run f32 on the Metal GPU via candle (base
+        // safetensors repo) — ~1.8x the int8 ONNX CPU fallback.
+        candle_repo: Some("nomic-ai/CodeRankEmbed"),
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
         note: "DEFAULT: SOTA code retrieval, English, CLS (int8)",
@@ -803,8 +873,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         doc_prefix: None,
         pooling: Pooling::Mean,
         hf_repo: Some("jinaai/jina-embeddings-v2-base-code"),
-        onnx_file: Some("onnx/model_quantized.onnx"),
-        force_cpu: false,
+        onnx: OnnxFiles::Single(Some("onnx/model_quantized.onnx")),
+        candle_repo: None,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
         note: "Pure code, 30 prog langs, English (int8)",
@@ -820,8 +890,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         doc_prefix: None,
         pooling: Pooling::Mean,
         hf_repo: Some("minishlab/potion-multilingual-128M"),
-        onnx_file: None,
-        force_cpu: false,
+        onnx: OnnxFiles::Single(None),
+        candle_repo: None,
         arch: ModelArch::Static,
         rec_batch: 64,
         note: "Model2Vec static, multilingual incl. Russian, tiny+fast",
@@ -837,8 +907,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         doc_prefix: None,
         pooling: Pooling::Mean,
         hf_repo: Some("minishlab/potion-base-32M"),
-        onnx_file: None,
-        force_cpu: false,
+        onnx: OnnxFiles::Single(None),
+        candle_repo: None,
         arch: ModelArch::Static,
         rec_batch: 64,
         note: "Model2Vec static, English, smallest+fastest, lowest RAM",
@@ -853,8 +923,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         doc_prefix: Some(E5_PASSAGE),
         pooling: Pooling::Mean,
         hf_repo: Some("Xenova/multilingual-e5-small"),
-        onnx_file: None,
-        force_cpu: false,
+        onnx: OnnxFiles::Single(None),
+        candle_repo: None,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 8,
         note: "Multilingual incl. Russian, ONNX encoder (fp16/int8)",
@@ -869,8 +939,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         doc_prefix: Some(E5_PASSAGE),
         pooling: Pooling::Mean,
         hf_repo: Some("Xenova/multilingual-e5-base"),
-        onnx_file: None,
-        force_cpu: false,
+        onnx: OnnxFiles::Single(None),
+        candle_repo: None,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
         note: "Multilingual incl. Russian, stronger than -small (fp16/int8)",
@@ -885,8 +955,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         doc_prefix: Some(E5_PASSAGE),
         pooling: Pooling::Mean,
         hf_repo: Some("Xenova/multilingual-e5-large"),
-        onnx_file: None,
-        force_cpu: false,
+        onnx: OnnxFiles::Single(None),
+        candle_repo: None,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 2,
         note: "Strongest multilingual incl. Russian, heaviest (fp16/int8)",
@@ -904,8 +974,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         pooling: Pooling::Mean,
         // Official ONNX export (onnx/model{,_fp16,_int8,_q4}.onnx).
         hf_repo: Some("nomic-ai/nomic-embed-text-v1.5"),
-        onnx_file: None,
-        force_cpu: false,
+        onnx: OnnxFiles::Single(None),
+        candle_repo: None,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
         note: "Fast, matryoshka dims, mostly English",
@@ -923,8 +993,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         doc_prefix: None,
         pooling: Pooling::Cls,
         hf_repo: Some("Snowflake/snowflake-arctic-embed-m-v2.0"),
-        onnx_file: None,
-        force_cpu: false,
+        onnx: OnnxFiles::Single(None),
+        candle_repo: None,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
         note: "Multilingual incl. Russian + code, CLS (fp16/int8)",
@@ -944,8 +1014,8 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         doc_prefix: Some(E5_PASSAGE),
         pooling: Pooling::Mean,
         hf_repo: Some("jamie8johnson/e5-base-v2-code-search"),
-        onnx_file: None,
-        force_cpu: true,
+        onnx: OnnxFiles::CpuOnly(None),
+        candle_repo: None,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 8,
         note: "e5-base-v2 tuned for code search, English (f32, CPU-only)",

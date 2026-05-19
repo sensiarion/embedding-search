@@ -36,6 +36,10 @@ enum Backend {
     /// encoder) run directly on ORT with bounded fixed-shape batches.
     #[cfg(not(feature = "bench-stub"))]
     Onnx(OnnxEncoder),
+    /// CodeRankEmbed (NomicBert) on the Metal GPU via candle —
+    /// Apple-Silicon only, ~1.8x the int8 ONNX CPU path.
+    #[cfg(candle_backend)]
+    Candle(Box<crate::candle_encoder::CandleEncoder>),
 }
 
 /// Resolved per-model input/output contract: the query/document
@@ -115,18 +119,66 @@ fn stub_vector(text: &str, dims: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Whether an accelerator that *actually speeds up* our ONNX encoders
+/// is active for this backend — which empirically means **CUDA only**.
+///
+/// Measured on the CodeRankEmbed (NomicBert) export, batch `[4,64]`,
+/// 10 runs: every quantized variant is *slower* on the ORT CoreML EP
+/// than on CPU (it cannot run int8 QDQ, falls back to CPU and adds
+/// copy/partition overhead — ~0.95 s vs ~0.72 s), and the f32 export
+/// is only CPU-equal; the newer MLProgram format miscompiles the
+/// rotary `Mul` and hard-fails. So the f32↔int8 `OnnxFiles` flip is
+/// pure downside on Apple Silicon (4× the download for no speedup) and
+/// only worth it under CUDA. (CoreML EP is still attached by
+/// `providers()` for non-pinned models — it just never wins here.)
+#[cfg(not(feature = "bench-stub"))]
+pub(crate) fn accel_active(b: &BackendConfig) -> bool {
+    cfg!(feature = "cuda")
+        && matches!(
+            b.execution_provider,
+            ExecutionProvider::Cuda | ExecutionProvider::Auto
+        )
+}
+
+/// CoreML EP for our fixed-shape encoder. NOTE: the `NeuralNetwork`
+/// format is deliberate — `MLProgram` "supports more ops" in general
+/// but **miscompiles NomicBert rotary** (`rotary_emb/Mul` broadcast
+/// hard-fails, even at batch 1; verified on every CodeRankEmbed
+/// export). `NeuralNetwork` runs every model correctly. Static input
+/// shapes (we already pad to fixed `[batch, seq]` buckets), all
+/// compute units, latency-first specialization, and a persistent
+/// compiled-model cache so a process restart does not recompile — that
+/// recompile is the slow startup + macOS "Context leak detected"
+/// os_log spam the CPU pin used to avoid.
+#[cfg(not(feature = "bench-stub"))]
+fn coreml_ep(cache_dir: &Path) -> fastembed::ExecutionProviderDispatch {
+    use ort::ep::coreml::{ComputeUnits, ModelFormat, SpecializationStrategy};
+    let mlcache = cache_dir.join("coreml");
+    // Best-effort: ORT writes the compiled model here; pre-create so the
+    // first run already caches (a failure just means no cache reuse).
+    let _ = std::fs::create_dir_all(&mlcache);
+    ort::ep::CoreML::default()
+        .with_model_format(ModelFormat::NeuralNetwork)
+        .with_static_input_shapes(true)
+        .with_compute_units(ComputeUnits::All)
+        .with_specialization_strategy(SpecializationStrategy::FastPrediction)
+        .with_model_cache_dir(mlcache.to_string_lossy())
+        .build()
+}
+
 #[cfg(not(feature = "bench-stub"))]
 pub(crate) fn providers(
     b: &BackendConfig,
     force_cpu: bool,
+    cache_dir: &Path,
 ) -> Vec<fastembed::ExecutionProviderDispatch> {
     use ort::ep::CPU;
     let mac_arm = cfg!(all(target_os = "macos", target_arch = "aarch64"));
     let mut v: Vec<fastembed::ExecutionProviderDispatch> = Vec::new();
 
-    // A model whose ONNX export OOMs the CoreML/CUDA partitioner pins
-    // CPU regardless of the backend setting (the only working path for
-    // it — see `ModelSpec::force_cpu`).
+    // A model whose ONNX export fragments the CoreML/CUDA partitioner
+    // pins CPU regardless of the backend setting (resolved per-model
+    // from `OnnxFiles` — see `ModelSpec::onnx`).
     let ep = if force_cpu {
         ExecutionProvider::Cpu
     } else {
@@ -135,7 +187,7 @@ pub(crate) fn providers(
     match ep {
         ExecutionProvider::Coreml => {
             if mac_arm {
-                v.push(ort::ep::CoreML::default().build());
+                v.push(coreml_ep(cache_dir));
             } else {
                 tracing::warn!("coreml requested but not on Apple Silicon — CPU");
             }
@@ -146,7 +198,7 @@ pub(crate) fn providers(
         }
         ExecutionProvider::Auto => {
             if mac_arm {
-                v.push(ort::ep::CoreML::default().build());
+                v.push(coreml_ep(cache_dir));
             }
             #[cfg(feature = "cuda")]
             v.push(ort::ep::CUDA::default().build());
@@ -449,6 +501,42 @@ fn is_kv_cache_decoder(onnx: &[u8]) -> bool {
     onnx.windows(M.len()).any(|w| w == M)
 }
 
+/// Try to build the Apple-Silicon Metal (candle) backend for a
+/// `candle_repo` model. Returns `None` (and logs why) on any failure —
+/// no Metal device (headless/CI), download error, bad weights — so the
+/// caller transparently falls back to the ONNX path.
+#[cfg(candle_backend)]
+fn try_candle(
+    spec: &crate::config::ModelSpec,
+    cfg: &Config,
+    cache_dir: &Path,
+) -> Option<crate::candle_encoder::CandleEncoder> {
+    let repo = spec.candle_repo?;
+    let build = || -> Result<crate::candle_encoder::CandleEncoder> {
+        let (_repo, r) = hf_repo(repo, cache_dir)?;
+        let get = |f: &str| -> Result<std::path::PathBuf> {
+            r.get(f)
+                .map_err(|e| Error::Embed(format!("hf-hub get {f}: {e}")))
+        };
+        let safetensors = get("model.safetensors")?;
+        let config_json = read(&get("config.json")?)?;
+        let tokenizer_json = read(&get("tokenizer.json")?)?;
+        crate::candle_encoder::CandleEncoder::build(
+            &safetensors,
+            &config_json,
+            &tokenizer_json,
+            cfg.model.max_length.max(1),
+        )
+    };
+    match build() {
+        Ok(enc) => Some(enc),
+        Err(e) => {
+            tracing::warn!("candle Metal backend unavailable ({e}); using ONNX fallback");
+            None
+        }
+    }
+}
+
 /// Download (cached) the chosen ONNX + tokenizer files from the HF
 /// repo. `explicit` pins an exact file; else the precision mapping.
 #[cfg(not(feature = "bench-stub"))]
@@ -741,12 +829,42 @@ pub(crate) fn seq_buckets(max_length: usize) -> Vec<usize> {
 /// sees a tiny bounded set of input shapes (the memory-bounding fix).
 /// Download / LM-head / KV-cache guards already ran in
 /// `load_user_defined`.
+/// The one owner of the `name@variant` identity convention. Folded
+/// into the index fingerprint, so every backend that changes the
+/// weights (ONNX f32↔int8 via `variant_tag`, the candle Metal path)
+/// must route its tag through here — ad-hoc `format!` risks a stale
+/// index silently surviving a backend switch.
+#[cfg(not(feature = "bench-stub"))]
+fn tagged_model_name(name: &str, variant: Option<&str>) -> String {
+    match variant {
+        Some(v) => format!("{name}@{v}"),
+        None => name.to_string(),
+    }
+}
+
+/// HF tokenizer truncated to `max_length`, padding off — we always pad
+/// manually (fixed ONNX buckets / candle batch-longest) so the
+/// tokenizer must not. Shared by the ONNX and candle backends.
+#[cfg(not(feature = "bench-stub"))]
+pub(crate) fn load_tokenizer(bytes: &[u8], max_length: usize) -> Result<Tokenizer> {
+    let mut tok =
+        Tokenizer::from_bytes(bytes).map_err(|e| Error::Embed(format!("tokenizer: {e}")))?;
+    tok.with_truncation(Some(TruncationParams {
+        max_length: max_length.max(1),
+        ..Default::default()
+    }))
+    .map_err(|e| Error::Embed(format!("tokenizer truncation: {e}")))?;
+    tok.with_padding(None);
+    Ok(tok)
+}
+
 #[cfg(not(feature = "bench-stub"))]
 pub(crate) fn build_onnx_session(
     udm: UserDefinedEmbeddingModel,
     backend: &BackendConfig,
     force_cpu: bool,
     max_length: usize,
+    cache_dir: &Path,
 ) -> Result<(Session, Tokenizer, i64, bool)> {
     // pad_token_id lives in config.json (default 0, the BERT/e5/jina
     // convention) — pure padding, masked out anyway.
@@ -755,19 +873,12 @@ pub(crate) fn build_onnx_session(
         .and_then(|v| v.get("pad_token_id").and_then(serde_json::Value::as_u64))
         .unwrap_or(0) as i64;
 
-    let mut tok = Tokenizer::from_bytes(&udm.tokenizer_files.tokenizer_file)
-        .map_err(|e| Error::Embed(format!("tokenizer: {e}")))?;
-    tok.with_truncation(Some(TruncationParams {
-        max_length,
-        ..Default::default()
-    }))
-    .map_err(|e| Error::Embed(format!("tokenizer truncation: {e}")))?;
-    tok.with_padding(None);
+    let tok = load_tokenizer(&udm.tokenizer_files.tokenizer_file, max_length)?;
 
     let threads = available_parallelism().map_err(Error::Io)?.get();
     let mut b = Session::builder()
         .map_err(|e| Error::Embed(e.to_string()))?
-        .with_execution_providers(providers(backend, force_cpu))
+        .with_execution_providers(providers(backend, force_cpu, cache_dir))
         .map_err(|e| Error::Embed(e.to_string()))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| Error::Embed(e.to_string()))?
@@ -870,8 +981,9 @@ impl OnnxEncoder {
         pooling: Pooling,
     ) -> Result<Self> {
         let max_length = cfg.model.max_length.max(1);
+        let cache_dir = cfg.model_cache_dir()?;
         let (session, tok, pad_id, need_type_ids) =
-            build_onnx_session(udm, &cfg.backend, force_cpu, max_length)?;
+            build_onnx_session(udm, &cfg.backend, force_cpu, max_length, &cache_dir)?;
 
         let mut enc = Self {
             session: Mutex::new(session),
@@ -1285,24 +1397,47 @@ impl Embedder {
                 ));
             }
             ModelArch::OnnxEncoder => {
+                // Apple Silicon: a `candle_repo` model runs f32 on the
+                // Metal GPU via candle (~1.8x the int8 ONNX CPU path;
+                // the ORT CoreML EP can't accelerate it). Falls through
+                // to ONNX if Metal is unreachable (headless/CI) — the
+                // identity carries `@candle` so switching backend (f32
+                // vs int8 = different vectors) busts the index.
+                #[cfg(candle_backend)]
+                if let Some(enc) = try_candle(spec, cfg, &cache_dir) {
+                    return Ok(Self {
+                        dimensions: enc.dim,
+                        backend: Backend::Candle(Box::new(enc)),
+                        model_name: tagged_model_name(spec.name, Some("candle")),
+                        contract: Contract::from_spec(spec),
+                    });
+                }
+                // `accel_active` (CUDA-only — CoreML never wins for
+                // these, see its doc) flips an `AccelCpu` model to its
+                // f32 file; otherwise the int8 file is pinned to CPU.
+                let accel = accel_active(&cfg.backend);
+                let (file, pin_cpu) = spec.onnx.resolve(accel);
                 let precision = spec.effective_precision(cfg.model.precision);
-                let udm = load_user_defined(repo()?, precision, &cache_dir, spec.onnx_file)?;
-                let enc = OnnxEncoder::build(udm, cfg, spec.force_cpu, spec.pooling)?;
+                let udm = load_user_defined(repo()?, precision, &cache_dir, file)?;
+                let enc = OnnxEncoder::build(udm, cfg, pin_cpu, spec.pooling)?;
                 return Ok(Self {
                     dimensions: enc.dim,
                     backend: Backend::Onnx(enc),
-                    model_name: spec.name.to_string(),
+                    // f32↔int8 are different weights; the tag busts the
+                    // index when the resolved file flips.
+                    model_name: tagged_model_name(spec.name, spec.onnx.variant_tag(accel)),
                     contract: Contract::from_spec(spec),
                 });
             }
             ModelArch::Fastembed(m) => {
                 // The only public HF export for these is an LM head;
                 // fastembed bundles a proper embedding ONNX + pooling.
+                let eps = providers(&cfg.backend, false, &cache_dir);
                 let init = InitOptions::new(m.clone())
                     .with_cache_dir(cache_dir)
                     .with_show_download_progress(true)
                     .with_max_length(cfg.model.max_length)
-                    .with_execution_providers(providers(&cfg.backend, false));
+                    .with_execution_providers(eps);
                 TextEmbedding::try_new(init).map_err(|e| Error::Embed(e.to_string()))?
             }
         };
@@ -1415,6 +1550,9 @@ impl Embedder {
             // peak memory is bounded by `batch * bucket * hidden`
             // regardless of the group size handed in by sync.
             Backend::Onnx(e) => e.embed(&texts),
+            #[cfg(candle_backend)]
+            // Metal GPU; owns its own sub-batch split like `OnnxEncoder`.
+            Backend::Candle(e) => e.embed(&texts),
         }
     }
 

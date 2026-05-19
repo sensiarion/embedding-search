@@ -1,3 +1,7 @@
+// Apple-Silicon-only Metal backend for CodeRankEmbed (candle).
+// `candle_backend` is set by build.rs (macOS+aarch64, non-bench-stub).
+#[cfg(candle_backend)]
+mod candle_encoder;
 pub mod chunker;
 pub mod config;
 pub mod db;

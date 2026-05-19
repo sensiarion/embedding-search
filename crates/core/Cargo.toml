@@ -43,6 +43,15 @@ tree-sitter-cpp.workspace = true
 # `__imp_*`). CoreML is mac-only at runtime anyway.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 ort = { version = "=2.0.0-rc.12", features = ["coreml"] }
+# Apple-Silicon-only: candle runs CodeRankEmbed (NomicBert) on the
+# Metal GPU directly from the base safetensors — measured ~1.8x faster
+# than the int8 ONNX CPU path, which is the best CoreML can do for this
+# rotary architecture (CoreML can't accelerate it — see
+# embedder::accel_active). Pulled only here, so non-Apple builds carry
+# zero candle cost.
+candle-core = { version = "0.10.2", features = ["metal"] }
+candle-nn = { version = "0.10.2", features = ["metal"] }
+candle-transformers = "0.10.2"
 
 [target.'cfg(not(all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 ort = "=2.0.0-rc.12"

@@ -109,6 +109,40 @@ fn predefined_e5_code_model_discriminates_via_forced_cpu() {
 }
 
 #[test]
+#[ignore = "downloads the default CodeRankEmbed ONNX (int8 ~138 MB on CPU/Apple-Silicon, f32 ~548 MB under CUDA)"]
+fn default_coderankembed_discriminates_with_accel_policy() {
+    // Regression for repointing the default to `jalipalo/CodeRankEmbed-onnx`
+    // and the `OnnxFiles::AccelCpu` policy: whichever file the run
+    // resolves to (int8 on CPU/Apple-Silicon, f32 under CUDA) must
+    // still CLS-pool and apply the `Represent this query for searching
+    // relevant code: ` query prefix, so the relevant code out-ranks the
+    // unrelated chunk. Catches a broken repo swap / pooling / prefix.
+    let cfg = Config::default();
+    let (_d, eng) = common::build_repo_with(
+        &[
+            (
+                "src/mail.rs",
+                "pub fn validate_email(addr: &str) -> bool { addr.contains('@') }\n",
+            ),
+            (
+                "src/math.rs",
+                "pub fn sum_all(xs: &[i64]) -> i64 { xs.iter().sum() }\n",
+            ),
+        ],
+        cfg,
+    );
+    let hits = eng
+        .search("function that checks an email address", 5, None)
+        .expect("search");
+    assert_eq!(
+        hits.first().map(|h| h.file_path.as_str()),
+        Some("src/mail.rs"),
+        "email query did not rank validate_email first: {:?}",
+        hits.iter().map(|h| &h.file_path).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 #[ignore = "downloads a real external-data ONNX model (~300 MB)"]
 fn external_data_custom_model_loads_and_embeds() {
     // onnx-community / >2 GB models split weights into a `.onnx_data`

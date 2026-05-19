@@ -1,0 +1,134 @@
+//! Apple-Silicon Metal backend for CodeRankEmbed (NomicBert), via
+//! candle, loaded directly from the base repo's f32 safetensors.
+//!
+//! Why this exists: the ORT CoreML EP cannot accelerate this rotary
+//! architecture (int8 QDQ falls back to CPU and is *slower*; MLProgram
+//! miscompiles the rotary — see `embedder::accel_active`). candle on
+//! the Metal GPU runs the same f32 weights ~1.8x faster than the int8
+//! ONNX CPU path, with identical embeddings. Apple-Silicon only;
+//! everything here is `cfg`-gated so other targets never see candle.
+
+use crate::embedder::load_tokenizer;
+use crate::error::{Error, Result};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::nomic_bert::{Config as NomicConfig, NomicBertModel};
+use std::path::Path;
+use tokenizers::Tokenizer;
+
+/// candle tensor-op errors are uniform ("a GPU op failed") on the hot
+/// path — one `From` lets `run()` use `?`. `build()` keeps explicit
+/// per-step messages (which file/stage failed is worth diagnosing).
+impl From<candle_core::Error> for Error {
+    fn from(e: candle_core::Error) -> Self {
+        Error::Embed(format!("candle: {e}"))
+    }
+}
+
+/// GPU sub-batch. Decoupled from `[sync] embed_batch` / `rec_batch`
+/// (which is small on purpose to bound the ONNX CoreML/CUDA per-shape
+/// graph cache — a constraint candle does NOT have). A wider batch
+/// amortizes tokenize/upload/readback and raises GPU occupancy;
+/// working set is `BATCH * seq * n_embd * 4 B` ≈ 50 MB at seq 512.
+const CANDLE_BATCH: usize = 32;
+
+/// CodeRankEmbed on Metal. CLS-pooled + L2-normalized; the query/doc
+/// prefix is applied by the caller (`Contract`), exactly as for the
+/// ONNX path, so embeddings are interchangeable across backends.
+pub(crate) struct CandleEncoder {
+    model: NomicBertModel,
+    tok: Tokenizer,
+    device: Device,
+    pub dim: usize,
+}
+
+/// Metal device without aborting the process. candle's
+/// `Device::new_metal` panics (it indexes an empty device list) when
+/// no GPU is reachable — e.g. a headless/CI context. Convert that into
+/// an `Err` so the caller can fall back to the ONNX path.
+fn metal_device() -> Result<Device> {
+    std::panic::catch_unwind(|| Device::new_metal(0))
+        .map_err(|_| Error::Embed("candle: Metal device unavailable (headless?)".into()))?
+        .map_err(|e| Error::Embed(format!("candle: Metal init: {e}")))
+}
+
+impl CandleEncoder {
+    /// Build from already-fetched base-repo files. Any failure (no
+    /// Metal, bad weights) is an `Err` so the embedder can fall back to
+    /// the ONNX encoder rather than hard-fail.
+    pub fn build(
+        safetensors: &Path,
+        config_json: &[u8],
+        tokenizer_json: &[u8],
+        max_length: usize,
+    ) -> Result<Self> {
+        let device = metal_device()?;
+        let cfg: NomicConfig = serde_json::from_slice(config_json)
+            .map_err(|e| Error::Embed(format!("candle: nomic config: {e}")))?;
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[safetensors], DType::F32, &device)
+                .map_err(|e| Error::Embed(format!("candle: safetensors: {e}")))?
+        };
+        let model = NomicBertModel::load(vb, &cfg)
+            .map_err(|e| Error::Embed(format!("candle: nomic load: {e}")))?;
+        let tok = load_tokenizer(tokenizer_json, max_length)?;
+
+        let mut enc = Self {
+            model,
+            tok,
+            device,
+            dim: 0,
+        };
+        enc.dim = enc
+            .embed(&["probe"])?
+            .first()
+            .map(Vec::len)
+            .ok_or_else(|| Error::Embed("candle: empty probe".into()))?;
+        Ok(enc)
+    }
+
+    pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(CANDLE_BATCH) {
+            out.extend(self.run(chunk)?);
+        }
+        Ok(out)
+    }
+
+    /// One forward on `[chunk, seq]` (seq = chunk's longest, already
+    /// truncated to `max_length`). candle is not the ONNX CoreML EP, so
+    /// a per-call dynamic shape is fine — no graph-per-shape blowup.
+    fn run(&self, chunk: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let encs = self
+            .tok
+            .encode_batch(chunk.to_vec(), true)
+            .map_err(|e| Error::Embed(format!("candle: tokenize: {e}")))?;
+        let b = encs.len();
+        let seq = encs
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let mut ids = vec![0u32; b * seq];
+        let mut mask = vec![0u8; b * seq];
+        for (r, e) in encs.iter().enumerate() {
+            for (j, (&id, &m)) in e.get_ids().iter().zip(e.get_attention_mask()).enumerate() {
+                ids[r * seq + j] = id;
+                mask[r * seq + j] = m as u8;
+            }
+        }
+        let ids = Tensor::from_vec(ids, (b, seq), &self.device)?;
+        // U8 mask: candle's NomicBert masking uses `where_cond`, whose
+        // predicate must be an integer dtype, not f32.
+        let mask = Tensor::from_vec(mask, (b, seq), &self.device)?;
+
+        let hidden = self.model.forward(&ids, None, Some(&mask))?; // [b, seq, n_embd]
+        let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?; // CLS = token 0
+        let norm = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
+        Ok(cls.broadcast_div(&norm)?.to_vec2::<f32>()?)
+    }
+}
