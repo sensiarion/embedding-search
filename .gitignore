@@ -6,3 +6,6 @@ benchmarks/results/*.jsonl
 .idea/
 .claude/
 **/.DS_Store
+
+# Vendored third-party / spike scratch — never indexed or built into the project
+/vendor/
