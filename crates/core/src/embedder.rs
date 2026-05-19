@@ -1,19 +1,24 @@
-use crate::config::Config;
+use crate::config::{Config, Pooling};
 use crate::error::{Error, Result};
 use fastembed::TextEmbedding;
 use std::sync::Mutex;
 #[cfg(not(feature = "bench-stub"))]
 use {
-    crate::config::{BackendConfig, EmbeddingProvider, ExecutionProvider, Precision, RemoteConfig},
-    fastembed::{
-        InitOptions, InitOptionsUserDefined, Pooling, TokenizerFiles, UserDefinedEmbeddingModel,
+    crate::config::{
+        BackendConfig, EmbeddingProvider, ExecutionProvider, ModelArch, Precision, RemoteConfig,
+    },
+    fastembed::{InitOptions, TokenizerFiles, UserDefinedEmbeddingModel},
+    ort::{
+        session::{builder::GraphOptimizationLevel, Session},
+        value::Tensor,
     },
     rayon::prelude::*,
     safetensors::SafeTensors,
     serde::Deserialize,
     std::path::Path,
+    std::thread::available_parallelism,
     std::time::Duration,
-    tokenizers::Tokenizer,
+    tokenizers::{Encoding, Tokenizer, TruncationParams},
 };
 
 enum Backend {
@@ -27,14 +32,74 @@ enum Backend {
     /// its own tiny inference path.
     #[cfg(not(feature = "bench-stub"))]
     Static(StaticModel2Vec),
+    /// Transformer ONNX (e5 / jina-code / nomic / any user-defined
+    /// encoder) run directly on ORT with bounded fixed-shape batches.
+    #[cfg(not(feature = "bench-stub"))]
+    Onnx(OnnxEncoder),
+}
+
+/// Resolved per-model input/output contract: the query/document
+/// prefixes and the pooling. Built once at construction from a built-in
+/// `ModelSpec`, a registered `CustomModel`, or an e5 bool (remote /
+/// local-onnx-path), then carried on the `Embedder`.
+#[derive(Clone)]
+pub struct Contract {
+    query_prefix: Option<String>,
+    doc_prefix: Option<String>,
+    pooling: Pooling,
+}
+
+impl Contract {
+    /// Just a query/doc prefix pair, mean pooling — the remote and
+    /// local-`onnx_path` paths (no per-model pooling knob there; e5 is
+    /// simply `query: `/`passage: `, nomic `search_query: `/…).
+    #[cfg(not(feature = "bench-stub"))]
+    fn from_prefixes(query_prefix: Option<String>, doc_prefix: Option<String>) -> Self {
+        Self {
+            query_prefix,
+            doc_prefix,
+            pooling: Pooling::Mean,
+        }
+    }
+
+    /// From a built-in registry entry (its `&'static str` prefixes).
+    fn from_spec(s: &crate::config::ModelSpec) -> Self {
+        Self {
+            query_prefix: s.query_prefix.map(str::to_owned),
+            doc_prefix: s.doc_prefix.map(str::to_owned),
+            pooling: s.pooling,
+        }
+    }
+
+    /// From a registered `[[custom_model]]` entry.
+    #[cfg(not(feature = "bench-stub"))]
+    fn from_custom(cm: &crate::config::CustomModel) -> Self {
+        Self {
+            query_prefix: cm.query_prefix.clone(),
+            doc_prefix: cm.doc_prefix.clone(),
+            pooling: cm.pooling,
+        }
+    }
+
+    /// Stable identity fragment for the index fingerprint — changing a
+    /// model's prefix or pooling must re-embed even if its name is
+    /// unchanged.
+    fn tag(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.query_prefix.as_deref().unwrap_or(""),
+            self.doc_prefix.as_deref().unwrap_or(""),
+            self.pooling.label()
+        )
+    }
 }
 
 pub struct Embedder {
     backend: Backend,
     pub dimensions: usize,
     pub model_name: String,
-    /// e5 models require "query:" / "passage:" input prefixes.
-    is_e5: bool,
+    /// Resolved per-model query/doc prefixes + pooling.
+    contract: Contract,
 }
 
 #[cfg(feature = "bench-stub")]
@@ -51,12 +116,23 @@ fn stub_vector(text: &str, dims: usize) -> Vec<f32> {
 }
 
 #[cfg(not(feature = "bench-stub"))]
-fn providers(b: &BackendConfig) -> Vec<fastembed::ExecutionProviderDispatch> {
+pub(crate) fn providers(
+    b: &BackendConfig,
+    force_cpu: bool,
+) -> Vec<fastembed::ExecutionProviderDispatch> {
     use ort::ep::CPU;
     let mac_arm = cfg!(all(target_os = "macos", target_arch = "aarch64"));
     let mut v: Vec<fastembed::ExecutionProviderDispatch> = Vec::new();
 
-    match b.execution_provider {
+    // A model whose ONNX export OOMs the CoreML/CUDA partitioner pins
+    // CPU regardless of the backend setting (the only working path for
+    // it — see `ModelSpec::force_cpu`).
+    let ep = if force_cpu {
+        ExecutionProvider::Cpu
+    } else {
+        b.execution_provider
+    };
+    match ep {
         ExecutionProvider::Coreml => {
             if mac_arm {
                 v.push(ort::ep::CoreML::default().build());
@@ -142,7 +218,9 @@ fn user_defined_from(
         special_tokens_map_file: fetch_tok("special_tokens_map.json")?,
         tokenizer_config_file: fetch_tok("tokenizer_config.json")?,
     };
-    let mut m = UserDefinedEmbeddingModel::new(onnx, tok).with_pooling(Pooling::Mean);
+    // fastembed's own pooling (only used if we ever route through its
+    // inference); our `OnnxEncoder` pools itself per `config::Pooling`.
+    let mut m = UserDefinedEmbeddingModel::new(onnx, tok).with_pooling(fastembed::Pooling::Mean);
     // ONNX external-data: the `.onnx` is just the graph; weights live in
     // a sibling file the model references by name (onnx-community /
     // models >2 GB). fastembed loads it in-memory by matching this name.
@@ -202,19 +280,42 @@ fn assert_loadable_embedding(repo: &str, config_json: &[u8]) -> Result<()> {
         .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
         .unwrap_or_default();
 
+    // Architectures whose checkpoint is exported as an LM head but
+    // whose ONNX still exposes a poolable encoder output usable as a
+    // sentence embedder (jina v2 — fastembed mean-pools this exact
+    // repo). Allowed despite the `*ForMaskedLM` name.
+    const EMBED_OK_LM: &[&str] = &["JinaBertForMaskedLM"];
     let bad = |n: &str| {
-        n.ends_with("ForMaskedLM")
-            || n.ends_with("ForCausalLM")
-            || n.ends_with("ForPreTraining")
-            || n.contains("LMHead")
+        !EMBED_OK_LM.contains(&n)
+            && (n.ends_with("ForMaskedLM")
+                || n.ends_with("ForCausalLM")
+                || n.ends_with("ForPreTraining")
+                || n.contains("LMHead"))
     };
     if !names.is_empty() && names.iter().all(|n| bad(n)) {
+        // This exact repo may already be a built-in served a working
+        // way (e.g. jina-code via the fastembed bundle) — point there
+        // instead of leaving the user to re-discover it.
+        let hint = crate::config::model_spec(repo).map_or_else(
+            || {
+                "Use a sentence-embedding ONNX export, a built-in \
+                 (`models list`), or a remote endpoint (`models add-remote`)."
+                    .to_string()
+            },
+            |s| {
+                format!(
+                    "'{0}' is already a built-in served correctly — just \
+                     `embedding-search models set-default {0}` (do NOT \
+                     `models add` the raw repo).",
+                    s.name
+                )
+            },
+        );
         return Err(Error::Embed(format!(
             "HF repo '{repo}': its ONNX is a language-model head ({}), not a \
              sentence-embedding model — pooling its vocab logits is not an \
              embedding and these exports (ALiBi/long-context) consume tens \
-             of GB of RAM. Use an embedding export, or the built-in \
-             `jinaai/jina-embeddings-v2-base-code` (models set-default).",
+             of GB of RAM. {hint}",
             names.join(", ")
         )));
     }
@@ -351,7 +452,7 @@ fn is_kv_cache_decoder(onnx: &[u8]) -> bool {
 /// Download (cached) the chosen ONNX + tokenizer files from the HF
 /// repo. `explicit` pins an exact file; else the precision mapping.
 #[cfg(not(feature = "bench-stub"))]
-fn load_user_defined(
+pub(crate) fn load_user_defined(
     repo: &str,
     precision: Precision,
     cache_dir: &Path,
@@ -612,14 +713,366 @@ fn load_local_user_defined(
     Ok((udm, name))
 }
 
-/// Wrap a `UserDefinedEmbeddingModel` into a `TextEmbedding` with the
-/// shared init options (max length + execution providers).
+/// Sequence-length buckets (ascending, last == `max_length`). Every
+/// batch is padded up to the smallest bucket that fits its longest
+/// sequence, so an ONNX session sees at most this many distinct input
+/// shapes. fastembed's own tokenizer pads to the batch's longest
+/// sequence (`BatchLongest`) — with small batches that is a *new*
+/// `[batch, seq]` shape almost every call, and the CoreML execution
+/// provider recompiles + retains the whole graph per shape (the
+/// multi-GB, erratic-RSS blowup on real repos). Few fixed shapes ⇒
+/// CoreML compiles a handful of graphs once; peak memory is bounded by
+/// the largest bucket, not the corpus.
 #[cfg(not(feature = "bench-stub"))]
-fn build_user_defined(udm: UserDefinedEmbeddingModel, cfg: &Config) -> Result<TextEmbedding> {
-    let opts = InitOptionsUserDefined::new()
-        .with_max_length(cfg.model.max_length)
-        .with_execution_providers(providers(&cfg.backend));
-    TextEmbedding::try_new_from_user_defined(udm, opts).map_err(|e| Error::Embed(e.to_string()))
+pub(crate) fn seq_buckets(max_length: usize) -> Vec<usize> {
+    let mut b: Vec<usize> = [64, 128, 256, 512]
+        .into_iter()
+        .filter(|&x| x < max_length)
+        .collect();
+    b.push(max_length.max(1));
+    b
+}
+
+/// Build an ORT session + its tokenizer from already-fetched model
+/// bytes, shared by `OnnxEncoder` (embedding) and `Reranker`
+/// (cross-encoder). Returns `(session, tokenizer, pad_id,
+/// need_type_ids)`. The tokenizer truncates to `max_length` and does
+/// NOT pad — callers pad manually to a fixed bucket so the EP only ever
+/// sees a tiny bounded set of input shapes (the memory-bounding fix).
+/// Download / LM-head / KV-cache guards already ran in
+/// `load_user_defined`.
+#[cfg(not(feature = "bench-stub"))]
+pub(crate) fn build_onnx_session(
+    udm: UserDefinedEmbeddingModel,
+    backend: &BackendConfig,
+    force_cpu: bool,
+    max_length: usize,
+) -> Result<(Session, Tokenizer, i64, bool)> {
+    // pad_token_id lives in config.json (default 0, the BERT/e5/jina
+    // convention) — pure padding, masked out anyway.
+    let pad_id = serde_json::from_slice::<serde_json::Value>(&udm.tokenizer_files.config_file)
+        .ok()
+        .and_then(|v| v.get("pad_token_id").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0) as i64;
+
+    let mut tok = Tokenizer::from_bytes(&udm.tokenizer_files.tokenizer_file)
+        .map_err(|e| Error::Embed(format!("tokenizer: {e}")))?;
+    tok.with_truncation(Some(TruncationParams {
+        max_length,
+        ..Default::default()
+    }))
+    .map_err(|e| Error::Embed(format!("tokenizer truncation: {e}")))?;
+    tok.with_padding(None);
+
+    let threads = available_parallelism().map_err(Error::Io)?.get();
+    let mut b = Session::builder()
+        .map_err(|e| Error::Embed(e.to_string()))?
+        .with_execution_providers(providers(backend, force_cpu))
+        .map_err(|e| Error::Embed(e.to_string()))?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| Error::Embed(e.to_string()))?
+        .with_intra_threads(threads)
+        .map_err(|e| Error::Embed(e.to_string()))?
+        // Off: the memory-pattern planner caches a per-shape allocation
+        // plan; with even a few buckets that is wasted retention. Our
+        // shapes are already bounded by `buckets`.
+        .with_memory_pattern(false)
+        .map_err(|e| Error::Embed(e.to_string()))?;
+    for ext in udm.external_initializers {
+        b = b
+            .with_external_initializer_file_in_memory(ext.file_name, ext.buffer.into())
+            .map_err(|e| Error::Embed(e.to_string()))?;
+    }
+    let session = b
+        .commit_from_memory(&udm.onnx_file)
+        .map_err(|e| Error::Embed(e.to_string()))?;
+    let need_type_ids = session
+        .inputs()
+        .iter()
+        .any(|i| i.name() == "token_type_ids");
+    Ok((session, tok, pad_id, need_type_ids))
+}
+
+/// Pack a tokenized batch into the FIXED shape `[batch, seq]`: pick the
+/// smallest `buckets` entry that fits the longest sequence, then fill
+/// `≤ batch` real rows over `batch * seq` pad-filled `(ids, mask)`
+/// buffers. Pinning BOTH axes means the shape-caching CoreML/CUDA EP
+/// compiles `buckets.len()` graphs total, not one per (partial-batch ×
+/// bucket). Shared by the embedder and reranker run paths.
+#[cfg(not(feature = "bench-stub"))]
+pub(crate) fn fill_fixed_batch(
+    encs: &[Encoding],
+    pad_id: i64,
+    batch: usize,
+    buckets: &[usize],
+) -> (Vec<i64>, Vec<i64>, usize) {
+    let longest = encs.iter().map(|e| e.get_ids().len()).max().unwrap_or(1);
+    let seq = buckets
+        .iter()
+        .copied()
+        .find(|&b| b >= longest)
+        .unwrap_or_else(|| *buckets.last().unwrap())
+        .max(1);
+    let mut ids = vec![pad_id; batch * seq];
+    let mut mask = vec![0i64; batch * seq];
+    for (row, e) in encs.iter().enumerate() {
+        let off = row * seq;
+        let n = e.get_ids().len().min(seq);
+        for (j, (&id, &m)) in e
+            .get_ids()
+            .iter()
+            .zip(e.get_attention_mask())
+            .take(n)
+            .enumerate()
+        {
+            ids[off + j] = id as i64;
+            mask[off + j] = m as i64;
+        }
+    }
+    (ids, mask, seq)
+}
+
+/// Direct ONNX-Runtime sentence encoder. Bypasses fastembed's inference
+/// (which hard-codes `BatchLongest` padding) so we control the input
+/// shape: tokenize → pad to a fixed `[batch, seq]` bucket → one ORT run
+/// → attention-masked mean pool → L2 normalize. Bounded, predictable
+/// memory regardless of corpus/chunk-length distribution.
+#[cfg(not(feature = "bench-stub"))]
+struct OnnxEncoder {
+    session: Mutex<Session>,
+    tok: Tokenizer,
+    pad_id: i64,
+    need_type_ids: bool,
+    buckets: Vec<usize>,
+    /// Fixed batch width every ORT run is padded up to. `seq_buckets`
+    /// already pins the sequence axis; this pins the *batch* axis so
+    /// the CoreML/CUDA EP — which compiles and *retains* one model per
+    /// distinct input shape — sees at most `buckets.len()` shapes total
+    /// instead of one per (partial-batch × bucket) combination (the
+    /// multi-GB blowup on a fragmented raw `torch.onnx.export`).
+    batch: usize,
+    /// How to reduce the rank-3 token states to one vector per row. A
+    /// ready rank-2 sentence/pooler output (sentence-transformers
+    /// export) is always used as-is and bypasses this.
+    pooling: Pooling,
+    dim: usize,
+}
+
+#[cfg(not(feature = "bench-stub"))]
+impl OnnxEncoder {
+    /// Build the encoder from already-fetched model bytes. `cfg` drives
+    /// max sequence length and execution providers (download / LM-head /
+    /// KV-cache guards already ran in `load_user_defined`).
+    fn build(
+        udm: UserDefinedEmbeddingModel,
+        cfg: &Config,
+        force_cpu: bool,
+        pooling: Pooling,
+    ) -> Result<Self> {
+        let max_length = cfg.model.max_length.max(1);
+        let (session, tok, pad_id, need_type_ids) =
+            build_onnx_session(udm, &cfg.backend, force_cpu, max_length)?;
+
+        let mut enc = Self {
+            session: Mutex::new(session),
+            tok,
+            pad_id,
+            need_type_ids,
+            buckets: seq_buckets(max_length),
+            // The resolved per-model embed batch (auto = the model's
+            // `rec_batch`). Every run is padded to exactly this width.
+            batch: cfg.embed_batch().max(1),
+            pooling,
+            dim: 0,
+        };
+        // Probe the output width (user-defined ONNX has no static spec).
+        enc.dim = enc
+            .embed(&["probe"])?
+            .first()
+            .map(Vec::len)
+            .ok_or_else(|| Error::Embed("ONNX encoder: empty probe".into()))?;
+        Ok(enc)
+    }
+
+    /// Embed every text, one fixed-shape ORT call per `self.batch`
+    /// slice. Splitting here (not in the caller) guarantees the only
+    /// batch width ORT — and the shape-caching CoreML/CUDA EP — ever
+    /// sees is `self.batch`.
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(self.batch) {
+            out.extend(self.run_batch(chunk)?);
+        }
+        Ok(out)
+    }
+
+    /// One ORT run on the FIXED shape `[self.batch, bucket]`: the `≤
+    /// batch` real rows plus pure-pad filler rows (pad-id ids, zero
+    /// mask) so the EP only ever compiles `buckets.len()` graphs.
+    /// Tokenize → masked mean-pool → L2-normalize; the filler rows'
+    /// outputs are discarded (transformer rows are independent, so they
+    /// cannot perturb the real ones).
+    fn run_batch(&self, chunk: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let real = chunk.len();
+        let encs = self
+            .tok
+            .encode_batch(chunk.to_vec(), true)
+            .map_err(|e| Error::Embed(format!("tokenize batch: {e}")))?;
+        // Pinned to `[self.batch, bucket]` (filler rows pad the batch
+        // axis) so the EP only ever compiles `buckets.len()` graphs.
+        let bsz = self.batch;
+        let (ids, mask, seq) = fill_fixed_batch(&encs, self.pad_id, bsz, &self.buckets);
+
+        let shape = vec![bsz as i64, seq as i64];
+        let mut inputs = ort::inputs![
+            "input_ids" => Tensor::from_array((shape.clone(), ids))
+                .map_err(|e| Error::Embed(e.to_string()))?,
+            "attention_mask" => Tensor::from_array((shape.clone(), mask.clone()))
+                .map_err(|e| Error::Embed(e.to_string()))?,
+        ];
+        if self.need_type_ids {
+            inputs.push((
+                "token_type_ids".into(),
+                Tensor::from_array((shape, vec![0i64; bsz * seq]))
+                    .map_err(|e| Error::Embed(e.to_string()))?
+                    .into(),
+            ));
+        }
+
+        // Prefer a ready rank-2 sentence/pooler output; else mean-pool a
+        // rank-3 token-state output ([batch, seq, hidden]) with the
+        // attention mask. Copy out inside the scope so the session
+        // borrow (and the ORT run arena) is released before pooling.
+        let (rank2, rank3) = {
+            let mut sess = self
+                .session
+                .lock()
+                .map_err(|_| Error::Embed("ONNX session lock poisoned".into()))?;
+            let outputs = sess.run(inputs).map_err(|e| Error::Embed(e.to_string()))?;
+            let mut rank2: Option<(usize, Vec<f32>)> = None;
+            let mut rank3: Option<(usize, usize, Vec<f32>)> = None;
+            for (name, val) in outputs.iter() {
+                let Ok((sh, data)) = val.try_extract_tensor::<f32>() else {
+                    continue;
+                };
+                match sh.len() {
+                    2 if rank2.is_none()
+                        || name.contains("sentence")
+                        || name.contains("pooler") =>
+                    {
+                        rank2 = Some((sh[1] as usize, data.to_vec()));
+                    }
+                    3 if rank3.is_none() || name.contains("hidden") => {
+                        rank3 = Some((sh[1] as usize, sh[2] as usize, data.to_vec()));
+                    }
+                    _ => {}
+                }
+            }
+            (rank2, rank3)
+        };
+
+        // Only the first `real` rows are caller data; the rest is
+        // filler that pinned the batch axis — drop it.
+        let mut out = Vec::with_capacity(real);
+        if let Some((hidden, data)) = rank2 {
+            for r in 0..real {
+                out.push(l2_normalized(&data[r * hidden..(r + 1) * hidden]));
+            }
+        } else if let Some((s, hidden, data)) = rank3 {
+            let t = Rank3 {
+                data: &data,
+                s,
+                hidden,
+                seq,
+                mask: &mask,
+            };
+            for r in 0..real {
+                out.push(pool_rank3(self.pooling, &t, r));
+            }
+        } else {
+            return Err(Error::Embed(
+                "ONNX encoder: model produced no float tensor output".into(),
+            ));
+        }
+        Ok(out)
+    }
+}
+
+/// A rank-3 `[batch, s, hidden]` token-state output plus the padded
+/// bucket width `seq` its `mask` is indexed by (`s` is the model's
+/// actual output length). Borrowed view — pooled one row at a time.
+#[cfg(not(feature = "bench-stub"))]
+struct Rank3<'a> {
+    data: &'a [f32],
+    s: usize,
+    hidden: usize,
+    seq: usize,
+    mask: &'a [i64],
+}
+
+/// Reduce row `r` of `t` to one L2-normalized vector per `pooling`.
+#[cfg(not(feature = "bench-stub"))]
+fn pool_rank3(pooling: Pooling, t: &Rank3, r: usize) -> Vec<f32> {
+    let Rank3 {
+        data,
+        s,
+        hidden,
+        seq,
+        mask,
+    } = *t;
+    let row = |i: usize| {
+        let base = (r * s + i) * hidden;
+        &data[base..base + hidden]
+    };
+    let valid = s.min(seq);
+    match pooling {
+        // [CLS] is always the first (unmasked) token.
+        Pooling::Cls => l2_normalized(row(0)),
+        // Last non-padding token (right-padded → highest t with
+        // mask==1); an all-pad row falls back to token 0.
+        Pooling::LastToken => {
+            let last = (0..valid)
+                .rev()
+                .find(|&t| mask[r * seq + t] != 0)
+                .unwrap_or(0);
+            l2_normalized(row(last))
+        }
+        // Attention-masked mean over the real tokens.
+        Pooling::Mean => {
+            let mut acc = vec![0f32; hidden];
+            let mut cnt = 0f32;
+            for t in 0..valid {
+                if mask[r * seq + t] == 0 {
+                    continue;
+                }
+                for (a, &x) in acc.iter_mut().zip(row(t)) {
+                    *a += x;
+                }
+                cnt += 1.0;
+            }
+            if cnt > 0.0 {
+                for a in &mut acc {
+                    *a /= cnt;
+                }
+            }
+            l2_normalized(&acc)
+        }
+    }
+}
+
+/// L2-normalize (e5 / jina-code / nomic embeddings are unit-norm; this
+/// matches sentence-transformers and keeps cosine == dot).
+#[cfg(not(feature = "bench-stub"))]
+fn l2_normalized(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter().map(|x| x / norm).collect()
+    } else {
+        v.to_vec()
+    }
 }
 
 /// External OpenAI-compatible `/embeddings` client with batch + bounded
@@ -728,7 +1181,7 @@ impl Embedder {
             backend: Backend::Local(None),
             dimensions: spec.dimensions,
             model_name: format!("{}#stub", spec.name),
-            is_e5: spec.needs_e5_prefix,
+            contract: Contract::from_spec(spec),
         })
     }
 
@@ -750,7 +1203,16 @@ impl Embedder {
         // User-provided local ONNX model: bypass the registry entirely.
         if let Some(custom) = &cfg.model.onnx_path {
             let (udm, name) = load_local_user_defined(custom, cfg.model.precision)?;
-            return Self::finish_user_defined(udm, cfg, name, cfg.model.onnx_e5_prefix);
+            return Self::finish_user_defined(
+                udm,
+                cfg,
+                name,
+                Contract::from_prefixes(
+                    cfg.model.onnx_query_prefix.clone(),
+                    cfg.model.onnx_doc_prefix.clone(),
+                ),
+                false,
+            );
         }
 
         // Registered custom model (HF repo id or direct .onnx URL),
@@ -760,15 +1222,8 @@ impl Embedder {
                 (Some(repo), None) => {
                     // Model2Vec → static backend; else the ONNX path.
                     if let Some(sm) = try_model2vec(repo, &cache_dir)? {
-                        return Ok(Self {
-                            dimensions: sm.dim,
-                            model_name: format!(
-                                "model2vec:{}",
-                                crate::config::normalize_hf_repo(repo)
-                            ),
-                            is_e5: false,
-                            backend: Backend::Static(sm),
-                        });
+                        let name = format!("model2vec:{}", crate::config::normalize_hf_repo(repo));
+                        return Ok(Self::from_static(sm, name, Contract::from_custom(cm)));
                     }
                     // Per-model precision overrides the global one (so a
                     // big model can be int8 without changing the rest);
@@ -801,45 +1256,54 @@ impl Embedder {
                     )))
                 }
             };
-            return Self::finish_user_defined(udm, cfg, name, cm.e5_prefix);
+            // A registered custom model has no per-model CPU pin: a raw
+            // export that OOMs CoreML/CUDA is better promoted to a
+            // built-in (`force_cpu`) or run with `[backend]
+            // execution_provider = "cpu"`.
+            return Self::finish_user_defined(udm, cfg, name, Contract::from_custom(cm), false);
         }
 
         let spec = cfg.model_spec()?;
+        let repo = || {
+            spec.hf_repo
+                .ok_or_else(|| Error::Embed(format!("built-in model {} has no hf_repo", spec.name)))
+        };
 
-        // Built-in Model2Vec (e.g. the default potion-*): the static
-        // backend, same routing as a custom repo.
-        if spec.static_model {
-            if let Some(repo) = spec.hf_repo {
-                if let Some(sm) = try_model2vec(repo, &cache_dir)? {
-                    return Ok(Self {
-                        dimensions: sm.dim,
-                        model_name: spec.name.to_string(),
-                        is_e5: spec.needs_e5_prefix,
-                        backend: Backend::Static(sm),
-                    });
-                }
+        // Dispatch on the declared architecture (the one switch).
+        let model = match &spec.arch {
+            ModelArch::Static => {
+                // arch already says Model2Vec — `try_model2vec`'s None
+                // (config.json not Model2Vec) can only mean a mis-
+                // curated registry entry, surfaced as a clear error.
+                let sm = try_model2vec(repo()?, &cache_dir)?.ok_or_else(|| {
+                    Error::Embed(format!("built-in {}: repo is not Model2Vec", spec.name))
+                })?;
+                return Ok(Self::from_static(
+                    sm,
+                    spec.name.to_string(),
+                    Contract::from_spec(spec),
+                ));
             }
-        }
-
-        let model = match (&spec.hf_repo, &spec.fastembed) {
-            (Some(repo), _) => {
+            ModelArch::OnnxEncoder => {
                 let precision = spec.effective_precision(cfg.model.precision);
-                let udm = load_user_defined(repo, precision, &cache_dir, None)?;
-                build_user_defined(udm, cfg)?
+                let udm = load_user_defined(repo()?, precision, &cache_dir, spec.onnx_file)?;
+                let enc = OnnxEncoder::build(udm, cfg, spec.force_cpu, spec.pooling)?;
+                return Ok(Self {
+                    dimensions: enc.dim,
+                    backend: Backend::Onnx(enc),
+                    model_name: spec.name.to_string(),
+                    contract: Contract::from_spec(spec),
+                });
             }
-            (None, Some(model)) => {
-                let init = InitOptions::new(model.clone())
+            ModelArch::Fastembed(m) => {
+                // The only public HF export for these is an LM head;
+                // fastembed bundles a proper embedding ONNX + pooling.
+                let init = InitOptions::new(m.clone())
                     .with_cache_dir(cache_dir)
                     .with_show_download_progress(true)
                     .with_max_length(cfg.model.max_length)
-                    .with_execution_providers(providers(&cfg.backend));
+                    .with_execution_providers(providers(&cfg.backend, false));
                 TextEmbedding::try_new(init).map_err(|e| Error::Embed(e.to_string()))?
-            }
-            (None, None) => {
-                return Err(Error::Embed(format!(
-                    "model {} has neither hf_repo nor fastembed variant",
-                    spec.name
-                )))
             }
         };
 
@@ -847,32 +1311,40 @@ impl Embedder {
             backend: Backend::Local(Some(Mutex::new(model))),
             dimensions: spec.dimensions,
             model_name: spec.name.to_string(),
-            is_e5: spec.needs_e5_prefix,
+            contract: Contract::from_spec(spec),
         })
     }
 
-    /// Build a user-defined model and probe its output dimensions from
-    /// a live embed (user-defined ONNX has no static dimension spec).
-    /// Shared by the `onnx_path` and registered-custom-model paths.
+    /// Wrap a loaded Model2Vec matrix as a static-backend embedder.
+    /// Shared by the declared-Static built-in and the auto-detected
+    /// custom Model2Vec repo (they differ only in name / e5 prefix).
+    #[cfg(not(feature = "bench-stub"))]
+    fn from_static(sm: StaticModel2Vec, model_name: String, contract: Contract) -> Self {
+        Self {
+            dimensions: sm.dim,
+            model_name,
+            contract,
+            backend: Backend::Static(sm),
+        }
+    }
+
+    /// Build a user-defined ONNX encoder (output dimensions probed at
+    /// build time). Shared by the `onnx_path` and registered
+    /// custom-model (HF repo / direct-URL) paths.
     #[cfg(not(feature = "bench-stub"))]
     fn finish_user_defined(
         udm: UserDefinedEmbeddingModel,
         cfg: &Config,
         name: String,
-        is_e5: bool,
+        contract: Contract,
+        force_cpu: bool,
     ) -> Result<Self> {
-        let mut model = build_user_defined(udm, cfg)?;
-        let dimensions = model
-            .embed(vec!["probe"], None)
-            .map_err(|e| Error::Embed(e.to_string()))?
-            .first()
-            .map(Vec::len)
-            .ok_or_else(|| Error::Embed(format!("custom model '{name}': empty probe")))?;
+        let enc = OnnxEncoder::build(udm, cfg, force_cpu, contract.pooling)?;
         Ok(Self {
-            backend: Backend::Local(Some(Mutex::new(model))),
-            dimensions,
+            dimensions: enc.dim,
+            backend: Backend::Onnx(enc),
             model_name: name,
-            is_e5,
+            contract,
         })
     }
 
@@ -909,7 +1381,7 @@ impl Embedder {
             backend: Backend::Remote(re),
             dimensions,
             model_name: format!("{} @ {}", cfg.model, cfg.base_url),
-            is_e5: cfg.e5_prefix,
+            contract: Contract::from_prefixes(cfg.query_prefix.clone(), cfg.doc_prefix.clone()),
         })
     }
 
@@ -937,28 +1409,45 @@ impl Embedder {
             // the group in parallel (the ONNX/remote backends batch
             // internally; this is the equivalent for static models).
             Backend::Static(s) => texts.par_iter().map(|t| s.embed_one(t)).collect(),
+            #[cfg(not(feature = "bench-stub"))]
+            // Fixed-shape ORT. `OnnxEncoder` owns the split into
+            // `self.batch` runs (so the EP sees one batch width), and
+            // peak memory is bounded by `batch * bucket * hidden`
+            // regardless of the group size handed in by sync.
+            Backend::Onnx(e) => e.embed(&texts),
         }
     }
 
-    /// Embed indexed chunks. e5 needs a "passage: " prefix; other models
-    /// take the text verbatim with no extra allocation.
+    /// Stable identity of this model's resolved input/output contract,
+    /// folded into the index fingerprint so changing a model's prefix
+    /// or pooling forces the automatic one-time re-embed.
+    pub fn fingerprint_tag(&self) -> String {
+        self.contract.tag()
+    }
+
+    /// Embed indexed chunks, prepending the model's `doc_prefix` when
+    /// it has one (verbatim, zero extra allocation, when it does not).
     pub fn embed_documents(&self, texts: &[&str], batch_size: usize) -> Result<Vec<Vec<f32>>> {
-        if self.is_e5 {
-            let owned: Vec<String> = texts.iter().map(|t| format!("passage: {t}")).collect();
-            self.embed_raw(owned.iter().map(String::as_str).collect(), batch_size)
-        } else {
-            self.embed_raw(texts.to_vec(), batch_size)
+        match &self.contract.doc_prefix {
+            Some(p) => {
+                let owned: Vec<String> = texts.iter().map(|t| format!("{p}{t}")).collect();
+                self.embed_raw(owned.iter().map(String::as_str).collect(), batch_size)
+            }
+            None => self.embed_raw(texts.to_vec(), batch_size),
         }
     }
 
-    /// Embed a search query (e5: "query:" prefix).
+    /// Embed a search query, prepending the model's `query_prefix`
+    /// (e5 `query: `, nomic `search_query: `, a CLS-model instruction,
+    /// or the full Qwen3 `Instruct: …\nQuery:` template) when set.
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         let owned;
-        let q: &str = if self.is_e5 {
-            owned = format!("query: {text}");
-            &owned
-        } else {
-            text
+        let q: &str = match &self.contract.query_prefix {
+            Some(p) => {
+                owned = format!("{p}{text}");
+                &owned
+            }
+            None => text,
         };
         let mut v = self.embed_raw(vec![q], 1)?;
         v.pop()
@@ -1015,9 +1504,16 @@ mod tests {
 
     #[test]
     fn assert_loadable_embedding_rejects_lm_heads() {
-        // LM head only → reject
-        let mlm = br#"{"architectures":["JinaBertForMaskedLM"]}"#;
+        // a true LM / causal head only → reject
+        let mlm = br#"{"architectures":["LlamaForCausalLM"]}"#;
         assert!(assert_loadable_embedding("r", mlm).is_err());
+        let bert_mlm = br#"{"architectures":["BertForMaskedLM"]}"#;
+        assert!(assert_loadable_embedding("r", bert_mlm).is_err());
+        // jina v2 exports as *ForMaskedLM but its ONNX is a poolable
+        // encoder (fastembed mean-pools this repo) → explicitly allowed
+        assert!(
+            assert_loadable_embedding("r", br#"{"architectures":["JinaBertForMaskedLM"]}"#).is_ok()
+        );
         // encoder export, mixed, unparseable/absent → allow
         assert!(assert_loadable_embedding("r", br#"{"architectures":["JinaBertModel"]}"#).is_ok());
         let mixed = br#"{"architectures":["BertModel","BertForMaskedLM"]}"#;
@@ -1093,5 +1589,83 @@ mod tests {
             }],
         };
         assert!(parse_embeddings(resp, 2).is_err());
+    }
+
+    // One row, s=3, hidden=2, seq=3. Tokens: t0=[1,0] t1=[0,1]
+    // t2=[9,9] (padding, mask=0). Each pooling must pick a different,
+    // correct vector.
+    const DATA: &[f32] = &[1.0, 0.0, 0.0, 1.0, 9.0, 9.0];
+    fn rank3<'a>(mask: &'a [i64]) -> Rank3<'a> {
+        Rank3 {
+            data: DATA,
+            s: 3,
+            hidden: 2,
+            seq: 3,
+            mask,
+        }
+    }
+
+    #[test]
+    fn pool_rank3_cls_takes_first_token() {
+        assert_eq!(
+            pool_rank3(Pooling::Cls, &rank3(&[1, 1, 0]), 0),
+            vec![1.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn pool_rank3_last_token_takes_last_unmasked() {
+        // t2 is masked → last real token is t1 = [0,1].
+        assert_eq!(
+            pool_rank3(Pooling::LastToken, &rank3(&[1, 1, 0]), 0),
+            vec![0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn pool_rank3_mean_averages_unmasked_then_normalizes() {
+        // mean([1,0],[0,1]) = [0.5,0.5] → L2 → [0.707,0.707].
+        let v = pool_rank3(Pooling::Mean, &rank3(&[1, 1, 0]), 0);
+        assert!((v[0] - 0.707).abs() < 1e-3 && (v[1] - 0.707).abs() < 1e-3);
+    }
+
+    #[test]
+    fn pool_rank3_last_token_all_pad_falls_back_to_token0() {
+        let v = pool_rank3(Pooling::LastToken, &rank3(&[0, 0, 0]), 0);
+        assert_eq!(v, vec![1.0, 0.0]); // token 0
+    }
+
+    #[test]
+    fn contract_from_prefixes_keeps_pair_and_mean() {
+        let on = Contract::from_prefixes(Some("query: ".into()), Some("passage: ".into()));
+        assert_eq!(on.query_prefix.as_deref(), Some("query: "));
+        assert_eq!(on.doc_prefix.as_deref(), Some("passage: "));
+        assert_eq!(on.pooling, Pooling::Mean);
+        let off = Contract::from_prefixes(None, None);
+        assert!(off.query_prefix.is_none() && off.doc_prefix.is_none());
+    }
+
+    #[test]
+    fn contract_tag_changes_with_prefix_or_pooling() {
+        let a = Contract::from_prefixes(Some("query: ".into()), Some("passage: ".into())).tag();
+        let b = Contract::from_prefixes(None, None).tag();
+        assert_ne!(a, b); // prefix difference shifts the fingerprint
+        let cls = Contract {
+            query_prefix: None,
+            doc_prefix: None,
+            pooling: Pooling::Cls,
+        };
+        assert_ne!(Contract::from_prefixes(None, None).tag(), cls.tag()); // pooling too
+    }
+
+    #[test]
+    fn pooling_fromstr_accepts_aliases_and_rejects_junk() {
+        use std::str::FromStr;
+        assert_eq!(Pooling::from_str("mean").unwrap(), Pooling::Mean);
+        assert_eq!(Pooling::from_str("cls").unwrap(), Pooling::Cls);
+        assert_eq!(Pooling::from_str("last-token").unwrap(), Pooling::LastToken);
+        assert_eq!(Pooling::from_str("last_token").unwrap(), Pooling::LastToken);
+        assert_eq!(Pooling::LastToken.label(), "last-token");
+        assert!(Pooling::from_str("bogus").is_err());
     }
 }

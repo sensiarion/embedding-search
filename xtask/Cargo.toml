@@ -5,8 +5,18 @@ version.workspace = true
 license.workspace = true
 publish = false
 
+# `bench-stub` is NOT enabled on the core dependency here. Cargo
+# unifies features across the workspace build graph, so a hard-enabled
+# `bench-stub` would leak the deterministic hash embedder into the
+# released `embedding-search` binary (every index becomes noise). It is
+# instead an opt-in xtask feature forwarded to core and turned on only
+# by the `cargo xtask` alias (see `.cargo/config.toml`) — release
+# builds never pass it, so the shipped binary always has a real model.
+[features]
+bench-stub = ["embedding-search-core/bench-stub"]
+
 [dependencies]
-embedding-search-core = { path = "../crates/core", features = ["bench-stub"] }
+embedding-search-core = { path = "../crates/core" }
 serde_json.workspace = true
 anyhow.workspace = true
 chrono.workspace = true

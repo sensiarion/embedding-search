@@ -148,13 +148,37 @@ struct FileWork {
     chunks: Vec<Chunk>,
 }
 
-/// A chunk tagged with its content hash and, when the same content
-/// already existed in the prior index, the vector to reuse instead of
-/// re-embedding.
+/// A chunk tagged with the text actually fed to the model (raw body +
+/// the code↔NL header), its content hash **over that enriched text**,
+/// and — when an identical enriched text already existed in the prior
+/// index — the vector to reuse instead of re-embedding.
 struct Planned {
     chunk: Chunk,
+    /// Small code↔NL header (path/symbol/kind/signature) prepended to
+    /// the body *for embedding only*. Stored separately from the large
+    /// body so the bounded scan window holds each body once, not twice
+    /// — the enriched `header + body` string is materialized
+    /// transiently only for the chunks actually being embedded.
+    embed_header: String,
     hash: String,
     reuse: Option<u64>,
+}
+
+/// Code↔NL bridge header prepended to a chunk **for embedding only**:
+/// the relative path, symbol, node kind and signature carry the
+/// natural-language cues raw code lacks (RANGER-style enrichment),
+/// ending with the `\n` that separates it from the body. The stored DB
+/// content and search-result content stay raw, so BM25 tokenization
+/// and prev/next/parent refs are unchanged. The embedded text is
+/// `header + body`; `plan_file` hashes both halves so the reuse
+/// identity covers the header without a third large allocation. The
+/// model's own `doc_prefix` is applied on top by `embed_documents`.
+fn embed_header(rel: &str, c: &Chunk) -> String {
+    let sig = crate::search::signature_of(&c.content);
+    match &c.symbol {
+        Some(sym) => format!("{rel}::{sym} ({}) — {sig}\n", c.node_type),
+        None => format!("{rel} ({}) — {sig}\n", c.node_type),
+    }
 }
 
 /// A changed file resolved against its prior index state: which chunks
@@ -209,11 +233,32 @@ fn linked_worktree_roots(project_dir: &Path) -> Vec<PathBuf> {
 
 /// Remove a project's on-disk index (SQLite + WAL/SHM + vector file).
 /// Single source of the wipe set — shared by the fingerprint-mismatch
-/// rebuild and the `clear` command. Missing files are not an error.
-pub fn wipe_index(index_dir: &Path) {
+/// rebuild and the `clear` command. A missing file is fine, but a file
+/// that *survives* removal is fatal: reopening on top of a half-wiped
+/// index silently corrupts the rebuild (the
+/// `UNIQUE constraint failed: chunks.vector_id` failure). Fail loudly
+/// instead so the cause (e.g. another process holding the index) is
+/// visible rather than producing garbage results.
+pub fn wipe_index(index_dir: &Path) -> Result<()> {
     for f in ["meta.db", "meta.db-wal", "meta.db-shm", "vectors.usearch"] {
-        let _ = std::fs::remove_file(index_dir.join(f));
+        let p = index_dir.join(f);
+        match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Index(format!("wipe {}: {e}", p.display()))),
+        }
     }
+    for f in ["meta.db", "vectors.usearch"] {
+        let p = index_dir.join(f);
+        if p.exists() {
+            return Err(Error::Index(format!(
+                "index wipe incomplete: {} still present — close other \
+                 embedding-search processes on this project and retry",
+                p.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// (mtime secs, size bytes) of a path, or (0, 0) if unstattable.
@@ -238,6 +283,11 @@ pub struct SyncEngine {
     vector: Mutex<VectorIndex>,
     embedder: Embedder,
     chunker: Chunker,
+    /// Optional cross-encoder re-rank stage. `None` unless
+    /// `[rerank] enabled` — default users never construct or pay for
+    /// it. Absent entirely under `bench-stub` (ONNX-only feature).
+    #[cfg(not(feature = "bench-stub"))]
+    reranker: Option<crate::rerank::Reranker>,
     /// Private worker pool for the parallel scan/hash/parse phase,
     /// built once (not the global pool) so its thread count bounds CPU
     /// and repeated syncs don't pay pool spawn/teardown.
@@ -258,7 +308,7 @@ impl SyncEngine {
         // Any change that makes existing chunks/vectors invalid (model,
         // dims, precision, token cap, chunk byte cap, chunker logic)
         // shifts the fingerprint → wipe stale index before reopening.
-        let fingerprint = config.index_fingerprint(model_name, dims);
+        let fingerprint = config.index_fingerprint(model_name, dims, &embedder.fingerprint_tag());
         if index_dir.exists() {
             let probe = Db::open_or_create(&index_dir)?;
             let stored = probe.get_meta("index_fingerprint")?;
@@ -274,7 +324,7 @@ impl SyncEngine {
                     "index fingerprint changed ({} -> {fingerprint}) — wiping index",
                     stored.as_deref().unwrap_or("none")
                 );
-                wipe_index(&index_dir);
+                wipe_index(&index_dir)?;
             }
         }
 
@@ -295,6 +345,16 @@ impl SyncEngine {
             .build()
             .map_err(|e| Error::Index(format!("rayon pool: {e}")))?;
 
+        // Load the reranker only when explicitly enabled — skipping the
+        // download/session entirely is what makes the default path
+        // zero-cost.
+        #[cfg(not(feature = "bench-stub"))]
+        let reranker = if config.rerank.enabled {
+            Some(crate::rerank::Reranker::load(&config)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             project_dir,
             index_dir,
@@ -303,6 +363,8 @@ impl SyncEngine {
             vector: Mutex::new(vector),
             embedder,
             chunker,
+            #[cfg(not(feature = "bench-stub"))]
+            reranker,
             pool,
         })
     }
@@ -436,10 +498,20 @@ impl SyncEngine {
         }
         let mut chunks = Vec::with_capacity(f.chunks.len());
         for c in f.chunks {
-            let hash = blake3::hash(c.content.as_bytes()).to_hex().to_string();
+            // Identity = hash(header ++ body), the exact bytes embedded,
+            // computed incrementally so the concatenation is never
+            // allocated. A body unchanged but moved to a new
+            // path/symbol gets a new header → new hash → re-embed
+            // (correct: its vector would otherwise be stale).
+            let header = embed_header(&f.rel, &c);
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(header.as_bytes());
+            hasher.update(c.content.as_bytes());
+            let hash = hasher.finalize().to_hex().to_string();
             let reuse = avail.get_mut(&hash).and_then(Vec::pop);
             chunks.push(Planned {
                 chunk: c,
+                embed_header: header,
                 hash,
                 reuse,
             });
@@ -535,17 +607,18 @@ impl SyncEngine {
             .map(|f| self.plan_file(f))
             .collect::<Result<_>>()?;
         let vectors = {
-            let texts: Vec<&str> = plans
+            // Materialize `header + body` only for the chunks actually
+            // being embedded, and only for this group — freed right
+            // after the embed call, so the bounded window never holds
+            // two copies of a body.
+            let owned: Vec<String> = plans
                 .iter()
-                .flat_map(|p| {
-                    p.chunks
-                        .iter()
-                        .filter(|c| c.reuse.is_none())
-                        .map(|c| c.chunk.content.as_str())
-                })
+                .flat_map(|p| p.chunks.iter().filter(|c| c.reuse.is_none()))
+                .map(|c| format!("{}{}", c.embed_header, c.chunk.content))
                 .collect();
+            let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
             self.embedder
-                .embed_documents(&texts, self.config.sync.embed_batch_size)?
+                .embed_documents(&texts, self.config.embed_batch())?
         };
         let mut it = vectors.into_iter();
         let mut chunks_total = 0;
@@ -619,7 +692,7 @@ impl SyncEngine {
         // stays deterministic. `self.pool` (private, not the global
         // pool) bounds CPU to `sync_threads`.
         use rayon::prelude::*;
-        let batch_chunks = self.config.sync.embed_batch_size.max(1);
+        let batch_chunks = self.config.embed_batch().max(1);
         let batch_bytes = self.config.sync.embed_batch_bytes.max(4096);
         let window = self.config.sync.scan_window.max(1);
         let mut group: Vec<FileWork> = Vec::new();
@@ -753,8 +826,12 @@ impl SyncEngine {
         &self.embedder
     }
 
-    pub(crate) fn search_config(&self) -> &crate::config::SearchConfig {
-        &self.config.search
+    /// The cross-encoder reranker, present only when `[rerank] enabled`
+    /// (and not under `bench-stub`). `search::run` re-orders the fused
+    /// candidate prefix with it when `Some`.
+    #[cfg(not(feature = "bench-stub"))]
+    pub(crate) fn reranker(&self) -> Option<&crate::rerank::Reranker> {
+        self.reranker.as_ref()
     }
 
     pub(crate) fn with_vector<R>(&self, f: impl FnOnce(&VectorIndex) -> R) -> R {

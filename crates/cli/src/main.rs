@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use embedding_search_core::{
     config::{
-        normalize_hf_repo, CustomModel, EmbeddingProvider, Precision, RemoteConfig, DEFAULT_MODEL,
-        SUPPORTED_MODELS,
+        normalize_hf_repo, CustomModel, EmbeddingProvider, Pooling, Precision, RemoteConfig,
+        DEFAULT_MODEL, SUPPORTED_MODELS,
     },
     embedder::custom_model_cache_dir,
     embedder::Embedder,
@@ -128,9 +128,22 @@ enum ModelsCmd {
         /// in the same directory)
         #[arg(long)]
         url: Option<String>,
-        /// Set if it's an e5-style model needing query:/passage:
+        /// Alias for `--query-prefix "query: " --doc-prefix
+        /// "passage: "` (e5 models). Explicit prefixes below win.
         #[arg(long)]
         e5_prefix: bool,
+        /// Text prepended to a search query before embedding, e.g.
+        /// "query: " (e5), "search_query: " (nomic), or an instruction.
+        #[arg(long)]
+        query_prefix: Option<String>,
+        /// Text prepended to each indexed chunk before embedding, e.g.
+        /// "passage: " / "search_document: ". Omit for query-only
+        /// (CLS code) models.
+        #[arg(long)]
+        doc_prefix: Option<String>,
+        /// Encoder output pooling: mean (default) | cls | last-token.
+        #[arg(long)]
+        pooling: Option<Pooling>,
         /// ONNX precision to pull (HF --repo): fp16 | int8 | full.
         /// Omitted ⇒ the global `[model] precision`.
         #[arg(long)]
@@ -160,9 +173,16 @@ enum ModelsCmd {
         /// Output dimensions (probed from a live request if omitted)
         #[arg(long)]
         dimensions: Option<usize>,
-        /// Prefix query: / passage: (only if the remote serves e5)
+        /// Alias for `--query-prefix "query: " --doc-prefix
+        /// "passage: "` (e5 remote). Explicit prefixes below win.
         #[arg(long)]
         e5_prefix: bool,
+        /// Text prepended to a query before sending it to the remote.
+        #[arg(long)]
+        query_prefix: Option<String>,
+        /// Text prepended to each chunk before sending it to the remote.
+        #[arg(long)]
+        doc_prefix: Option<String>,
     },
 }
 
@@ -319,7 +339,7 @@ fn main() -> Result<()> {
                 .context("resolve path")?
                 .join(PROJECT_INDEX_DIR);
             if dir.is_dir() {
-                wipe_index(&dir);
+                wipe_index(&dir).context("clear index")?;
                 println!("Cleared index at {}", dir.display());
             } else {
                 println!("No index at {} (nothing to clear)", dir.display());
@@ -474,8 +494,9 @@ fn main() -> Result<()> {
                     );
                 }
                 println!(
-                    "\n* = active model. f32/fp16/int8 via [model] precision \
-                     (HF built-ins only). Add: `models add` / `models add-remote`."
+                    "\n* = active model. [model] precision (f32/fp16/int8) \
+                     applies to ONNX-encoder models only (static + \
+                     fastembed ignore it). Add: `models add` / `models add-remote`."
                 );
             }
             ModelsCmd::SetDefault { model } => {
@@ -530,6 +551,9 @@ fn main() -> Result<()> {
                 repo,
                 url,
                 e5_prefix,
+                query_prefix,
+                doc_prefix,
+                pooling,
                 precision,
                 onnx_file,
             } => {
@@ -537,13 +561,28 @@ fn main() -> Result<()> {
                 // --repo / --url is set. A `--repo` value may be a full
                 // HF URL (copied from the browser) — canonicalize to
                 // the bare `org/name` id `hf-hub` expects.
+                // `--e5_prefix` is sugar for the e5 prefix pair;
+                // explicit `--query-prefix`/`--doc-prefix` win.
+                let (qp, dp) = if e5_prefix {
+                    (
+                        query_prefix
+                            .or_else(|| Some(embedding_search_core::config::E5_QUERY.to_string())),
+                        doc_prefix.or_else(|| {
+                            Some(embedding_search_core::config::E5_PASSAGE.to_string())
+                        }),
+                    )
+                } else {
+                    (query_prefix, doc_prefix)
+                };
                 let mut cfg = Config::load_or_init().context("load config")?;
                 cfg.custom_models.retain(|m| m.name != name);
                 cfg.custom_models.push(CustomModel {
                     name: name.clone(),
                     repo: repo.map(|r| normalize_hf_repo(&r)),
                     url,
-                    e5_prefix,
+                    query_prefix: qp,
+                    doc_prefix: dp,
+                    pooling: pooling.unwrap_or_default(),
                     precision,
                     onnx_file,
                 });
@@ -558,7 +597,22 @@ fn main() -> Result<()> {
                 api_key,
                 dimensions,
                 e5_prefix,
+                query_prefix,
+                doc_prefix,
             } => {
+                // `--e5_prefix` is sugar for the e5 prefix pair;
+                // explicit `--query-prefix`/`--doc-prefix` win.
+                let (qp, dp) = if e5_prefix {
+                    (
+                        query_prefix
+                            .or_else(|| Some(embedding_search_core::config::E5_QUERY.to_string())),
+                        doc_prefix.or_else(|| {
+                            Some(embedding_search_core::config::E5_PASSAGE.to_string())
+                        }),
+                    )
+                } else {
+                    (query_prefix, doc_prefix)
+                };
                 let mut cfg = Config::load_or_init().context("load config")?;
                 let entry = RemoteConfig {
                     name: name.clone(),
@@ -566,7 +620,8 @@ fn main() -> Result<()> {
                     model: model.clone(),
                     api_key,
                     dimensions,
-                    e5_prefix,
+                    query_prefix: qp,
+                    doc_prefix: dp,
                     ..RemoteConfig::default()
                 };
                 // Keep it in the registry so it can be re-selected

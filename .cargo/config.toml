@@ -1,2 +1,6 @@
 [alias]
-xtask = "run -p xtask --release --"
+# `--features bench-stub` is scoped to this `cargo run -p xtask`
+# invocation only (builds xtask + core, never the cli), so the bench
+# stays the deterministic hash embedder while release builds of the
+# `embedding-search` binary never see the feature.
+xtask = "run -p xtask --release --features bench-stub --"

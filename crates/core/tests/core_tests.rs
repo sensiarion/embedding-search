@@ -12,7 +12,24 @@ fn config_defaults_are_sane() {
     assert_eq!(c.model.default, DEFAULT_MODEL);
     assert_eq!(c.model.precision, Precision::Fp16);
     assert_eq!(c.sync.max_chunk_bytes, 2048);
-    assert_eq!(c.sync.embed_batch_size, 16);
+    // 0 = auto: resolves to the active model's per-model rec_batch.
+    assert_eq!(c.sync.embed_batch_size, 0);
+    // default is now jina-code (a transformer) → small auto batch.
+    let rec = model_spec(DEFAULT_MODEL).unwrap().rec_batch as usize;
+    assert_eq!(c.embed_batch(), rec);
+    // transformer default: a too-large explicit value (e.g. a stale
+    // pre-per-model config) is clamped down to the safe rec_batch.
+    let mut heavy = Config::default();
+    heavy.sync.embed_batch_size = 16;
+    assert_eq!(heavy.embed_batch(), rec); // 16 → clamped to rec
+    heavy.sync.embed_batch_size = 2;
+    assert_eq!(heavy.embed_batch(), 2); // smaller-than-rec honored
+                                        // static model: an explicit value is honored as-is (no attention
+                                        // → no OOM risk, bigger = faster).
+    let mut stat = Config::default();
+    stat.model.default = "minishlab/potion-multilingual-128M".into();
+    stat.sync.embed_batch_size = 7;
+    assert_eq!(stat.embed_batch(), 7);
     // chunk byte cap aligned to token cap (~4 bytes/token) so chunks
     // are fully embedded, not truncated.
     assert_eq!(c.model.max_length, 512);
@@ -23,36 +40,45 @@ fn config_defaults_are_sane() {
     assert_eq!(c.backend.execution_provider, ExecutionProvider::Auto);
     assert!(c.sync.embed_batch_bytes >= 4096);
     let spec = c.model_spec().expect("default model known");
-    // default is the Model2Vec potion-multilingual-128M
-    assert_eq!(spec.dimensions, 256);
-    assert_eq!(spec.multilingual, 5);
-    assert!(spec.static_model);
-    assert!(!spec.supports_precision()); // static matrix: precision N/A
-                                         // local in-process backend by default
+    // default is jina-embeddings-v2-base-code (ONNX encoder)
+    assert_eq!(spec.dimensions, 768);
+    assert_eq!(spec.code, 5);
+    assert!(!spec.is_static());
+    assert!(spec.supports_precision()); // ONNX encoder: precision honored
+                                        // local in-process backend by default
     assert_eq!(c.model.provider, EmbeddingProvider::Local);
     // no custom ONNX override by default
     assert!(c.model.onnx_path.is_none());
-    assert!(!c.model.onnx_e5_prefix);
+    assert!(c.model.onnx_query_prefix.is_none() && c.model.onnx_doc_prefix.is_none());
 }
 
 #[test]
 fn chunk_param_change_invalidates_index() {
     let mut c = Config::default();
-    let base = c.index_fingerprint("m", 768);
+    let base = c.index_fingerprint("m", 768, "ct");
     // same inputs → stable
-    assert_eq!(base, c.index_fingerprint("m", 768));
+    assert_eq!(base, c.index_fingerprint("m", 768, "ct"));
     // each invalidating knob shifts the fingerprint
     c.sync.max_chunk_bytes += 1;
-    assert_ne!(base, c.index_fingerprint("m", 768));
+    assert_ne!(base, c.index_fingerprint("m", 768, "ct"));
     let mut c = Config::default();
     c.model.max_length += 1;
-    assert_ne!(base, c.index_fingerprint("m", 768));
+    assert_ne!(base, c.index_fingerprint("m", 768, "ct"));
     let mut c = Config::default();
     c.model.precision = Precision::Int8;
-    assert_ne!(base, c.index_fingerprint("m", 768));
+    assert_ne!(base, c.index_fingerprint("m", 768, "ct"));
     // model name / dims also part of identity
-    assert_ne!(base, Config::default().index_fingerprint("other", 768));
-    assert_ne!(base, Config::default().index_fingerprint("m", 384));
+    assert_ne!(
+        base,
+        Config::default().index_fingerprint("other", 768, "ct")
+    );
+    assert_ne!(base, Config::default().index_fingerprint("m", 384, "ct"));
+    // the resolved contract (prefix/pooling) is part of identity too —
+    // changing a model's prefix or pooling must force a re-embed.
+    assert_ne!(
+        base,
+        Config::default().index_fingerprint("m", 768, "other-contract")
+    );
 }
 
 #[test]
@@ -60,7 +86,7 @@ fn remote_config_defaults_and_endpoint() {
     let r = RemoteConfig::default();
     assert_eq!(r.batch_size, 64);
     assert_eq!(r.concurrency, 4);
-    assert!(!r.e5_prefix);
+    assert!(r.query_prefix.is_none() && r.doc_prefix.is_none());
     assert!(r.dimensions.is_none());
     assert_eq!(r.endpoint(), "http://localhost:4000/v1/embeddings");
 }
@@ -141,18 +167,21 @@ fn remote_api_key_expands_env_var() {
 
 #[test]
 fn ram_estimate_scales_with_precision() {
-    let e5_base = model_spec("intfloat/multilingual-e5-base").unwrap();
-    let f32 = e5_base.ram_mb(Precision::Full);
-    let f16 = e5_base.ram_mb(Precision::Fp16);
-    let i8 = e5_base.ram_mb(Precision::Int8);
+    let e5 = model_spec("intfloat/multilingual-e5-small").unwrap();
+    let f32 = e5.ram_mb(Precision::Full);
+    let f16 = e5.ram_mb(Precision::Fp16);
+    let i8 = e5.ram_mb(Precision::Int8);
     assert!(f32 > f16 && f16 > i8, "{f32} {f16} {i8}");
     // fp16 default must be well under the old 32GB / f32 blowup
     assert!(f16 < 1200, "fp16 RAM estimate {f16}MB too high");
 
-    // models without an HF repo ignore precision (f32 only)
-    let jina = model_spec("jinaai/jina-embeddings-v2-base-code").unwrap();
-    assert!(!jina.supports_precision());
-    assert_eq!(jina.ram_mb(Precision::Int8), jina.ram_mb(Precision::Full));
+    // a static (Model2Vec) model ignores precision — single f32 matrix
+    let potion = model_spec("minishlab/potion-multilingual-128M").unwrap();
+    assert!(!potion.supports_precision());
+    assert_eq!(
+        potion.ram_mb(Precision::Int8),
+        potion.ram_mb(Precision::Full)
+    );
     assert!(SUPPORTED_MODELS.iter().any(|m| m.supports_precision()));
 }
 
@@ -193,6 +222,35 @@ impl Point {
     let kinds: Vec<_> = chunks.iter().map(|c| c.node_type.as_str()).collect();
     assert!(kinds.contains(&"function"));
     assert!(kinds.iter().any(|k| *k == "struct" || *k == "impl"));
+}
+
+#[test]
+fn chunker_captures_symbol_name_for_enrichment_header() {
+    // The code↔NL embed header needs the declared name: `name` field
+    // for fn/struct, first type_identifier for an `impl` (no name field).
+    let code = "fn alpha() -> i32 { 1 }\n\
+                struct Point { x: i32 }\n\
+                impl Point { fn beta(&self) {} }\n";
+    let ck = Chunker::new(4096);
+    let (_lang, chunks) = ck.chunk_file(Path::new("sample.rs"), code);
+    let sym = |nt: &str| {
+        chunks
+            .iter()
+            .find(|c| c.node_type == nt)
+            .and_then(|c| c.symbol.as_deref())
+    };
+    assert_eq!(sym("function"), Some("alpha"));
+    assert_eq!(sym("struct"), Some("Point"));
+    assert_eq!(sym("impl"), Some("Point")); // type_identifier fallback
+}
+
+#[test]
+fn chunker_line_chunks_have_no_symbol() {
+    let txt = (0..50).map(|i| format!("line {i}\n")).collect::<String>();
+    let ck = Chunker::new(4096);
+    let (_lang, chunks) = ck.chunk_file(Path::new("notes.xyz"), &txt);
+    assert!(!chunks.is_empty());
+    assert!(chunks.iter().all(|c| c.symbol.is_none()));
 }
 
 #[test]

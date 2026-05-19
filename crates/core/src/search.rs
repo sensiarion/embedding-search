@@ -39,8 +39,9 @@ pub struct SearchResult {
 }
 
 /// First non-empty line, trimmed, capped — a cheap stand-in for the
-/// symbol signature.
-fn signature_of(content: &str) -> String {
+/// symbol signature. `pub(crate)` so `sync` builds the same signature
+/// into the code↔NL embed header (single source, no drift).
+pub(crate) fn signature_of(content: &str) -> String {
     let line = content
         .lines()
         .map(str::trim)
@@ -179,6 +180,52 @@ fn ranks_desc(scores: &[f32]) -> Vec<usize> {
     rank
 }
 
+/// Cross-encoder re-rank of the fused top-`top_n`: re-score each
+/// `(query, candidate)` jointly, stable-sort that prefix by the new
+/// score (the tail keeps its fused order), and write the rerank score
+/// back so `SearchResult.score` reflects it. No-op when the reranker is
+/// disabled. Stable sort ⇒ ties keep the fused order.
+#[cfg(not(feature = "bench-stub"))]
+fn rerank_fused(
+    engine: &SyncEngine,
+    query: &str,
+    cands: &mut [(crate::db::ChunkRow, f32)],
+    order: Vec<usize>,
+) -> Result<Vec<usize>> {
+    let Some(rr) = engine.reranker() else {
+        return Ok(order);
+    };
+    let n = order.len().min(rr.top_n());
+    if n == 0 {
+        return Ok(order);
+    }
+    let passages: Vec<&str> = order[..n]
+        .iter()
+        .map(|&i| cands[i].0.content.as_str())
+        .collect();
+    let scores = rr.score(query, &passages)?;
+    let mut prefix: Vec<(usize, f32)> = order[..n].iter().copied().zip(scores).collect();
+    prefix.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut reordered = Vec::with_capacity(order.len());
+    for (ci, sc) in &prefix {
+        cands[*ci].1 = *sc;
+        reordered.push(*ci);
+    }
+    reordered.extend_from_slice(&order[n..]);
+    Ok(reordered)
+}
+
+/// `bench-stub` has no ONNX reranker — ordering is unchanged.
+#[cfg(feature = "bench-stub")]
+fn rerank_fused(
+    _engine: &SyncEngine,
+    _query: &str,
+    _cands: &mut [(crate::db::ChunkRow, f32)],
+    order: Vec<usize>,
+) -> Result<Vec<usize>> {
+    Ok(order)
+}
+
 pub fn run(
     engine: &SyncEngine,
     query: &str,
@@ -192,9 +239,13 @@ pub fn run(
     let mut q_terms = tokenize(query);
     q_terms.sort_unstable();
     q_terms.dedup();
-    // Hybrid only helps when the query has lexical content; a
-    // symbol-only query falls back to pure vector ranking.
-    let hybrid = engine.search_config().hybrid && !q_terms.is_empty();
+    // Hybrid (cosine + BM25-lite RRF) is unconditional whenever the
+    // query has lexical content: pure-cosine ranking is weak across
+    // every model (worst on a static bag-of-token-means one) and the
+    // re-rank only reorders the already-fetched neighborhood, so there
+    // is no reason to ever turn it off. A symbol-only query (no terms)
+    // still falls back to pure vector ranking.
+    let hybrid = !q_terms.is_empty();
 
     // Over-fetch the neighborhood when we must filter (scope) or
     // re-rank (hybrid) it; otherwise fetch exactly `limit`.
@@ -246,6 +297,11 @@ pub fn run(
     } else {
         (0..cands.len()).collect()
     };
+
+    // Optional cross-encoder re-rank of the fused top-N (joint
+    // query+passage scoring sharpens selection once recall is
+    // adequate). A no-op with zero added cost unless `[rerank] enabled`.
+    let order = rerank_fused(engine, query, &mut cands, order)?;
 
     // Per-file caches: each result file's text and its chunk list are
     // fetched at most once even when several hits share the file

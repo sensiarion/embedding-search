@@ -85,6 +85,10 @@ pub struct Chunk {
     pub start_byte: i64,
     pub end_byte: i64,
     pub node_type: String,
+    /// Declared name of the AST node (fn/struct/impl-type/…), when one
+    /// exists. `None` for line/markdown/structured chunks. Used only to
+    /// build the code↔NL embed header — never stored or returned.
+    pub symbol: Option<String>,
 }
 
 pub struct Chunker {
@@ -200,6 +204,31 @@ fn lang_for_ext(ext: &str) -> Option<LangSpec> {
     })
 }
 
+/// Declared name of an AST node: the tree-sitter `name` field if the
+/// grammar exposes one (fn/struct/trait/mod/class…), else the first
+/// `identifier`/`type_identifier` descendant (covers `impl Foo`, whose
+/// name is its `type_identifier`, and grammars with no `name` field).
+/// Only called on nodes that fit one chunk (≤ a few KB) so the bounded
+/// pre-order descent is cheap.
+fn node_symbol(node: &Node<'_>, src: &str) -> Option<String> {
+    fn first_ident(node: Node<'_>, src: &str) -> Option<String> {
+        if matches!(node.kind(), "identifier" | "type_identifier") {
+            return src
+                .get(node.start_byte()..node.end_byte())
+                .map(str::to_owned);
+        }
+        let mut c = node.walk();
+        let found = node
+            .named_children(&mut c)
+            .find_map(|ch| first_ident(ch, src));
+        found
+    }
+    node.child_by_field_name("name")
+        .and_then(|n| src.get(n.start_byte()..n.end_byte()))
+        .map(str::to_owned)
+        .or_else(|| first_ident(*node, src))
+}
+
 impl Chunker {
     pub fn new(max_chunk_bytes: usize) -> Self {
         Self { max_chunk_bytes }
@@ -258,6 +287,7 @@ impl Chunker {
                     start_byte: base + off as i64,
                     end_byte: base + end as i64,
                     node_type: c.node_type.clone(),
+                    symbol: c.symbol.clone(),
                 });
                 off = end;
             }
@@ -301,6 +331,7 @@ impl Chunker {
                 start_byte: start as i64,
                 end_byte: end as i64,
                 node_type: kind_str.into(),
+                symbol: node_symbol(node, src),
             });
             return;
         }
@@ -365,6 +396,7 @@ impl Chunker {
                 start_byte: (base_offset + s) as i64,
                 end_byte: (base_offset + e) as i64,
                 node_type: NodeKind::Lines.as_str().into(),
+                symbol: None,
             });
             if end == n {
                 break;
@@ -391,6 +423,7 @@ impl Chunker {
                     start_byte: sec_start as i64,
                     end_byte: pos as i64,
                     node_type: NodeKind::Heading.as_str().into(),
+                    symbol: None,
                 });
                 sec_start = pos;
             }
@@ -403,6 +436,7 @@ impl Chunker {
                 start_byte: sec_start as i64,
                 end_byte: pos as i64,
                 node_type: NodeKind::Heading.as_str().into(),
+                symbol: None,
             });
         }
         if out.is_empty() {
@@ -418,6 +452,7 @@ impl Chunker {
                 start_byte: 0,
                 end_byte: content.len() as i64,
                 node_type: NodeKind::structured(kind).as_str().into(),
+                symbol: None,
             }];
         }
         let split_here = |line: &str| -> bool {
@@ -447,6 +482,7 @@ impl Chunker {
                     start_byte: sec_start as i64,
                     end_byte: pos as i64,
                     node_type: NodeKind::structured(kind).as_str().into(),
+                    symbol: None,
                 });
                 sec_start = pos;
             }
@@ -459,6 +495,7 @@ impl Chunker {
                 start_byte: sec_start as i64,
                 end_byte: pos as i64,
                 node_type: NodeKind::structured(kind).as_str().into(),
+                symbol: None,
             });
         }
         if out.is_empty() {

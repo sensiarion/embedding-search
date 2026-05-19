@@ -88,7 +88,7 @@ embedding-search debug files [path]              list indexed files
 embedding-search debug chunks <file> [--path .]  show a file's chunks
 embedding-search models list                     built-in + custom models
 embedding-search models set-default <name>       switch model (re-index)
-embedding-search models add --name X --repo ORG/M [--precision P | --onnx-file F] | --url URL
+embedding-search models add --name X --repo ORG/M [--precision P|--onnx-file F] [--query-prefix .. --doc-prefix .. --pooling mean|cls|last-token | --e5_prefix] | --url URL
 embedding-search models remove <name>            unregister + delete cached weights (alias: rm)
 embedding-search models add-remote --name N --base-url U --model M   add + select a remote
 ```
@@ -103,11 +103,12 @@ command (CLI or MCP), so it's there to edit. Delete it to reset.
 
 ```toml
 [model]
-default   = "minishlab/potion-multilingual-128M"  # Model2Vec static, multilingual
+default   = "nomic-ai/CodeRankEmbed"          # SOTA code encoder (int8)
 precision = "fp16"                            # fp16 | int8 | full (ONNX models only)
 max_length = 512                              # token cap; keep ≈ max_chunk_bytes/4
 # onnx_path = "/path/to/model-dir"            # custom local ONNX (see below)
-# onnx_e5_prefix = false                      # true if custom model is e5
+# onnx_query_prefix = "query: "               # e.g. e5; omit for none
+# onnx_doc_prefix   = "passage: "             # e.g. e5; omit for none
 
 [backend]
 execution_provider = "auto"   # auto | coreml | cuda | cpu
@@ -115,7 +116,7 @@ disable_mem_arena  = true     # keep ORT arena off (memory)
 
 [sync]
 max_chunk_bytes  = 2048       # hard cap ≈ max_length*4; large files split, never skipped
-embed_batch_size = 16
+embed_batch_size = 0          # 0 = auto (per-model: small for heavy ONNX, large for static)
 embed_batch_bytes = 262144    # flush a batch at this many bytes
 sync_threads     = 0          # scan/hash/parse worker cap; 0 = all cores but one
 resync_interval_minutes = 10  # background catch-up cadence (CLI + MCP)
@@ -123,16 +124,31 @@ exclude = []
 
 [search]
 exact_below = 50000           # < this many vectors → exact (brute) search, not HNSW
-hybrid      = true            # fuse cosine with a BM25 lexical re-rank (RRF)
+
+[rerank]
+enabled = false               # opt-in cross-encoder re-rank (off = previous behavior)
+# model = "Xenova/bge-reranker-base"   # int8 ONNX cross-encoder
+# top_n = 50                            # how many fused candidates to re-score
 ```
 
-**Hybrid search** (on by default): the embedding neighborhood is
+**Hybrid search** (always on): the embedding neighborhood is
 over-fetched, then re-ranked by Reciprocal Rank Fusion of the cosine
-ranking and a BM25 lexical ranking of the same candidates — so an
-exact-identifier query (`validate_bearer_token`) surfaces the literal
-match that pure-vector ranking buries, while conceptual queries still
-ride the embeddings. No separate full-text index; `score` then reports
-the fused relevance. Set `hybrid = false` for vector-only.
+ranking and a BM25 lexical ranking — so an exact-identifier query
+(`validate_bearer_token`) surfaces the literal match pure-vector
+ranking buries, while conceptual queries still ride the embeddings.
+`score` reports the fused relevance.
+
+**Chunk enrichment** (always on): each chunk is embedded with a short
+`path::symbol (kind) — signature` header so natural-language queries
+bridge to code; the stored/returned snippet stays raw.
+
+**Cross-encoder re-rank** (opt-in, `[rerank] enabled = true`): the top
+`top_n` fused candidates are re-scored jointly `(query, passage)` by a
+small int8 reranker and reordered before truncation — sharper top
+results when recall is already good. Off by default: no second model
+download, no added latency, and results are exactly the pre-rerank
+behavior. It does not affect the index (ordering only), so toggling it
+never triggers a rebuild.
 
 Every sync is hash-incremental: a file whose mtime+size are unchanged
 is skipped before any read/hash/parse (the cheap node of a blake3 file
@@ -172,7 +188,8 @@ dimensions = 0                            # omit/0 → probed at startup
 batch_size  = 64          # texts per request (OpenAI `input` array)
 concurrency = 4           # max parallel in-flight requests
 timeout_seconds = 60
-e5_prefix = false         # true only if the remote serves an e5 model
+# query_prefix = "query: "    # e.g. e5 remote; omit for OpenAI/DeepSeek
+# doc_prefix   = "passage: "  # e.g. e5 remote; omit for OpenAI/DeepSeek
 ```
 
 Batching uses the OpenAI `input` array (`batch_size` texts/request);
@@ -190,28 +207,53 @@ streamed in byte-bounded batches.
 
 `ml` rating covers non-English (incl. Russian): ★★★★★ = full, ★★ = English-centric.
 
-Built-in models are pulled (and cached) from **Hugging Face**. The
-default and `potion-base-32M` are [Model2Vec](https://github.com/MinishLab/model2vec)
-static models (a token-embedding matrix — no transformer/ONNX, tiny
-RAM, very fast, no precision knob). The e5 family is ONNX from the
-[`Xenova`](https://huggingface.co/Xenova) org (community ONNX
-re-publishes — what makes the fp16 / int8 variants available); jina /
-nomic are fastembed built-ins (f32).
+Built-in models are pulled (and cached) from **Hugging Face**. Each
+declares an *architecture* that decides how it is loaded:
 
-| model | dim | code | ml | RAM≈ |
-|-------|-----|------|----|------|
-| minishlab/potion-multilingual-128M **(default, static)** | 256 | ★★★ | ★★★★★ | ~542 MB |
-| minishlab/potion-base-32M (static, English) | 512 | ★★★ | ★★ | ~158 MB |
-| intfloat/multilingual-e5-base | 768 | ★★★★ | ★★★★★ | ~1462 / ~906 / ~628 MB (f32/fp16/int8) |
-| intfloat/multilingual-e5-small | 384 | ★★★ | ★★★★★ | ~822 / ~586 / ~468 MB |
-| intfloat/multilingual-e5-large | 1024 | ★★★ | ★★★★★ | ~2590 / ~1470 / ~910 MB |
-| jinaai/jina-embeddings-v2-base-code | 768 | ★★★★★ | ★★ | ~994 MB (f32 only) |
-| nomic-ai/nomic-embed-text-v1.5 | 768 | ★★★★ | ★★★ | ~898 MB (f32 only) |
+- **static** — [Model2Vec](https://github.com/MinishLab/model2vec)
+  token-embedding matrix (no transformer/ONNX): tiny RAM, very fast,
+  no precision knob. The default + `potion-base-32M`.
+- **onnx** — transformer encoder from an HF ONNX repo, mean-pooled;
+  the `fp16` / `int8` precision knob applies. The e5 / nomic models,
+  and jina-code (pinned to its int8 export).
+- **fastembed** — encoder served by fastembed's bundled ONNX (a
+  fallback arch; no built-in currently needs it).
 
-Default is the multilingual Model2Vec (incl. Russian) — fastest +
-lowest RAM, good general semantic recall. For strongest pure-code
-retrieval switch to `jinaai/jina-embeddings-v2-base-code`; for max
-multilingual quality `intfloat/multilingual-e5-large`.
+`peak RSS` below is measured indexing a real ~12k-chunk repo (auto
+per-model batch); `sync` is that first full sync (incremental after).
+
+Each model has a fixed input/output **contract** (query/doc prefix +
+pooling) — applied automatically; `pool` = mean / cls. `peak RSS` is
+measured indexing a real ~12k-chunk repo (auto per-model batch).
+
+| model | arch | dim | code | ml | pool | peak RSS |
+|-------|------|-----|------|----|------|----------|
+| nomic-ai/CodeRankEmbed **(default)** | onnx (int8, CPU) | 768 | ★★★★★ | ★★ | cls | ~0.7 GB |
+| jinaai/jina-embeddings-v2-base-code | onnx (int8) | 768 | ★★★★★ | ★★ | mean | ~0.76 GB |
+| minishlab/potion-multilingual-128M | static | 256 | ★★★ | ★★★★★ | mean | ~0.85 GB |
+| minishlab/potion-base-32M | static | 512 | ★★★ | ★★ | mean | ~0.36 GB |
+| intfloat/multilingual-e5-small | onnx | 384 | ★★★ | ★★★★★ | mean | ~1.1 GB |
+| intfloat/multilingual-e5-base | onnx | 768 | ★★★ | ★★★★★ | mean | ~1.4 GB |
+| intfloat/multilingual-e5-large | onnx | 1024 | ★★★ | ★★★★★ | mean | ~2.2 GB |
+| nomic-ai/nomic-embed-text-v1.5 | onnx | 768 | ★★★★ | ★★★ | mean | ~0.8 GB |
+| Snowflake/snowflake-arctic-embed-m-v2.0 | onnx | 768 | ★★★ | ★★★★★ | cls | ~1.2 GB |
+| jamie8johnson/e5-base-v2-code-search | onnx (f32, CPU) | 768 | ★★★★ | ★★ | mean | ~1.1 GB |
+
+**The default `nomic-ai/CodeRankEmbed`** is SOTA code retrieval (int8
+ONNX, CLS-pooled, CPU-pinned — its NomicBert export is slow under
+CoreML/CUDA). `jinaai/jina-embeddings-v2-base-code`
+is a lighter code alternative (~0.76 GB). For multilingual / Russian
+use an e5 model or the static `potion-multilingual-128M` (fastest, full
+sync of a big repo in seconds at <1 GB). The static models are
+bag-of-token-means (weaker code relevance) but cheap; the onnx encoders
+are slower on the first sync of a large repo (incremental after).
+`models add` registers any other HF model — set
+`--query-prefix`/`--doc-prefix`/`--pooling` (or `--e5_prefix`) for its
+contract; its `config.json` architecture is checked at add time and an
+unsupported one (LM-head / KV-cache decoder) is rejected up front.
+
+(Qwen3-Embedding decoder models need a candle backend that does not
+exist yet.)
 
 ### Selecting a model
 
@@ -220,7 +262,7 @@ is **not** encoded in the name, it's a separate config knob (same name,
 different ONNX weights). Two ways:
 
 ```
-embedding-search models set-default intfloat/multilingual-e5-large
+embedding-search models set-default intfloat/multilingual-e5-small
 embedding-search models list           # shows table + active precision/RAM
 ```
 
@@ -228,7 +270,7 @@ or edit `~/.embedding-search/config.toml` directly:
 
 ```toml
 [model]
-default   = "intfloat/multilingual-e5-large"
+default   = "intfloat/multilingual-e5-small"
 precision = "int8"
 ```
 
@@ -247,8 +289,9 @@ the Hugging Face `Xenova/*` repos, which ship `model.onnx` /
   repos / low-RAM machines.
 - `full` — f32 reference quality, highest RAM.
 
-`jina`/`nomic` have no quantized ONNX in fastembed → always f32
-(`precision` ignored, shows `f32` in `models list`).
+The static Model2Vec models (the default + `potion-base-32M`) have no
+precision knob — a single f32 matrix; `models list` shows `f32` and
+`precision` is ignored for them.
 
 ### Using any Hugging Face model
 
@@ -326,9 +369,10 @@ RAM. Just `models add --name potion --repo minishlab/potion-multilingual-128M`.
 
 ```toml
 [model]
-onnx_path      = "/models/bge-small-en"   # dir or direct .onnx file
-onnx_e5_prefix = false                     # true only for e5-style models
-precision      = "fp16"                    # picks onnx/model_fp16.onnx if present
+onnx_path        = "/models/bge-small-en" # dir or direct .onnx file
+# onnx_query_prefix = "query: "           # e.g. e5; omit for none
+# onnx_doc_prefix   = "passage: "         # e.g. e5; omit for none
+precision        = "fp16"                 # picks onnx/model_fp16.onnx if present
 ```
 
 Same file requirements as above (a directory with `model.onnx` or

@@ -4,6 +4,7 @@ pub mod db;
 pub mod embedder;
 pub mod error;
 pub mod inspect;
+pub mod rerank;
 pub mod search;
 pub mod sync;
 pub mod vector;
