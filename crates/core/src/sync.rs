@@ -820,6 +820,13 @@ impl SyncEngine {
                     stats.chunks_total += self.flush_group(std::mem::take(&mut group))?;
                     pending_chunks = 0;
                     pending_bytes = 0;
+                }
+                // Emit every classified file, not only at a flush: the
+                // producer runs ahead of the blocking embed, so
+                // `discovered` climbs while `embedded` (`chunks_total`)
+                // steps only per flush — the buffered lead is visible
+                // instead of the two always reading equal post-flush.
+                if changed {
                     progress(SyncEvent::Chunks {
                         embedded: stats.chunks_total,
                         discovered,
