@@ -103,7 +103,7 @@ command (CLI or MCP), so it's there to edit. Delete it to reset.
 
 ```toml
 [model]
-default   = "nomic-ai/CodeRankEmbed"          # SOTA code encoder (int8)
+default   = "sensiarion/CodeRankEmbed-f16"    # SOTA code (f16 Metal / int8 CPU)
 precision = "fp16"                            # fp16 | int8 | full (ONNX models only)
 max_length = 512                              # token cap; keep ≈ max_chunk_bytes/4
 # onnx_path = "/path/to/model-dir"            # custom local ONNX (see below)
@@ -228,7 +228,8 @@ measured indexing a real ~12k-chunk repo (auto per-model batch).
 
 | model | arch | dim | code | ml | pool | peak RSS |
 |-------|------|-----|------|----|------|----------|
-| nomic-ai/CodeRankEmbed **(default)** | onnx (int8, CPU) | 768 | ★★★★★ | ★★ | cls | ~0.7 GB |
+| sensiarion/CodeRankEmbed-f16 **(default)** | candle f16 Metal / onnx int8 CPU | 768 | ★★★★★ | ★★ | cls | ~0.57 GB |
+| nomic-ai/CodeRankEmbed | candle f32 Metal / onnx int8 CPU | 768 | ★★★★★ | ★★ | cls | ~1.1 GB |
 | jinaai/jina-embeddings-v2-base-code | onnx (int8) | 768 | ★★★★★ | ★★ | mean | ~0.76 GB |
 | minishlab/potion-multilingual-128M | static | 256 | ★★★ | ★★★★★ | mean | ~0.85 GB |
 | minishlab/potion-base-32M | static | 512 | ★★★ | ★★ | mean | ~0.36 GB |
@@ -239,9 +240,16 @@ measured indexing a real ~12k-chunk repo (auto per-model batch).
 | Snowflake/snowflake-arctic-embed-m-v2.0 | onnx | 768 | ★★★ | ★★★★★ | cls | ~1.2 GB |
 | jamie8johnson/e5-base-v2-code-search | onnx (f32, CPU) | 768 | ★★★★ | ★★ | mean | ~1.1 GB |
 
-**The default `nomic-ai/CodeRankEmbed`** is SOTA code retrieval (int8
-ONNX, CLS-pooled, CPU-pinned — its NomicBert export is slow under
-CoreML/CUDA). `jinaai/jina-embeddings-v2-base-code`
+**The default `sensiarion/CodeRankEmbed-f16`** is SOTA code retrieval
+(CLS-pooled). It is a pure **f16 cast** of the official
+`nomic-ai/CodeRankEmbed` safetensors, validated equivalent (cosine
+0.999998, identical CodeSearchNet MRR@10/Recall@1 — see `tools/quant`).
+On **Apple Silicon** it runs on the **Metal GPU** via candle at ~0.57 GB
+(the ORT CoreML EP can't accelerate NomicBert); on CPU it uses the int8
+ONNX, on CUDA the f32 ONNX. For exact upstream provenance pick the
+official f32 weights: `models set-default nomic-ai/CodeRankEmbed`
+(~2x RAM on Metal, same embeddings; identical to the default off
+Apple-Silicon). `jinaai/jina-embeddings-v2-base-code`
 is a lighter code alternative (~0.76 GB). For multilingual / Russian
 use an e5 model or the static `potion-multilingual-128M` (fastest, full
 sync of a big repo in seconds at <1 GB). The static models are

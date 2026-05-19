@@ -2,15 +2,18 @@
 
 ## 0.2.5
 
-- Apple Silicon now runs the default `nomic-ai/CodeRankEmbed` on the
-  **Metal GPU** via an **f16** weight build — about **half the RAM**
-  (peak ~0.57 GB vs ~1.1 GB f32) and faster than the CPU path. CoreML
-  can't accelerate this architecture, so the GPU is driven directly;
-  CUDA machines run the accelerated f32 ONNX, everything else the int8
-  ONNX on CPU, with automatic int8-CPU fallback if the GPU is
-  unreachable. The f16 build is validated equivalent to f32 (cosine
-  0.999998, identical CodeSearchNet MRR@10 / Recall@1) — search quality
-  is unchanged. The index records the backend/precision, so it
+- **The default model is now `sensiarion/CodeRankEmbed-f16`** — an f16
+  cast of the official `nomic-ai/CodeRankEmbed`, validated equivalent
+  (cosine 0.999998, identical CodeSearchNet MRR@10 / Recall@1; search
+  quality unchanged). On **Apple Silicon** it runs on the **Metal GPU**
+  via candle at about **half the RAM** (peak ~0.57 GB vs ~1.1 GB f32)
+  and faster than the CPU path — CoreML can't accelerate this
+  architecture so the GPU is driven directly. CUDA runs the f32 ONNX,
+  everything else the int8 ONNX on CPU, with automatic int8-CPU
+  fallback if the GPU is unreachable. Both CodeRankEmbed builtins now
+  show in `models list`; pick the official upstream f32 weights with
+  `models set-default nomic-ai/CodeRankEmbed` (~2x Metal RAM, same
+  embeddings, identical off Apple-Silicon). The per-project index
   re-embeds itself once automatically on upgrade (nothing to do).
 - Faster indexing: parallel file walk and length-sorted GPU
   sub-batching. The candle sub-batch size is tunable via the

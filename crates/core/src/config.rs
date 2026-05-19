@@ -3,7 +3,7 @@ use fastembed::EmbeddingModel;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const DEFAULT_MODEL: &str = "nomic-ai/CodeRankEmbed";
+pub const DEFAULT_MODEL: &str = "sensiarion/CodeRankEmbed-f16";
 
 /// Bumped whenever chunking logic OR the embedded-text shape changes
 /// (AST kinds, line window, structured split, the code↔NL embed
@@ -825,14 +825,45 @@ impl ModelSpec {
 }
 
 pub const SUPPORTED_MODELS: &[ModelSpec] = &[
-    // DEFAULT: nomic CodeRankEmbed — SOTA code retrieval (NomicBertModel
-    // encoder, CLS-pooled, query-only instruction prefix). The base
-    // repo ships safetensors only; this community export carries both
-    // the f32 `onnx/model.onnx` and the int8 `onnx/model_quantized.onnx`.
-    // Apple Silicon / CPU stays on int8 (the ORT CoreML EP can't
-    // accelerate NomicBert — int8 QDQ falls back to CPU and is *slower*
-    // there, and MLProgram miscompiles its rotary); CUDA gets the f32
-    // file where it is genuinely accelerated. See `OnnxFiles`.
+    // DEFAULT: CodeRankEmbed — SOTA code retrieval (NomicBert encoder,
+    // CLS-pooled, query-only instruction prefix). Two selectable
+    // builtins, identical EXCEPT the Apple-Silicon candle weights:
+    //
+    //  * `sensiarion/CodeRankEmbed-f16` (default) — a pure f16 cast of
+    //    the official `nomic-ai/CodeRankEmbed` safetensors, validated
+    //    equivalent (cosine 0.999998, identical CodeSearchNet
+    //    MRR@10/Recall@1; see tools/quant) at ~half the RAM.
+    //  * `nomic-ai/CodeRankEmbed` — the official upstream f32 weights
+    //    (~2x RAM, same embeddings). `models set-default
+    //    nomic-ai/CodeRankEmbed` to pick exact upstream provenance.
+    //
+    // Off Apple-Silicon both resolve to the SAME ONNX path
+    // (`jalipalo/CodeRankEmbed-onnx`): int8 on CPU, f32 on CUDA (the
+    // ORT CoreML EP can't accelerate NomicBert — int8 QDQ falls back
+    // to CPU and is slower, MLProgram miscompiles the rotary). See
+    // `OnnxFiles`.
+    ModelSpec {
+        name: "sensiarion/CodeRankEmbed-f16",
+        dimensions: 768,
+        code: 5,
+        multilingual: 2,
+        params_m: 137,
+        query_prefix: Some("Represent this query for searching relevant code: "),
+        doc_prefix: None,
+        pooling: Pooling::Cls,
+        hf_repo: Some("jalipalo/CodeRankEmbed-onnx"),
+        onnx: OnnxFiles::AccelCpu {
+            accel: "onnx/model.onnx",
+            cpu: "onnx/model_quantized.onnx",
+        },
+        // candle reads the native safetensors dtype, so this f16 repo
+        // runs half-precision on Metal; the `candle-f16` variant tag
+        // keeps its index distinct from the f32 entry below.
+        candle_repo: Some("sensiarion/CodeRankEmbed-f16"),
+        arch: ModelArch::OnnxEncoder,
+        rec_batch: 4,
+        note: "DEFAULT: SOTA code retrieval, English, CLS (f16 Metal / int8 CPU)",
+    },
     ModelSpec {
         name: "nomic-ai/CodeRankEmbed",
         dimensions: 768,
@@ -843,24 +874,17 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         doc_prefix: None,
         pooling: Pooling::Cls,
         hf_repo: Some("jalipalo/CodeRankEmbed-onnx"),
-        // One repo, both files: f32 for CUDA (accelerated), int8 for
-        // CPU/Apple-Silicon (fastest correct path there — ~0.7 s/10
-        // batches vs the f32's CPU-equal CoreML run; MLProgram crashes
-        // the rotary). `accel_active` is CUDA-only, so on a Mac this
-        // resolves to int8/CPU automatically.
         onnx: OnnxFiles::AccelCpu {
             accel: "onnx/model.onnx",
             cpu: "onnx/model_quantized.onnx",
         },
-        // Apple Silicon: run on the Metal GPU via candle. f16 export
-        // of the base safetensors (candle reads the native dtype) —
-        // half the weight bandwidth, embeddings ≈ f32, ~1.8x the int8
-        // ONNX CPU fallback. The `candle-f16` variant tag busts the
-        // index vs the old f32 repo.
-        candle_repo: Some("sensiarion/CodeRankEmbed-f16"),
+        // Official upstream f32 safetensors on Metal (~2x the f16
+        // default's RAM, identical embeddings). `candle-f32` variant
+        // tag → its own index.
+        candle_repo: Some("nomic-ai/CodeRankEmbed"),
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
-        note: "DEFAULT: SOTA code retrieval, English, CLS (int8)",
+        note: "Official upstream f32 weights (Metal); ~2x f16 default RAM",
     },
     // jina-v2-base-code's HF ONNX config is `JinaBertForMaskedLM`, but
     // the export exposes a poolable encoder output (fastembed mean-pools
