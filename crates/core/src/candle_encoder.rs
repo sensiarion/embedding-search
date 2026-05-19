@@ -53,6 +53,9 @@ pub(crate) struct CandleEncoder {
     model: NomicBertModel,
     tok: Tokenizer,
     device: Device,
+    /// Resolved weight precision — folded into the index identity so a
+    /// repo precision change (f32 base ↔ f16 export) re-embeds.
+    dtype: DType,
     pub dim: usize,
 }
 
@@ -108,6 +111,7 @@ impl CandleEncoder {
             model,
             tok,
             device,
+            dtype,
             dim: 0,
         };
         enc.dim = enc
@@ -116,6 +120,26 @@ impl CandleEncoder {
             .map(Vec::len)
             .ok_or_else(|| Error::Embed("candle: empty probe".into()))?;
         Ok(enc)
+    }
+
+    /// Index-identity suffix: the real loaded precision, so switching
+    /// the candle repo's dtype (f32 base ↔ f16 export) busts the index.
+    /// Every distinct weight precision must yield a distinct tag — f16
+    /// and bf16 are deliberately NOT merged (different embeddings ⇒
+    /// must re-embed separately), which is why this does not route
+    /// through `Precision::label` (it has no bf16 and would collide
+    /// the two). Only F16/BF16/F32/F64 are reachable (the float dtypes
+    /// `DType::try_from` yields for a safetensors model); `candle-other`
+    /// is an exhaustiveness sentinel that is never taken in practice
+    /// and still cannot collide with a real precision tag.
+    pub fn variant(&self) -> &'static str {
+        match self.dtype {
+            DType::F16 => "candle-f16",
+            DType::BF16 => "candle-bf16",
+            DType::F32 => "candle-f32",
+            DType::F64 => "candle-f64",
+            _ => "candle-other",
+        }
     }
 
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {

@@ -852,9 +852,12 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
             accel: "onnx/model.onnx",
             cpu: "onnx/model_quantized.onnx",
         },
-        // Apple Silicon: run f32 on the Metal GPU via candle (base
-        // safetensors repo) — ~1.8x the int8 ONNX CPU fallback.
-        candle_repo: Some("nomic-ai/CodeRankEmbed"),
+        // Apple Silicon: run on the Metal GPU via candle. f16 export
+        // of the base safetensors (candle reads the native dtype) —
+        // half the weight bandwidth, embeddings ≈ f32, ~1.8x the int8
+        // ONNX CPU fallback. The `candle-f16` variant tag busts the
+        // index vs the old f32 repo.
+        candle_repo: Some("sensiarion/CodeRankEmbed-f16"),
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
         note: "DEFAULT: SOTA code retrieval, English, CLS (int8)",

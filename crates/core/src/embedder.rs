@@ -1407,8 +1407,8 @@ impl Embedder {
                 if let Some(enc) = try_candle(spec, cfg, &cache_dir) {
                     return Ok(Self {
                         dimensions: enc.dim,
+                        model_name: tagged_model_name(spec.name, Some(enc.variant())),
                         backend: Backend::Candle(Box::new(enc)),
-                        model_name: tagged_model_name(spec.name, Some("candle")),
                         contract: Contract::from_spec(spec),
                     });
                 }

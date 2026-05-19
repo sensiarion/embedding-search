@@ -1,12 +1,15 @@
 [workspace]
 members = ["crates/core", "crates/cli", "xtask"]
 default-members = ["crates/core", "crates/cli"]
+# Standalone dev tooling (candle/Metal, Apple-Silicon only) — built
+# on demand, kept out of the main workspace/CI build.
+exclude = ["tools/quant"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"
-version = "0.2.4"
+version = "0.2.5"
 license = "MIT"
 authors = ["sensiarion"]
 repository = "https://github.com/sensiarion/embedding-search"
