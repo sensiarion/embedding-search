@@ -83,18 +83,6 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Set the embedding model for THIS project only. Writes
-    /// `<project>/.embedding-search/config.toml`, which is deep-merged
-    /// over (and wins against) the global default — other projects are
-    /// unaffected. The model is verified (download + test embed) before
-    /// anything is written; the project re-indexes on the next sync.
-    Set {
-        /// A built-in, or a globally-registered custom/remote model
-        /// name (see `models list`).
-        model: String,
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
     /// Start MCP server mode on stdio
     Serve,
     /// Inspection helpers
@@ -128,7 +116,17 @@ enum DebugCmd {
 enum ModelsCmd {
     /// List supported models
     List,
-    /// Set the default model (requires re-index)
+    /// Set the embedding model for THIS project (CWD) only. Writes
+    /// `<project>/.embedding-search/config.toml`, which is deep-merged
+    /// over (and wins against) the global default — other projects are
+    /// unaffected. The model is verified (download + test embed) before
+    /// anything is written; the project re-indexes on the next sync.
+    Set {
+        /// A built-in, or a globally-registered custom/remote model
+        /// name (see `models list`).
+        model: String,
+    },
+    /// Set the default model globally (requires re-index)
     SetDefault { model: String },
     /// Unregister a custom/remote model and delete its cached weights.
     /// Built-ins can't be removed. If it was active, the default
@@ -150,17 +148,12 @@ enum ModelsCmd {
         /// in the same directory)
         #[arg(long)]
         url: Option<String>,
-        /// Alias for `--query-prefix "query: " --doc-prefix
-        /// "passage: "` (e5 models). Explicit prefixes below win.
-        #[arg(long)]
-        e5_prefix: bool,
         /// Text prepended to a search query before embedding, e.g.
-        /// "query: " (e5), "search_query: " (nomic), or an instruction.
+        /// "search_query: " (nomic) or a CodeRank-style instruction.
         #[arg(long)]
         query_prefix: Option<String>,
         /// Text prepended to each indexed chunk before embedding, e.g.
-        /// "passage: " / "search_document: ". Omit for query-only
-        /// (CLS code) models.
+        /// "search_document: ". Omit for query-only (CLS code) models.
         #[arg(long)]
         doc_prefix: Option<String>,
         /// Encoder output pooling: mean (default) | cls | last-token.
@@ -191,10 +184,6 @@ enum ModelsCmd {
         /// Output dimensions (probed from a live request if omitted)
         #[arg(long)]
         dimensions: Option<usize>,
-        /// Alias for `--query-prefix "query: " --doc-prefix
-        /// "passage: "` (e5 remote). Explicit prefixes below win.
-        #[arg(long)]
-        e5_prefix: bool,
         /// Text prepended to a query before sending it to the remote.
         #[arg(long)]
         query_prefix: Option<String>,
@@ -326,26 +315,20 @@ fn run_sync(eng: &SyncEngine, force: bool, report: Report) -> Result<()> {
         // of it; nudge the user (per-project, one command) when a sync
         // actually ran long on a non-static model.
         if stats.elapsed_ms > SLOW_SYNC_MS && !eng.model_is_static() {
+            let prefix = match std::env::current_dir() {
+                Ok(cwd) if cwd == eng.project_dir() => String::new(),
+                _ => format!("cd {} && ", eng.project_dir().display()),
+            };
             println!(
                 "Tip: this repo is large and '{}' is a heavy model. For \
-                 much faster syncs:\n  embedding-search set \
-                 minishlab/potion-base-32M{}\n(per-project; re-indexes \
+                 much faster syncs:\n  {prefix}embedding-search models set \
+                 minishlab/potion-base-32M\n(per-project; re-indexes \
                  once on the next sync).",
                 eng.configured_model(),
-                path_hint(eng.project_dir()),
             );
         }
     }
     Ok(())
-}
-
-/// ` <path>` suffix for the hint when the synced project is not the
-/// shell's CWD, so the suggested command targets the right repo.
-fn path_hint(project_dir: &Path) -> String {
-    match std::env::current_dir() {
-        Ok(cwd) if cwd == project_dir => String::new(),
-        _ => format!(" {}", project_dir.display()),
-    }
 }
 
 fn main() -> Result<()> {
@@ -383,24 +366,6 @@ fn main() -> Result<()> {
         return mcp::run();
     };
     match cmd {
-        Command::Set { model, path } => {
-            let dir = std::fs::canonicalize(&path).context("resolve path")?;
-            let mut cfg = Config::load_for_project(&dir).context("load config")?;
-            cfg.select_model(&model)?;
-            // Same pre-persist contract as `models set-default`: a bad
-            // name/repo fails here and the project override is untouched.
-            let emb = verify_model(&cfg, &model)?;
-            let p = cfg
-                .save_project_override(&dir)
-                .context("save project override")?;
-            println!(
-                "\u{2713} '{model}' set for this project ({} dims).\n  {}\n\
-                 Run `embedding-search sync --force` to re-index now \
-                 (otherwise it auto-rebuilds on the next sync).",
-                emb.dimensions,
-                p.display()
-            );
-        }
         Command::Serve => return mcp::run(),
         Command::Clear { path } => {
             use embedding_search_core::{config::PROJECT_INDEX_DIR, sync::wipe_index};
@@ -589,6 +554,24 @@ fn main() -> Result<()> {
                      Add: `models add` / `models add-remote`."
                 );
             }
+            ModelsCmd::Set { model } => {
+                let dir = std::env::current_dir().context("resolve cwd")?;
+                let mut cfg = Config::load_for_project(&dir).context("load config")?;
+                cfg.select_model(&model)?;
+                // Same pre-persist contract as `models set-default`: a bad
+                // name/repo fails here and the project override is untouched.
+                let emb = verify_model(&cfg, &model)?;
+                let p = cfg
+                    .save_project_override(&dir)
+                    .context("save project override")?;
+                println!(
+                    "\u{2713} '{model}' set for this project ({} dims).\n  {}\n\
+                     Run `embedding-search sync --force` to re-index now \
+                     (otherwise it auto-rebuilds on the next sync).",
+                    emb.dimensions,
+                    p.display()
+                );
+            }
             ModelsCmd::SetDefault { model } => {
                 let mut cfg = Config::load_or_init().context("load config")?;
                 cfg.select_model(&model)?;
@@ -640,7 +623,6 @@ fn main() -> Result<()> {
                 name,
                 repo,
                 url,
-                e5_prefix,
                 query_prefix,
                 doc_prefix,
                 pooling,
@@ -650,27 +632,14 @@ fn main() -> Result<()> {
                 // --repo / --url is set. A `--repo` value may be a full
                 // HF URL (copied from the browser) — canonicalize to
                 // the bare `org/name` id `hf-hub` expects.
-                // `--e5_prefix` is sugar for the e5 prefix pair;
-                // explicit `--query-prefix`/`--doc-prefix` win.
-                let (qp, dp) = if e5_prefix {
-                    (
-                        query_prefix
-                            .or_else(|| Some(embedding_search_core::config::E5_QUERY.to_string())),
-                        doc_prefix.or_else(|| {
-                            Some(embedding_search_core::config::E5_PASSAGE.to_string())
-                        }),
-                    )
-                } else {
-                    (query_prefix, doc_prefix)
-                };
                 let mut cfg = Config::load_or_init().context("load config")?;
                 cfg.custom_models.retain(|m| m.name != name);
                 cfg.custom_models.push(CustomModel {
                     name: name.clone(),
                     repo: repo.map(|r| normalize_hf_repo(&r)),
                     url,
-                    query_prefix: qp,
-                    doc_prefix: dp,
+                    query_prefix,
+                    doc_prefix,
                     pooling: pooling.unwrap_or_default(),
                     onnx_file,
                 });
@@ -684,23 +653,9 @@ fn main() -> Result<()> {
                 model,
                 api_key,
                 dimensions,
-                e5_prefix,
                 query_prefix,
                 doc_prefix,
             } => {
-                // `--e5_prefix` is sugar for the e5 prefix pair;
-                // explicit `--query-prefix`/`--doc-prefix` win.
-                let (qp, dp) = if e5_prefix {
-                    (
-                        query_prefix
-                            .or_else(|| Some(embedding_search_core::config::E5_QUERY.to_string())),
-                        doc_prefix.or_else(|| {
-                            Some(embedding_search_core::config::E5_PASSAGE.to_string())
-                        }),
-                    )
-                } else {
-                    (query_prefix, doc_prefix)
-                };
                 let mut cfg = Config::load_or_init().context("load config")?;
                 let entry = RemoteConfig {
                     name: name.clone(),
@@ -708,8 +663,8 @@ fn main() -> Result<()> {
                     model: model.clone(),
                     api_key,
                     dimensions,
-                    query_prefix: qp,
-                    doc_prefix: dp,
+                    query_prefix,
+                    doc_prefix,
                     ..RemoteConfig::default()
                 };
                 // Keep it in the registry so it can be re-selected

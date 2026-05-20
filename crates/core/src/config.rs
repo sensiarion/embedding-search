@@ -60,8 +60,8 @@ pub struct CustomModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Prepended to a search query before embedding (`None`/absent =
-    /// none). e.g. `"query: "` for e5, `"search_query: "` for nomic, a
-    /// task instruction for CLS code models.
+    /// none). e.g. `"search_query: "` for nomic or a task instruction
+    /// for CLS code models (CodeRankEmbed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_prefix: Option<String>,
     /// Prepended to an indexed chunk before embedding (`None`/absent =
@@ -173,7 +173,8 @@ pub struct ModelConfig {
     /// the model actually sees — text past this many tokens is silently
     /// truncated before embedding. Keep it aligned with
     /// `sync.max_chunk_bytes` (≈4 bytes/token for code) so whole chunks
-    /// are embedded, not just their head. e5 native/hard max is 512.
+    /// are embedded, not just their head. 512 is the common BERT/jina
+    /// native max.
     pub max_length: usize,
     /// Use a user-provided ONNX model instead of the built-in registry.
     /// Either a directory containing `model.onnx` (or
@@ -184,8 +185,9 @@ pub struct ModelConfig {
     /// are probed at load. `[model] default` is ignored when set.
     pub onnx_path: Option<PathBuf>,
     /// Prefix prepended to a query / document before embedding the
-    /// `onnx_path` model (`None` = none). e5 ⇒ `"query: "` /
-    /// `"passage: "`; nomic ⇒ `"search_query: "` / `"search_document: "`.
+    /// `onnx_path` model (`None` = none). nomic ⇒ `"search_query: "` /
+    /// `"search_document: "`; CodeRankEmbed-style: a task instruction
+    /// on the query side only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onnx_query_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,8 +233,8 @@ pub struct RemoteConfig {
     /// Per-request timeout.
     pub timeout_seconds: u64,
     /// Prefix prepended to a query / document before sending it to the
-    /// remote (`None` = none — OpenAI / DeepSeek). e5 ⇒ `"query: "` /
-    /// `"passage: "`; nomic ⇒ `"search_query: "` / `"search_document: "`.
+    /// remote (`None` = none — OpenAI / DeepSeek). nomic ⇒
+    /// `"search_query: "` / `"search_document: "`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -698,7 +700,7 @@ pub const LARGE_REPO_FILES: i64 = 1_500;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Pooling {
-    /// Attention-masked mean of `last_hidden_state` — e5, nomic, jina,
+    /// Attention-masked mean of `last_hidden_state` — nomic, jina,
     /// most sentence-transformers encoders.
     #[default]
     Mean,
@@ -738,12 +740,6 @@ impl std::str::FromStr for Pooling {
         }
     }
 }
-
-/// e5-family input prefixes (intfloat e5 / multilingual-e5 / e5
-/// fine-tunes). One source for the registry entries and the
-/// `--e5_prefix` CLI sugar (Add / AddRemote).
-pub const E5_QUERY: &str = "query: ";
-pub const E5_PASSAGE: &str = "passage: ";
 
 /// How a model is loaded and run. Detected from a model's
 /// `config.json` for user-added models (`models add`); declared up
@@ -841,9 +837,7 @@ pub struct ModelSpec {
     pub multilingual: u8,
     pub params_m: u32,
     /// Prepended to a search query before embedding (`None` = none).
-    /// e5: `"query: "`; nomic: `"search_query: "`; arctic-v2 / nomic
-    /// CodeRankEmbed: a task instruction; Qwen3: the full
-    /// `Instruct: …\nQuery:` template.
+    /// nomic: `"search_query: "`; CodeRankEmbed: a task instruction.
     pub query_prefix: Option<&'static str>,
     /// Prepended to an indexed document chunk before embedding (`None`
     /// = none — many code/CLS models prefix only the query side).

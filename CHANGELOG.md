@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.7
+
+- **BREAKING:** per-project model override moved from the top-level
+  `embedding-search set <model> [path]` to `embedding-search models set
+  <model>` (next to `models set-default`). The `[path]` argument is
+  gone — the command now always targets the current working directory
+  (`cd` to the project first). The behavior is otherwise unchanged.
+- **BREAKING:** `--e5_prefix` (alias of
+  `--query-prefix "query: " --doc-prefix "passage: "`) is gone from
+  `models add` and `models add-remote`. The built-in models that needed
+  it were removed in 0.2.6 — pass the explicit prefixes if you still
+  need them on a custom model.
+
 ## 0.2.6
 
 - **BREAKING:** the predefined model list is trimmed to five:
@@ -30,11 +43,13 @@
   project is **not a git repository** (or before its first commit) —
   e.g. secrets/build output in a plain directory. They are now
   excluded correctly; the next sync drops any that had slipped in.
-- Per-project model: `embedding-search set <model> [path]` pins a
-  model for one repo only — it writes
+- Per-project model: `embedding-search models set <model>` pins a
+  model for the current repo only — it writes
   `<project>/.embedding-search/config.toml`, which overrides the
   global default without affecting other projects. `status` shows
-  when a project override is active.
+  when a project override is active. (Renamed/moved from the previous
+  top-level `embedding-search set` — now under `models` next to
+  `models set-default`.)
 - The CLI now prints the previous/next chunk around each hit for
   immediate context. The MCP/agent output is unchanged (still
   refs-only, so agent searches stay token-lean).

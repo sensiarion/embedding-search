@@ -32,7 +32,7 @@ use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 use candle_transformers::models::modernbert::{Config as ModernBertConfig, ModernBert};
 use std::collections::HashMap;
 use std::path::Path;
-use tokenizers::{Encoding, Tokenizer};
+use tokenizers::Tokenizer;
 
 /// `ettin-reranker-68m-v1` on Metal. One relevance logit per
 /// `(query, passage)` pair — same contract as the ONNX reranker, so
@@ -150,8 +150,12 @@ impl CandleReranker {
 
     /// Relevance logit of `query` against each passage, in input
     /// order. Pairs are length sub-batched (attention is O(seq²) and
-    /// every row pads to its sub-batch's longest), results scattered
-    /// back so this stays transparent to the caller.
+    /// every row pads to its sub-batch's longest); results scatter
+    /// back so this stays transparent to the caller. ModernBERT has
+    /// no segment embeddings, so there are no `token_type_ids` —
+    /// just `(input_ids, attention_mask)`. F32 mask: candle's
+    /// modernbert resolves the 4-D mask via
+    /// `prepare_4d_attention_mask(.., DType::F32, ..)`.
     pub fn score(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>> {
         if passages.is_empty() {
             return Ok(Vec::new());
@@ -163,67 +167,30 @@ impl CandleReranker {
             .tok
             .encode_batch(pairs, true)
             .map_err(|e| Error::Embed(format!("candle: rerank tokenize: {e}")))?;
-        let mut order: Vec<usize> = (0..encs.len()).collect();
-        order.sort_unstable_by_key(|&i| encs[i].get_ids().len());
-
         let mut ids_buf: Vec<u32> = Vec::new();
         let mut mask_buf: Vec<f32> = Vec::new();
-        let mut out = vec![0.0f32; passages.len()];
-        for window in order.chunks(crate::candle_encoder::candle_batch()) {
-            let batch: Vec<&Encoding> = window.iter().map(|&i| &encs[i]).collect();
-            for (&slot, logit) in window
-                .iter()
-                .zip(self.forward(&batch, &mut ids_buf, &mut mask_buf)?)
-            {
-                out[slot] = logit;
-            }
-        }
-        Ok(out)
-    }
-
-    /// One forward on a length-homogeneous sub-batch → one logit per
-    /// row. ModernBERT has no segment embeddings, so there are no
-    /// `token_type_ids`: just `(input_ids, attention_mask)`.
-    fn forward(
-        &self,
-        encs: &[&Encoding],
-        ids_buf: &mut Vec<u32>,
-        mask_buf: &mut Vec<f32>,
-    ) -> Result<Vec<f32>> {
-        let b = encs.len();
-        let seq = encs
-            .iter()
-            .map(|e| e.get_ids().len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        ids_buf.clear();
-        ids_buf.resize(b * seq, 0);
-        mask_buf.clear();
-        mask_buf.resize(b * seq, 0.0);
-        for (r, e) in encs.iter().enumerate() {
-            for (j, (&id, &m)) in e.get_ids().iter().zip(e.get_attention_mask()).enumerate() {
-                ids_buf[r * seq + j] = id;
-                mask_buf[r * seq + j] = m as f32;
-            }
-        }
-        let ids = Tensor::from_slice(&ids_buf[..b * seq], (b, seq), &self.device)?;
-        // candle's modernbert resolves the 4-D mask itself via
-        // `prepare_4d_attention_mask(.., DType::F32, ..)`; F32 in is
-        // what it expects.
-        let mask = Tensor::from_slice(&mask_buf[..b * seq], (b, seq), &self.device)?;
-        let hidden = self.encoder.forward(&ids, &mask)?; // [b, seq, h]
-        // ST CrossEncoder head: CLS pooling (token 0) → Dense·GELU →
-        // LayerNorm → Dense → the single relevance logit.
-        let cls = hidden.i((.., 0, ..))?.contiguous()?; // [b, h]
-        let x = self.dense1.forward(&cls)?.gelu_erf()?;
-        let x = self.norm.forward(&x)?;
-        let logits = self.dense2.forward(&x)?; // [b, 1]
-        Ok(logits
-            .to_dtype(DType::F32)?
-            .to_vec2::<f32>()?
-            .into_iter()
-            .map(|row| row.first().copied().unwrap_or(0.0))
-            .collect())
+        crate::candle_encoder::length_batched(&encs, |batch| {
+            let (ids, mask) = crate::candle_encoder::pack_ids_mask(
+                batch,
+                &mut ids_buf,
+                &mut mask_buf,
+                |m| m as f32,
+                &self.device,
+            )?;
+            let hidden = self.encoder.forward(&ids, &mask)?; // [b, seq, h]
+            // ST CrossEncoder head: CLS pooling (token 0) →
+            // Dense·GELU → LayerNorm → Dense → the single relevance
+            // logit.
+            let cls = hidden.i((.., 0, ..))?.contiguous()?; // [b, h]
+            let x = self.dense1.forward(&cls)?.gelu_erf()?;
+            let x = self.norm.forward(&x)?;
+            let logits = self.dense2.forward(&x)?; // [b, 1]
+            Ok(logits
+                .to_dtype(DType::F32)?
+                .to_vec2::<f32>()?
+                .into_iter()
+                .map(|row| row.first().copied().unwrap_or(0.0))
+                .collect())
+        })
     }
 }

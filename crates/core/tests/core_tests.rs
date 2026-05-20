@@ -118,22 +118,22 @@ fn select_model_rejects_unknown_name() {
 
 #[test]
 fn normalize_hf_repo_strips_url_forms_to_id() {
-    let id = "Xenova/multilingual-e5-base";
+    let id = "minishlab/potion-base-32M";
     assert_eq!(normalize_hf_repo(id), id);
     assert_eq!(
-        normalize_hf_repo("https://huggingface.co/Xenova/multilingual-e5-base"),
+        normalize_hf_repo("https://huggingface.co/minishlab/potion-base-32M"),
         id
     );
     assert_eq!(
-        normalize_hf_repo("http://www.huggingface.co/Xenova/multilingual-e5-base/tree/main"),
+        normalize_hf_repo("http://www.huggingface.co/minishlab/potion-base-32M/tree/main"),
         id
     );
     assert_eq!(
-        normalize_hf_repo("  hf.co/Xenova/multilingual-e5-base/  "),
+        normalize_hf_repo("  hf.co/minishlab/potion-base-32M/  "),
         id
     );
     assert_eq!(
-        normalize_hf_repo("https://huggingface.co/Xenova/multilingual-e5-base/blob/main/onnx"),
+        normalize_hf_repo("https://huggingface.co/minishlab/potion-base-32M/blob/main/onnx"),
         id
     );
 }

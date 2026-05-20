@@ -32,7 +32,7 @@ enum Backend {
     /// its own tiny inference path.
     #[cfg(not(feature = "bench-stub"))]
     Static(StaticModel2Vec),
-    /// Transformer ONNX (e5 / jina-code / nomic / any user-defined
+    /// Transformer ONNX (jina-code / CodeRankEmbed / any user-defined
     /// encoder) run directly on ORT with bounded fixed-shape batches.
     #[cfg(not(feature = "bench-stub"))]
     Onnx(OnnxEncoder),
@@ -44,8 +44,8 @@ enum Backend {
 
 /// Resolved per-model input/output contract: the query/document
 /// prefixes and the pooling. Built once at construction from a built-in
-/// `ModelSpec`, a registered `CustomModel`, or an e5 bool (remote /
-/// local-onnx-path), then carried on the `Embedder`.
+/// `ModelSpec`, a registered `CustomModel`, or raw config prefixes
+/// (remote / local-onnx-path), then carried on the `Embedder`.
 #[derive(Clone)]
 pub struct Contract {
     query_prefix: Option<String>,
@@ -55,8 +55,8 @@ pub struct Contract {
 
 impl Contract {
     /// Just a query/doc prefix pair, mean pooling — the remote and
-    /// local-`onnx_path` paths (no per-model pooling knob there; e5 is
-    /// simply `query: `/`passage: `, nomic `search_query: `/…).
+    /// local-`onnx_path` paths (no per-model pooling knob there; e.g.
+    /// nomic ⇒ `search_query: `/`search_document: `).
     #[cfg(not(feature = "bench-stub"))]
     fn from_prefixes(query_prefix: Option<String>, doc_prefix: Option<String>) -> Self {
         Self {
@@ -849,7 +849,7 @@ pub(crate) fn build_onnx_session(
     max_length: usize,
     cache_dir: &Path,
 ) -> Result<(Session, Tokenizer, i64, bool)> {
-    // pad_token_id lives in config.json (default 0, the BERT/e5/jina
+    // pad_token_id lives in config.json (default 0, the BERT/jina
     // convention) — pure padding, masked out anyway.
     let pad_id = serde_json::from_slice::<serde_json::Value>(&udm.tokenizer_files.config_file)
         .ok()
@@ -1158,8 +1158,8 @@ fn pool_rank3(pooling: Pooling, t: &Rank3, r: usize) -> Vec<f32> {
     }
 }
 
-/// L2-normalize (e5 / jina-code / nomic embeddings are unit-norm; this
-/// matches sentence-transformers and keeps cosine == dot).
+/// L2-normalize (jina-code / nomic / CodeRankEmbed embeddings are
+/// unit-norm; this matches sentence-transformers and keeps cosine == dot).
 #[cfg(not(feature = "bench-stub"))]
 fn l2_normalized(v: &[f32]) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1429,7 +1429,7 @@ impl Embedder {
 
     /// Wrap a loaded Model2Vec matrix as a static-backend embedder.
     /// Shared by the declared-Static built-in and the auto-detected
-    /// custom Model2Vec repo (they differ only in name / e5 prefix).
+    /// custom Model2Vec repo (they differ only in name / prefix pair).
     #[cfg(not(feature = "bench-stub"))]
     fn from_static(sm: StaticModel2Vec, model_name: String, contract: Contract) -> Self {
         Self {
@@ -1553,8 +1553,7 @@ impl Embedder {
     }
 
     /// Embed a search query, prepending the model's `query_prefix`
-    /// (e5 `query: `, nomic `search_query: `, a CLS-model instruction,
-    /// or the full Qwen3 `Instruct: …\nQuery:` template) when set.
+    /// (nomic `search_query: `, or a CLS-model task instruction) when set.
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         let owned;
         let q: &str = match &self.contract.query_prefix {

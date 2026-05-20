@@ -11,11 +11,75 @@
 use crate::embedder::load_tokenizer;
 use crate::error::{Error, Result};
 use candle_core::safetensors::MmapedSafetensors;
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor, WithDType};
 use candle_nn::VarBuilder;
 use candle_transformers::models::nomic_bert::{Config as NomicConfig, NomicBertModel};
 use std::path::Path;
 use tokenizers::{Encoding, Tokenizer};
+
+/// Length-bucketed forward driver shared by `CandleEncoder` and
+/// `CandleReranker`. Both models pad each sub-batch row to the
+/// window's longest, and both pay O(seq²) attention, so the input
+/// indices are sorted by token length before being fed in
+/// `candle_batch()`-sized windows; per-row results scatter back to
+/// the caller's input order. Generic over the per-row result `R` (an
+/// embedding `Vec<f32>` for the encoder, a single logit `f32` for the
+/// reranker) so the only thing that differs at the call site is the
+/// `forward` closure body (model + pooling/head).
+pub(crate) fn length_batched<R: Default + Clone>(
+    encs: &[Encoding],
+    mut forward: impl FnMut(&[&Encoding]) -> Result<Vec<R>>,
+) -> Result<Vec<R>> {
+    let mut order: Vec<usize> = (0..encs.len()).collect();
+    order.sort_unstable_by_key(|&i| encs[i].get_ids().len());
+    let mut out = vec![R::default(); encs.len()];
+    for window in order.chunks(candle_batch()) {
+        let batch: Vec<&Encoding> = window.iter().map(|&i| &encs[i]).collect();
+        for (&slot, item) in window.iter().zip(forward(&batch)?) {
+            out[slot] = item;
+        }
+    }
+    Ok(out)
+}
+
+/// Stage one length-homogeneous sub-batch into `(ids, mask)` candle
+/// tensors of shape `[b, seq]`. The mask scalar `M` is parameterized
+/// because the two models need different dtypes: NomicBert's
+/// `where_cond` needs an integer mask (`u8`); ModernBERT's
+/// `prepare_4d_attention_mask` adds the mask to f32 scores, so it
+/// must arrive as `f32`. Host buffers are reused across windows
+/// (resize+zero, never a per-window `vec!`).
+pub(crate) fn pack_ids_mask<M>(
+    encs: &[&Encoding],
+    ids_buf: &mut Vec<u32>,
+    mask_buf: &mut Vec<M>,
+    mask_cvt: impl Fn(u32) -> M,
+    device: &Device,
+) -> Result<(Tensor, Tensor)>
+where
+    M: WithDType + Copy + Default,
+{
+    let b = encs.len();
+    let seq = encs
+        .iter()
+        .map(|e| e.get_ids().len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    ids_buf.clear();
+    ids_buf.resize(b * seq, 0);
+    mask_buf.clear();
+    mask_buf.resize(b * seq, M::default());
+    for (r, e) in encs.iter().enumerate() {
+        for (j, (&id, &m)) in e.get_ids().iter().zip(e.get_attention_mask()).enumerate() {
+            ids_buf[r * seq + j] = id;
+            mask_buf[r * seq + j] = mask_cvt(m);
+        }
+    }
+    let ids = Tensor::from_slice(&ids_buf[..b * seq], (b, seq), device)?;
+    let mask = Tensor::from_slice(&mask_buf[..b * seq], (b, seq), device)?;
+    Ok((ids, mask))
+}
 
 /// candle tensor-op errors are uniform ("a GPU op failed") on the hot
 /// path — one `From` lets `run()` use `?`. `build()` keeps explicit
@@ -144,76 +208,21 @@ impl CandleEncoder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        // Tokenize once, then sub-batch by ascending token length:
-        // NomicBert attention is O(seq^2) and every row in a sub-batch
-        // pads up to its longest, so a single long chunk mixed with
-        // short ones makes the short ones pay the long seq. Sorting
-        // groups similar lengths; results are scattered back to the
-        // caller's order so this stays transparent to the collector.
         let encs = self
             .tok
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| Error::Embed(format!("candle: tokenize: {e}")))?;
-        let mut order: Vec<usize> = (0..encs.len()).collect();
-        order.sort_unstable_by_key(|&i| encs[i].get_ids().len());
-
-        // ids/mask host staging reused across sub-batches (one alloc,
-        // grown to the largest window, instead of two `vec!`s per
-        // forward).
         let mut ids_buf: Vec<u32> = Vec::new();
         let mut mask_buf: Vec<u8> = Vec::new();
-        let mut out = vec![Vec::new(); texts.len()];
-        for window in order.chunks(candle_batch()) {
-            let batch: Vec<&Encoding> = window.iter().map(|&i| &encs[i]).collect();
-            for (&slot, vec) in window
-                .iter()
-                .zip(self.forward(&batch, &mut ids_buf, &mut mask_buf)?)
-            {
-                out[slot] = vec;
-            }
-        }
-        Ok(out)
-    }
-
-    /// One forward on a length-homogeneous sub-batch (`seq` = its
-    /// longest, already truncated to `max_length`). candle is not the
-    /// ONNX CoreML EP, so a per-call dynamic shape is fine — no
-    /// graph-per-shape blowup.
-    fn forward(
-        &self,
-        encs: &[&Encoding],
-        ids_buf: &mut Vec<u32>,
-        mask_buf: &mut Vec<u8>,
-    ) -> Result<Vec<Vec<f32>>> {
-        let b = encs.len();
-        let seq = encs
-            .iter()
-            .map(|e| e.get_ids().len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        // resize(.., 0) reuses the existing capacity after the first
-        // window and re-zeros it (pad positions must be 0).
-        ids_buf.clear();
-        ids_buf.resize(b * seq, 0);
-        mask_buf.clear();
-        mask_buf.resize(b * seq, 0);
-        for (r, e) in encs.iter().enumerate() {
-            for (j, (&id, &m)) in e.get_ids().iter().zip(e.get_attention_mask()).enumerate() {
-                ids_buf[r * seq + j] = id;
-                mask_buf[r * seq + j] = m as u8;
-            }
-        }
-        let ids = Tensor::from_slice(&ids_buf[..b * seq], (b, seq), &self.device)?;
-        // U8 mask: candle's NomicBert masking uses `where_cond`, whose
-        // predicate must be an integer dtype, not f32.
-        let mask = Tensor::from_slice(&mask_buf[..b * seq], (b, seq), &self.device)?;
-
-        let hidden = self.model.forward(&ids, None, Some(&mask))?; // [b, seq, n_embd]
-        // Upcast CLS to f32: L2 norm + readback stay full-precision
-        // regardless of the model dtype (no-op when weights are f32).
-        let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
-        let norm = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
-        Ok(cls.broadcast_div(&norm)?.to_vec2::<f32>()?)
+        length_batched(&encs, |batch| {
+            let (ids, mask) =
+                pack_ids_mask(batch, &mut ids_buf, &mut mask_buf, |m| m as u8, &self.device)?;
+            let hidden = self.model.forward(&ids, None, Some(&mask))?; // [b, seq, n_embd]
+            // CLS upcast to f32 so the L2 norm + readback stay
+            // full-precision when the model loaded at f16/bf16.
+            let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
+            let norm = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
+            Ok(cls.broadcast_div(&norm)?.to_vec2::<f32>()?)
+        })
     }
 }

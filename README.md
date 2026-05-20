@@ -82,14 +82,14 @@ embedding-search init [path]                     create the index, first sync
 embedding-search sync [path] [--force]           re-index (progress bar)
 embedding-search search <query> [-n N] [--json] [--in DIR|FILE] [--no-sync]
 embedding-search status [path]                   index/sync health
-embedding-search set <model> [path]              per-project model override (re-index)
 embedding-search clear [path]                     delete the index (rebuild on next sync)
 embedding-search serve | --mcp                   run MCP server on stdio
 embedding-search debug files [path]              list indexed files
 embedding-search debug chunks <file> [--path .]  show a file's chunks
 embedding-search models list                     built-in + custom models
-embedding-search models set-default <name>       switch model (re-index)
-embedding-search models add --name X --repo ORG/M [--onnx-file F] [--query-prefix .. --doc-prefix .. --pooling mean|cls|last-token | --e5_prefix] | --url URL
+embedding-search models set <name>                per-project (CWD) model override (re-index)
+embedding-search models set-default <name>       switch the global default (re-index)
+embedding-search models add --name X --repo ORG/M [--onnx-file F] [--query-prefix .. --doc-prefix .. --pooling mean|cls|last-token] | --url URL
 embedding-search models remove <name>            unregister + delete cached weights (alias: rm)
 embedding-search models add-remote --name N --base-url U --model M   add + select a remote
 ```
@@ -107,8 +107,8 @@ command (CLI or MCP), so it's there to edit. Delete it to reset.
 default   = "sensiarion/CodeRankEmbed-f16"    # SOTA code (f16 Metal / int8 CPU)
 max_length = 512                              # token cap; keep ≈ max_chunk_bytes/4
 # onnx_path = "/path/to/model-dir"            # custom local ONNX (see below)
-# onnx_query_prefix = "query: "               # e.g. e5; omit for none
-# onnx_doc_prefix   = "passage: "             # e.g. e5; omit for none
+# onnx_query_prefix = "search_query: "        # e.g. nomic; omit for none
+# onnx_doc_prefix   = "search_document: "     # e.g. nomic; omit for none
 
 [backend]
 execution_provider = "auto"   # auto | coreml | cuda | cpu
@@ -204,8 +204,8 @@ dimensions = 0                            # omit/0 → probed at startup
 batch_size  = 64          # texts per request (OpenAI `input` array)
 concurrency = 4           # max parallel in-flight requests
 timeout_seconds = 60
-# query_prefix = "query: "    # e.g. e5 remote; omit for OpenAI/DeepSeek
-# doc_prefix   = "passage: "  # e.g. e5 remote; omit for OpenAI/DeepSeek
+# query_prefix = "search_query: "    # e.g. nomic remote; omit for OpenAI/DeepSeek
+# doc_prefix   = "search_document: "  # e.g. nomic remote; omit for OpenAI/DeepSeek
 ```
 
 Batching uses the OpenAI `input` array (`batch_size` texts/request);
@@ -264,9 +264,8 @@ static `potion-multilingual-128M` — bag-of-token-means (weaker raw
 code relevance, but re-rank is **on by default** for it and largely
 closes the gap); the onnx encoders are slower on the first sync of a
 large repo (incremental after). `models add` registers any other HF
-model — set `--query-prefix`/`--doc-prefix`/`--pooling` (or
-`--e5_prefix`) for its contract, and `--onnx-file` to pick a specific
-quantization; its `config.json` architecture is checked at add time
+model — set `--query-prefix`/`--doc-prefix`/`--pooling` for its
+contract, and `--onnx-file` to pick a specific quantization; its `config.json` architecture is checked at add time
 and an unsupported one (LM-head / KV-cache decoder) is rejected up
 front.
 
@@ -324,10 +323,12 @@ auto-rebuilds on next run (or force it: `embedding-search sync --force`).
 
 #### Per-project override
 
-`models set-default` is global. To pin a model for **one repo only**:
+`models set-default` is global. To pin a model for **one repo only**
+(the current working directory):
 
 ```
-embedding-search set minishlab/potion-base-32M [path]
+cd /path/to/project
+embedding-search models set minishlab/potion-base-32M
 ```
 
 This writes a minimal `<project>/.embedding-search/config.toml` that is
@@ -370,7 +371,8 @@ canonicalized to the `org/name` id):
 # HF repo id …
 embedding-search models add --name bge-small --repo Xenova/bge-small-en-v1.5
 # … or the full page URL (with or without /tree/main) — both work
-embedding-search models add --name e5 --repo https://huggingface.co/Xenova/multilingual-e5-base
+embedding-search models add --name mxbai \
+  --repo https://huggingface.co/mixedbread-ai/mxbai-embed-large-v1
 
 # onnx-community / large models: weights split into a .onnx_data
 # sidecar — fetched automatically. --onnx-file picks the variant.
@@ -389,7 +391,9 @@ embedding-search models add --name my-model \
 embedding-search sync --force   # re-index with the new model
 ```
 
-Add `--e5-prefix` if it's an e5-style model. `--onnx-file
+Pass `--query-prefix` / `--doc-prefix` if the model needs them
+(e.g. `--query-prefix "search_query: " --doc-prefix "search_document: "`
+for a nomic-style model). `--onnx-file
 model_q4f16.onnx` (or `onnx/model_q4.onnx`) pulls that exact file —
 the **sole weight selector** (q4, q4f16, bnb4, uint8, quantized…);
 omit it and the loader uses `onnx/model.onnx` with a flat
@@ -415,8 +419,8 @@ RAM. Just `models add --name potion --repo minishlab/potion-multilingual-128M`.
 ```toml
 [model]
 onnx_path        = "/models/bge-small-en" # dir or direct .onnx file
-# onnx_query_prefix = "query: "           # e.g. e5; omit for none
-# onnx_doc_prefix   = "passage: "         # e.g. e5; omit for none
+# onnx_query_prefix = "search_query: "    # e.g. nomic; omit for none
+# onnx_doc_prefix   = "search_document: " # e.g. nomic; omit for none
 ```
 
 Same file requirements as above (a directory with `onnx/model.onnx`
@@ -432,8 +436,8 @@ If a model has **only** PyTorch weights, export it once with
 
 ```bash
 pip install "optimum[exporters]"
-optimum-cli export onnx -m intfloat/e5-small-v2 /models/e5-small-v2
-# → writes model.onnx + the tokenizer files into /models/e5-small-v2
+optimum-cli export onnx -m mixedbread-ai/mxbai-embed-large-v1 /models/mxbai
+# → writes model.onnx + the tokenizer files into /models/mxbai
 ```
 
 ### Using a remote API instead (OpenAI / DeepSeek / LiteLLM)
@@ -463,7 +467,8 @@ the active `[remote]` block, and sets `provider = "openai"`.
 `models set-default <name>` re-selects any registered model — built-in,
 `[[custom_model]]`, or `[[remote_model]]` — flipping the provider as
 needed. `--dimensions` is optional (probed from a live request if
-omitted); add `--e5-prefix` only if the remote serves an e5 model.
+omitted); add `--query-prefix`/`--doc-prefix` only if the remote
+needs them (e.g. a self-hosted nomic-style model).
 Works the same for OpenAI, a self-hosted
 [LiteLLM](https://github.com/BerriAI/litellm) proxy, TEI, or Ollama —
 just change `--base-url`/`--model`. See *External embeddings service*
