@@ -1,6 +1,6 @@
 ---
 name: embedding-search
-description: Semantic (meaning-based) code search over the current project via the embedding-search MCP. Use for conceptual/relationship code questions ("how does auth work", "where is X enforced") instead of grep/find; grep only for exact known strings.
+description: Semantic (meaning-based) code search over the current project. Use it for any code exploration or where/how/what questions about an unfamiliar codebase — prefer over grep/find. Grep only for exact known strings. Also use inside subagents (Explore, general-purpose, Task), where the plugin's hook-injected reminders don't reach.
 ---
 
 # embedding-search — semantic code search
@@ -8,6 +8,26 @@ description: Semantic (meaning-based) code search over the current project via t
 This server gives you **meaning-based** code search over the current
 project. Prefer it over grep whenever the *concept* matters more than
 an exact string.
+
+## Subagent note
+
+The plugin's SessionStart and UserPromptSubmit hooks inject reminders
+into the **top-level** session only — they do not reach subagent
+contexts (Explore, general-purpose, Task). Inside a subagent this
+skill is your standing directive: reach for `search_code` first for
+any code exploration.
+
+## Loading the tool when deferred
+
+`mcp__embedding-search__search_code` may appear under "deferred tools"
+with its schema not loaded — direct calls then fail with
+`InputValidationError`. Load it once:
+
+```
+ToolSearch query: "select:mcp__embedding-search__search_code"
+```
+
+The tool becomes callable.
 
 ## Use `search_code` for
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.8
+
+- Skill description rewritten to trigger in subagent (Explore /
+  general-purpose / Task) contexts where the SessionStart and
+  UserPromptSubmit hooks don't propagate. New "Subagent note" and
+  "Loading the tool when deferred" sections in `SKILL.md` make the
+  skill self-sufficient inside nested agents and explain the one
+  `ToolSearch select:` step needed when the tool schema is deferred.
+
 ## 0.2.7
 
 - **BREAKING:** per-project model override moved from the top-level
