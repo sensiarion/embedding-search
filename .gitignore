@@ -5,6 +5,8 @@ benchmarks/csn/
 benchmarks/results/*.jsonl
 # Per-run directories from `cargo xtask eval` / `xtask golden`
 benchmarks/results/*/
+# Detached sweep logs from scripts/run-bench.sh
+benchmarks/results/bench-*.log
 *.usearch
 .idea/
 .claude/

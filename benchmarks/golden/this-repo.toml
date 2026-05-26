@@ -337,3 +337,224 @@ expected = "crates/core/src/db.rs"
 [[query]]
 text = "dimensions and tokenizer of a registered model"
 expected = "crates/core/src/config.rs"
+
+# --- third expansion (added 2026-05-26) ---
+# Push past 80 for statistical signal. Add paraphrase variants on hot
+# files plus newly-anchored sub-concepts (merkle root, RRF k, sequence
+# allocation, attention mask, etc.). Each pair still has a single best
+# file — paraphrases differ from earlier text strings.
+
+# sync.rs deeper anchors
+[[query]]
+text = "merkle hash of the whole indexed tree"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "propagate file deletions through the index"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "emit a warning when the repo is too large"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "two-phase plan and apply for incremental sync"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "queue work items between walker and embedder"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "include model name in the content fingerprint"
+expected = "crates/core/src/sync.rs"
+
+# embedder.rs sub-concepts
+[[query]]
+text = "dispatch table between static onnx remote candle"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "mean pool over last hidden state"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "max pool variant for sentence embedding"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "feed an attention mask alongside input ids"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "load a user supplied local ONNX file"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "guard against masked language model export"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "warm the embedder with a single throwaway probe"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "embed a batch of strings end to end"
+expected = "crates/core/src/embedder.rs"
+
+# search.rs deeper anchors
+[[query]]
+text = "over-fetch candidates before rerank or scope filter"
+expected = "crates/core/src/search.rs"
+
+[[query]]
+text = "RRF fusion with k=60 constant"
+expected = "crates/core/src/search.rs"
+
+[[query]]
+text = "result row with file path range and score"
+expected = "crates/core/src/search.rs"
+
+# config.rs deeper anchors
+[[query]]
+text = "search runtime configuration knobs"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "cross encoder rerank batch and top n"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "ONNX execution provider preference list"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "paths to index database and cache directory"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "deep merge of user toml over the default"
+expected = "crates/core/src/config.rs"
+
+# db.rs deeper anchors
+[[query]]
+text = "assign the next vector id sequence"
+expected = "crates/core/src/db.rs"
+
+[[query]]
+text = "replace all chunks for a single file in one transaction"
+expected = "crates/core/src/db.rs"
+
+[[query]]
+text = "fetch one chunk row by vector id"
+expected = "crates/core/src/db.rs"
+
+# chunker.rs deeper anchors
+[[query]]
+text = "fallback line-based chunking for unknown language"
+expected = "crates/core/src/chunker.rs"
+
+[[query]]
+text = "concatenate small adjacent AST nodes into one chunk"
+expected = "crates/core/src/chunker.rs"
+
+[[query]]
+text = "enforce a maximum chunk byte budget"
+expected = "crates/core/src/chunker.rs"
+
+# candle paths
+[[query]]
+text = "load safetensors weights for a candle encoder"
+expected = "crates/core/src/candle_encoder.rs"
+
+[[query]]
+text = "cross encoder pooler logit head"
+expected = "crates/core/src/candle_rerank.rs"
+
+[[query]]
+text = "Metal device selection on Apple Silicon"
+expected = "crates/core/src/candle_encoder.rs"
+
+# rerank.rs deeper
+[[query]]
+text = "candle metal versus onnx cpu reranker dispatch"
+expected = "crates/core/src/rerank.rs"
+
+[[query]]
+text = "score query-document pairs in batches"
+expected = "crates/core/src/rerank.rs"
+
+# vector.rs deeper
+[[query]]
+text = "fetch a stored vector by integer key"
+expected = "crates/core/src/vector.rs"
+
+# mcp.rs deeper
+[[query]]
+text = "expose a tool with an input JSON schema example"
+expected = "crates/cli/src/mcp.rs"
+
+[[query]]
+text = "MCP error mapping helper function"
+expected = "crates/cli/src/mcp.rs"
+
+[[query]]
+text = "expose set-model tool over MCP"
+expected = "crates/cli/src/mcp.rs"
+
+# main.rs deeper
+[[query]]
+text = "init subcommand creates the per project config"
+expected = "crates/cli/src/main.rs"
+
+[[query]]
+text = "search subcommand prints results to stdout"
+expected = "crates/cli/src/main.rs"
+
+[[query]]
+text = "guard a CLI command against indexing the home directory"
+expected = "crates/cli/src/main.rs"
+
+[[query]]
+text = "warn when a sync ran slower than threshold"
+expected = "crates/cli/src/main.rs"
+
+# root.rs deeper
+[[query]]
+text = "use git rev-parse to find the workspace root"
+expected = "crates/cli/src/root.rs"
+
+# xtask
+[[query]]
+text = "compare every model in the registry against a baseline"
+expected = "xtask/src/main.rs"
+
+[[query]]
+text = "per-query JSONL record with model and score"
+expected = "xtask/src/main.rs"
+
+[[query]]
+text = "load TOML corpus file into golden query structs"
+expected = "xtask/src/main.rs"
+
+[[query]]
+text = "compute MRR Recall NDCG metrics from a results list"
+expected = "xtask/src/main.rs"
+
+# tests
+[[query]]
+text = "test that touching mtime alone does not re-embed"
+expected = "crates/core/tests/reindex.rs"
+
+[[query]]
+text = "synthetic test fixture for code search ranking"
+expected = "crates/core/tests/search_synthetic.rs"
+
+[[query]]
+text = "end to end CLI command tests"
+expected = "crates/core/tests/core_tests.rs"
+
+# inspect.rs
+[[query]]
+text = "list every file and its indexed chunk count"
+expected = "crates/core/src/inspect.rs"
