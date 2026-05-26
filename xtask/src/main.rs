@@ -552,12 +552,14 @@ fn eval_model(
 /// build and `process::exit`s first. Present only so `main` compiles
 /// under the alias feature.
 #[cfg(feature = "bench-stub")]
+#[allow(clippy::too_many_arguments)]
 fn eval(
     _cn: usize,
     _qn: usize,
     _rr: bool,
     _tn: usize,
     _ml: usize,
+    _rerank_model: &str,
     _models: &str,
     _out: Option<&Path>,
 ) -> Result<()> {
@@ -572,6 +574,7 @@ fn eval(
     do_rerank: bool,
     rerank_top_n: usize,
     rerank_max_len: usize,
+    rerank_model_override: &str,
     models_selector: &str,
     out_override: Option<&Path>,
 ) -> Result<()> {
@@ -635,6 +638,12 @@ fn eval(
         rcfg.model.default = "minishlab/potion-base-32M".to_string();
         rcfg.model.max_length = rerank_max_len;
         rcfg.rerank.top_n = rerank_top_n;
+        // B6: --rerank-model lets the eval swap reranker checkpoints
+        // (ettin baseline vs mxbai-rerank-base-v2 / bge-reranker-v2-m3
+        // for ablation). Empty string → keep the DEFAULT_RERANK_MODEL.
+        if !rerank_model_override.is_empty() {
+            rcfg.rerank.model = rerank_model_override.to_string();
+        }
         match Reranker::load(&rcfg) {
             Ok(r) => Some(r),
             Err(e) => {
@@ -787,6 +796,190 @@ fn render_report(
     out
 }
 
+/// One hand-curated retrieval pair: `text` is a natural-language query,
+/// `expected` is the project-relative path that should appear in the
+/// search results. See `benchmarks/golden/this-repo.toml`.
+#[cfg(not(feature = "bench-stub"))]
+#[derive(serde::Deserialize)]
+struct GoldenQuery {
+    text: String,
+    expected: String,
+}
+
+#[cfg(not(feature = "bench-stub"))]
+#[derive(serde::Deserialize)]
+struct GoldenCorpus {
+    #[serde(rename = "query")]
+    queries: Vec<GoldenQuery>,
+}
+
+#[cfg(not(feature = "bench-stub"))]
+fn load_golden(path: &Path) -> Result<Vec<GoldenQuery>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let corpus: GoldenCorpus = toml::from_str(&text).context("parse golden corpus")?;
+    Ok(corpus.queries)
+}
+
+/// Recursive copy that skips heavy / index-state subtrees (`.git`,
+/// `target`, `.embedding-search`, `node_modules`). Used by `golden` to
+/// snapshot the source root into a tempdir so the per-model index
+/// builds don't trample the working tree's .embedding-search/.
+#[cfg(not(feature = "bench-stub"))]
+fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
+    const SKIP: &[&str] = &[".git", "target", ".embedding-search", "node_modules"];
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let e = entry?;
+        let name = e.file_name();
+        if SKIP.iter().any(|s| std::ffi::OsStr::new(s) == name) {
+            continue;
+        }
+        let to = dst.join(&name);
+        if e.file_type()?.is_dir() {
+            copy_dir_filtered(&e.path(), &to)?;
+        } else {
+            std::fs::copy(e.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Sync a fresh per-model index over `src_root`, then run every golden
+/// query through it and record where the expected file landed. Index
+/// lives in a tempdir so the working repo's `.embedding-search/` is
+/// untouched.
+#[cfg(not(feature = "bench-stub"))]
+fn eval_golden_model(
+    name: &str,
+    src_root: &Path,
+    queries: &[GoldenQuery],
+    k: usize,
+) -> Result<serde_json::Value> {
+    let mut cfg = Config::default();
+    cfg.model.default = name.to_string();
+
+    let work = tempfile::tempdir()?;
+    copy_dir_filtered(src_root, work.path()).context("snapshot src")?;
+    let eng = SyncEngine::new(work.path().to_path_buf(), cfg)
+        .with_context(|| format!("open engine for {name}"))?;
+    let t0 = Instant::now();
+    let stats = eng
+        .sync(true, |_| {})
+        .with_context(|| format!("sync {name}"))?;
+    let sync_ms = t0.elapsed().as_millis() as u64;
+
+    let mut metrics = Metrics::default();
+    let mut misses: Vec<String> = Vec::new();
+    let t1 = Instant::now();
+    for q in queries {
+        let hits = eng.search(&q.text, k, None).context("search")?;
+        match hits.iter().position(|h| h.file_path == q.expected) {
+            Some(i) => metrics.add(i + 1),
+            None => {
+                metrics.n += 1; // count miss in n so MRR averages over the full set
+                misses.push(q.text.clone());
+            }
+        }
+    }
+    let search_ms = t1.elapsed().as_millis() as u64;
+
+    Ok(metrics.record(serde_json::json!({
+        "model": name,
+        "variant": "golden",
+        "queries": queries.len(),
+        "misses": misses.len(),
+        "indexed_files": stats.files_indexed,
+        "chunks": stats.chunks_total,
+        "sync_ms": sync_ms,
+        "search_ms": search_ms,
+        "k": k,
+    })))
+}
+
+#[cfg(feature = "bench-stub")]
+fn golden(
+    _src: &Path,
+    _corpus: &Path,
+    _models: &str,
+    _k: usize,
+    _out: Option<&Path>,
+) -> Result<()> {
+    unreachable!("golden re-execs into a non-stub build via run_eval")
+}
+
+#[cfg(not(feature = "bench-stub"))]
+fn golden(
+    src_root: &Path,
+    corpus_path: &Path,
+    models_selector: &str,
+    k: usize,
+    out_override: Option<&Path>,
+) -> Result<()> {
+    let queries = load_golden(corpus_path)?;
+    anyhow::ensure!(!queries.is_empty(), "golden corpus has no queries");
+    let models = pick_models(models_selector);
+    anyhow::ensure!(!models.is_empty(), "no models selected");
+    println!(
+        "golden retrieval — {} queries, {} models, k={}\n",
+        queries.len(),
+        models.len(),
+        k,
+    );
+
+    let root = workspace_root();
+    let commit = git_short();
+    let date = chrono::Utc::now().to_rfc3339();
+    let host = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let run_dir = match out_override {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let slug = date.replace(':', "-");
+            root.join("benchmarks/results")
+                .join(format!("golden-{slug}-{commit}"))
+        }
+    };
+    std::fs::create_dir_all(&run_dir)?;
+    let results_jsonl = run_dir.join("results.jsonl");
+
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    for name in &models {
+        let mut rec = match eval_golden_model(name, src_root, &queries, k) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("model '{name}' failed: {e:#}");
+                serde_json::json!({
+                    "model": name,
+                    "variant": "golden",
+                    "error": format!("{e:#}"),
+                })
+            }
+        };
+        let obj = rec.as_object_mut().unwrap();
+        obj.insert("commit".into(), serde_json::json!(commit));
+        obj.insert("date".into(), serde_json::json!(date));
+        obj.insert("host".into(), serde_json::json!(host));
+        obj.insert(
+            "corpus".into(),
+            serde_json::json!(corpus_path.display().to_string()),
+        );
+        println!("{}", serde_json::to_string_pretty(&rec)?);
+        append_jsonl(&results_jsonl, &rec)?;
+        records.push(rec);
+    }
+
+    let report = render_report(
+        &records,
+        &date,
+        &commit,
+        &host,
+        queries.len(),
+        queries.len(),
+    );
+    std::fs::write(run_dir.join("REPORT.md"), report).context("write REPORT.md")?;
+    println!("\nresults  -> {}", results_jsonl.display());
+    Ok(())
+}
+
 /// Under the `cargo xtask` alias the build carries `bench-stub` (the
 /// deterministic hash embedder) — meaningless for a retrieval metric.
 /// Re-exec the eval through a real (non-stub) build once.
@@ -843,13 +1036,34 @@ fn main() -> Result<()> {
             let models = arg(&args, "--models", "");
             let out_raw = arg(&args, "--output", "");
             let out_path = (!out_raw.is_empty()).then(|| PathBuf::from(out_raw));
+            let rerank_model = arg(&args, "--rerank-model", "");
             eval(
                 corpus,
                 queries,
                 do_rerank,
                 rr_top_n,
                 rr_max_len,
+                &rerank_model,
                 &models,
+                out_path.as_deref(),
+            )?;
+        }
+        "golden" => {
+            // Re-exec under a non-stub build so a real model runs.
+            run_eval(&args)?;
+            // Defaults: this repo's own golden corpus, indexed from
+            // CWD into a temp copy; top-k 10; baseline model set.
+            let corpus = arg(&args, "--corpus", "benchmarks/golden/this-repo.toml");
+            let src = arg(&args, "--src", ".");
+            let k: usize = arg(&args, "-k", "10").parse().unwrap_or(10);
+            let models = arg(&args, "--models", "");
+            let out_raw = arg(&args, "--output", "");
+            let out_path = (!out_raw.is_empty()).then(|| PathBuf::from(out_raw));
+            golden(
+                Path::new(&src),
+                Path::new(&corpus),
+                &models,
+                k,
                 out_path.as_deref(),
             )?;
         }
@@ -859,17 +1073,33 @@ fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <gen-corpus|bench|eval|bump> \
-                 [--files N] [--seed S] [--corpus N] [--queries N] \
-                 [--models a,b,c|all] [--output DIR] \
-                 [--rerank [--rerank-top-n N] [--rerank-max-len N]] \
-                 [--out DIR]\n\n\
+                "usage: cargo xtask <gen-corpus|bench|eval|golden|bump> \
+                 [--files N] [--seed S] [--corpus N|PATH] [--queries N] \
+                 [--models a,b,c|all] [--output DIR] [--src PATH] [-k N] \
+                 [--rerank [--rerank-top-n N] [--rerank-max-len N] \
+                 [--rerank-model REPO]] [--out DIR]\n\n\
+                 golden:\n  \
+                 Run real-repo retrieval over hand-curated \
+                 (query → expected_file) pairs from a TOML corpus.\n  \
+                 --corpus  path to TOML file (default: \
+                 benchmarks/golden/this-repo.toml)\n  \
+                 --src     project root to index (default: `.`)\n  \
+                 -k        top-k cutoff (default: 10)\n  \
+                 --models  same selector as `eval` (default: 3-model \
+                 baseline)\n  \
+                 --output  per-run results dir (default: \
+                 benchmarks/results/golden-<date>-<commit>/)\n\n\
                  eval:\n  \
                  --models  comma-separated names, or `all` for every \
                  entry in SUPPORTED_MODELS (default: 3-model baseline).\n  \
                  --output  per-run results dir (default: \
                  benchmarks/results/<date>-<commit>/). Writes \
-                 results.jsonl + REPORT.md."
+                 results.jsonl + REPORT.md.\n  \
+                 --rerank-model  HF repo of the cross-encoder for \
+                 --rerank (default: cross-encoder/ettin-reranker-68m-v1). \
+                 Use to ablate alternatives such as \
+                 mixedbread-ai/mxbai-rerank-base-v2 or \
+                 BAAI/bge-reranker-v2-m3."
             );
             std::process::exit(2);
         }

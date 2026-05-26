@@ -1,0 +1,82 @@
+# Hand-curated (query → expected_file) pairs for this repo.
+#
+# Used by `cargo xtask golden --corpus benchmarks/golden/this-repo.toml`.
+# A query passes if the search result whose `file_path` matches `expected`
+# appears within the configured top-k. The harness reports
+# (mrr@k, recall@1, recall@5, ndcg@k) per model.
+#
+# Add new queries whenever a feature lands: each pair anchors a piece of
+# the codebase to its conceptual NL phrasing — drift becomes visible
+# in the next eval.
+
+[[query]]
+text = "where is reranking applied"
+expected = "crates/core/src/rerank.rs"
+
+[[query]]
+text = "candle metal reranker"
+expected = "crates/core/src/candle_rerank.rs"
+
+[[query]]
+text = "how is the index incrementally synced"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "blake3 chunk hashing"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "tree-sitter chunker"
+expected = "crates/core/src/chunker.rs"
+
+[[query]]
+text = "small chunk concatenation"
+expected = "crates/core/src/chunker.rs"
+
+[[query]]
+text = "vector index usearch wrapper"
+expected = "crates/core/src/vector.rs"
+
+[[query]]
+text = "BM25 plus dense reciprocal rank fusion"
+expected = "crates/core/src/search.rs"
+
+[[query]]
+text = "ONNX runtime embedder backend"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "candle metal embedding encoder"
+expected = "crates/core/src/candle_encoder.rs"
+
+[[query]]
+text = "model registry built-in list"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "SQLite chunks file schema"
+expected = "crates/core/src/db.rs"
+
+[[query]]
+text = "cross-file chunk reuse copy path"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "MCP server search tool handler"
+expected = "crates/cli/src/mcp.rs"
+
+[[query]]
+text = "CLI subcommand parsing"
+expected = "crates/cli/src/main.rs"
+
+[[query]]
+text = "project root resolution and HOME refusal"
+expected = "crates/cli/src/root.rs"
+
+[[query]]
+text = "agent skill description for semantic search"
+expected = "crates/cli/src/SKILL.md"
+
+[[query]]
+text = "xtask eval driver markdown report"
+expected = "xtask/src/main.rs"

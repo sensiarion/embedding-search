@@ -45,6 +45,15 @@
     tooling that reads it.
   - A bad model no longer aborts the sweep; its failure shows up in
     REPORT.md under an `## errors` section.
+  - `--rerank-model REPO` swaps the cross-encoder for ablation
+    (default: ettin; alternatives: `mixedbread-ai/mxbai-rerank-base-v2`,
+    `BAAI/bge-reranker-v2-m3`).
+- New `cargo xtask golden` subcommand: runs hand-curated
+  `(query → expected_file)` pairs through a real `SyncEngine` over a
+  filtered snapshot of the source root (default
+  `benchmarks/golden/this-repo.toml`). Reports MRR@k / Recall@1 / R@5 /
+  NDCG@k + sync/search latency per model. Use to compare candidates on
+  this repo's own retrieval before picking a default.
 
 ## 0.2.8
 

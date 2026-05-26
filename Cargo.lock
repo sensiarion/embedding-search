@@ -4935,8 +4935,10 @@ dependencies = [
  "chrono",
  "embedding-search-core",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
+ "toml",
  "ureq",
 ]
 

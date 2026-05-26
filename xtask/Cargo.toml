@@ -25,3 +25,7 @@ libc = "0.2"
 # `eval` pulls the CodeSearchNet retrieval set from the HF
 # datasets-server (cached locally after the first run).
 ureq.workspace = true
+# `golden` reads a (query, expected_file) TOML corpus and runs it
+# through a real SyncEngine. Workspace toml = serde-only adapter.
+toml.workspace = true
+serde = { version = "1", features = ["derive"] }
