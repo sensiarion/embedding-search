@@ -1038,6 +1038,50 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         rerank_default: true,
         note: "Model2Vec static, English, smallest+fastest, lowest RAM",
     },
+    // EmbeddingGemma 300M — Google's multilingual encoder built on the
+    // Gemma3 backbone with a trained dense projection head on top of
+    // mean-pooled hidden states. Matryoshka 128/256/512/768. Apache-
+    // adjacent Gemma license (free use with the usual carveouts), so
+    // user-opt-in by default but registered as a built-in so it gets
+    // a real RAM estimate and prompt-aware prefixes.
+    //
+    // Runtime: ONNX int8 from `onnx-community/embeddinggemma-300m-ONNX`
+    // (`onnx/model_quantized.onnx` + `model_quantized.onnx_data` ≈ 309 MB).
+    // Google's model card explicitly warns activations don't survive
+    // fp16, so the fp16 export is NOT a default. CoreML EP can't
+    // accelerate the dynamic-shape attention graph either (same shape
+    // pattern as NomicBert in this repo), so this is pinned to the
+    // CPU provider via `AccelCpu { accel, cpu }` → off-CUDA, cpu wins.
+    //
+    // No candle Metal path yet: `candle-transformers::models::gemma3`
+    // exposes the causal-LM head only — no mean-pool or dense head
+    // exit, would need a fork to wire the 2_Dense projection. Tracked
+    // as a follow-up; for now the project's `models add` route can be
+    // used to bench the f32 ONNX in CUDA environments.
+    //
+    // Task prompts come from the official model card:
+    //   query → `task: code retrieval | query: <text>`
+    //   doc   → `title: none | text: <text>`
+    ModelSpec {
+        name: "google/embeddinggemma-300m",
+        dimensions: 768,
+        code: 4,
+        multilingual: 5,
+        params_m: 308,
+        query_prefix: Some("task: code retrieval | query: "),
+        doc_prefix: Some("title: none | text: "),
+        pooling: Pooling::Mean,
+        hf_repo: Some("onnx-community/embeddinggemma-300m-ONNX"),
+        onnx: OnnxFiles::AccelCpu {
+            accel: "onnx/model.onnx",
+            cpu: "onnx/model_quantized.onnx",
+        },
+        candle_repo: None,
+        arch: ModelArch::OnnxEncoder,
+        rec_batch: 4,
+        rerank_default: false,
+        note: "EmbeddingGemma 300M, Matryoshka 128-768, multilingual (int8 CPU)",
+    },
 ];
 
 pub fn model_spec(name: &str) -> Option<&'static ModelSpec> {

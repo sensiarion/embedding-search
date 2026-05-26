@@ -80,3 +80,260 @@ expected = "crates/cli/src/SKILL.md"
 [[query]]
 text = "xtask eval driver markdown report"
 expected = "xtask/src/main.rs"
+
+# --- expanded corpus (added 2026-05-26) ---
+# Below queries broaden coverage beyond the initial 18: deeper sync,
+# embedder, config, search-side, MCP-side, and tooling concepts. They
+# stress retrieval against natural-language intent, not symbol lookup.
+
+[[query]]
+text = "honor gitignore when walking the project tree"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "limit indexing threads based on cpu count"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "prepend language hint to chunk before embedding"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "rebuild the index when the embedding model changes"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "discover sibling git worktrees of this checkout"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "delete every index artifact on disk"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "progress events emitted during sync"
+expected = "crates/core/src/sync.rs"
+
+[[query]]
+text = "pick the tree-sitter grammar from file extension"
+expected = "crates/core/src/chunker.rs"
+
+[[query]]
+text = "pull function or struct name out of the AST"
+expected = "crates/core/src/chunker.rs"
+
+[[query]]
+text = "enable CoreML execution provider for ONNX"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "fall back to static model2vec embedding"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "remote HTTP embedding service client"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "L2 normalize an embedding"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "reject a decoder model exported with kv cache"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "deterministic stub vector for offline tests"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "load an ONNX model from a user supplied URL"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "estimate peak RAM per model"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "default directories excluded from the walk"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "merge user TOML config over defaults"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "remote provider API key from environment"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "mean vs cls token pooling enum"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "schema migration version bump"
+expected = "crates/core/src/db.rs"
+
+[[query]]
+text = "scope filter results to a subdirectory"
+expected = "crates/core/src/search.rs"
+
+[[query]]
+text = "lookup enclosing parent chunk for a hit"
+expected = "crates/core/src/search.rs"
+
+[[query]]
+text = "compute line number from byte offset"
+expected = "crates/core/src/search.rs"
+
+[[query]]
+text = "warn the agent when the index is still warming up"
+expected = "crates/cli/src/mcp.rs"
+
+[[query]]
+text = "MCP tool to switch the active embedding model"
+expected = "crates/cli/src/mcp.rs"
+
+[[query]]
+text = "register a custom HuggingFace model from the CLI"
+expected = "crates/cli/src/main.rs"
+
+[[query]]
+text = "verify a model loads end to end before saving"
+expected = "crates/cli/src/main.rs"
+
+[[query]]
+text = "refuse to index the user home directory"
+expected = "crates/cli/src/root.rs"
+
+[[query]]
+text = "render a markdown comparison table from eval rows"
+expected = "xtask/src/main.rs"
+
+[[query]]
+text = "snapshot the source tree into a sandbox for benchmarks"
+expected = "xtask/src/main.rs"
+
+# --- second expansion (added 2026-05-26) ---
+# Push corpus past statistical noise floor and broaden test/coverage of
+# subtle behaviors (neighbor surfacing, model tagging, MCP plumbing).
+
+[[query]]
+text = "show prev and next sibling chunks around a hit"
+expected = "crates/core/src/search.rs"
+
+[[query]]
+text = "rerank fused candidates with cross encoder"
+expected = "crates/core/src/search.rs"
+
+[[query]]
+text = "BM25 idf and term frequency scoring"
+expected = "crates/core/src/search.rs"
+
+[[query]]
+text = "tag a model name with its quantization variant"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "filesystem-safe slug for a model cache directory"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "HTTP agent with timeout for HuggingFace downloads"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "parse JSON embeddings from a remote API response"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "decide which ONNX file variant to fetch"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "BERT versus decoder model architecture enum"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "normalize a HuggingFace repo identifier string"
+expected = "crates/core/src/config.rs"
+
+[[query]]
+text = "ONNX model sidecar weights filenames"
+expected = "crates/core/src/embedder.rs"
+
+[[query]]
+text = "select model subset from a CSV flag"
+expected = "xtask/src/main.rs"
+
+[[query]]
+text = "MCP server initialize handshake response"
+expected = "crates/cli/src/mcp.rs"
+
+[[query]]
+text = "embed the skill markdown into server instructions"
+expected = "crates/cli/src/mcp.rs"
+
+[[query]]
+text = "wrap a search payload with a warmup hint"
+expected = "crates/cli/src/mcp.rs"
+
+[[query]]
+text = "print index statistics counts and bytes"
+expected = "crates/cli/src/main.rs"
+
+[[query]]
+text = "remove a registered custom model"
+expected = "crates/cli/src/main.rs"
+
+[[query]]
+text = "list registered embedding models with RAM estimate"
+expected = "crates/cli/src/main.rs"
+
+[[query]]
+text = "force a full reindex from scratch"
+expected = "crates/cli/src/main.rs"
+
+[[query]]
+text = "test that gitignore is honored during the walk"
+expected = "crates/core/tests/gitignore.rs"
+
+[[query]]
+text = "test that renaming a file reuses its vectors"
+expected = "crates/core/tests/reindex.rs"
+
+[[query]]
+text = "test that switching models rebuilds the index"
+expected = "crates/core/tests/reindex.rs"
+
+[[query]]
+text = "synthetic dataset retrieval quality test"
+expected = "crates/core/tests/quality.rs"
+
+[[query]]
+text = "shared helpers for setting up a temp index in tests"
+expected = "crates/core/tests/common/mod.rs"
+
+[[query]]
+text = "inspector dumps chunk rows for debugging"
+expected = "crates/core/src/inspect.rs"
+
+[[query]]
+text = "HNSW search index backed by usearch"
+expected = "crates/core/src/vector.rs"
+
+[[query]]
+text = "tree-sitter language spec table"
+expected = "crates/core/src/chunker.rs"
+
+[[query]]
+text = "look up a vector by content hash for cross-file reuse"
+expected = "crates/core/src/db.rs"
+
+[[query]]
+text = "bump file mtime and size after a no-op resync"
+expected = "crates/core/src/db.rs"
+
+[[query]]
+text = "dimensions and tokenizer of a registered model"
+expected = "crates/core/src/config.rs"
