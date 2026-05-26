@@ -287,22 +287,26 @@ metric). `base` and the `+rerank` column are the **same 200 queries /
 
 | model | MRR@10 | R@1 | NDCG@10 | MRR@10 +rerank | index (docs/s) | rerank default |
 |-------|-------|-----|---------|----------------|----------------|----------------|
-| google/embeddinggemma-300m | **0.938** | **0.910** | **0.949** | **0.942** | ~2 | off |
+| google/embeddinggemma-300m | **0.940** | **0.915** | **0.951** | **0.944** | ~12 | off |
 | sensiarion/CodeRankEmbed-f16 **(default)** | 0.929 | 0.910 | 0.937 | 0.928 | ~21 | off |
 | minishlab/potion-base-32M | 0.730 | 0.660 | 0.759 | **0.849** | ~11 000 | on |
 | minishlab/potion-multilingual-128M | 0.716 | 0.635 | 0.749 | **0.858** | ~7 600 | on |
 
 `google/embeddinggemma-300m` edges past the default on every quality
-metric (+0.009 MRR base, +0.014 MRR with re-rank, +0.012 NDCG) and
-matches it on Recall@1 (0.910). On Apple Silicon it runs on the
-**Metal GPU via candle (f32)** — about 2.8× the indexing throughput
-of the int8 ONNX CPU fallback, and on this repo's 130-query golden
-set it also beats the ONNX path on MRR (0.444 vs 0.437). The HF repo
-is license-gated; the first sync needs a token with `canReadGatedRepos`
-or it falls back to int8 ONNX with a single warn line. Pick
-CodeRankEmbed as the speed-balanced default; switch to EmbeddingGemma
-when query language is multilingual or NL ("how does X work") rather
-than identifier-shaped. The default transformer is markedly more
+metric (+0.011 MRR base, +0.016 MRR with re-rank, +0.014 NDCG) and
+beats it on Recall@1 (0.915 vs 0.910). The numbers above are the
+**candle Metal f32 path** measured on Apple Silicon; the int8 ONNX
+CPU fallback (used off-Mac, on a headless host, or when the gated
+HF download fails) scores ~0.002 MRR / ~0.005 R@1 lower and indexes
+~6× slower (~2 docs/s vs ~12 docs/s) — quality-equivalent within
+noise, latency very much not. On this repo's 130-query golden set
+the Metal path also beats the ONNX one on MRR (0.444 vs 0.437) at
+~2.8× the indexing throughput. The HF repo is license-gated; the
+first sync needs a token with `canReadGatedRepos` or it falls back
+to int8 ONNX with a single warn line. Pick CodeRankEmbed as the
+speed-balanced default; switch to EmbeddingGemma when query language
+is multilingual or NL ("how does X work") rather than identifier-
+shaped. The default transformer is markedly more
 accurate than the static models; the static models trade ~0.20 MRR
 for a **~500× faster index** (the right pick on a large repo or when
 sync speed matters). Cross-encoder re-rank
