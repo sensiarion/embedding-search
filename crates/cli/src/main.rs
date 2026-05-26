@@ -1,11 +1,12 @@
 mod mcp;
+mod root;
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use embedding_search_core::{
     config::{
-        normalize_hf_repo, CustomModel, EmbeddingProvider, Pooling, RemoteConfig,
-        DEFAULT_MODEL, SUPPORTED_MODELS,
+        normalize_hf_repo, CustomModel, EmbeddingProvider, Pooling, RemoteConfig, DEFAULT_MODEL,
+        SUPPORTED_MODELS,
     },
     embedder::custom_model_cache_dir,
     embedder::Embedder,
@@ -42,15 +43,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create the index for a directory and run the first sync
-    Init {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
-    /// Re-index a directory
+    /// Create the index for a directory and run the first sync. Omit
+    /// `path` to resolve via `EMBEDDING_SEARCH_PROJECT_DIR` → git
+    /// toplevel → CWD; pass a path to override.
+    Init { path: Option<PathBuf> },
+    /// Re-index a directory. Path resolution as in `init`.
     Sync {
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// Ignore the hash cache and re-embed everything
         #[arg(long)]
         force: bool,
@@ -62,8 +61,9 @@ enum Command {
         n: usize,
         #[arg(long)]
         json: bool,
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
+        /// Project root. Omit to resolve via env / git toplevel / CWD.
+        #[arg(long)]
+        path: Option<PathBuf>,
         /// Skip the freshness sync and search the index as-is
         #[arg(long)]
         no_sync: bool,
@@ -73,16 +73,10 @@ enum Command {
         scope: Option<String>,
     },
     /// Index / sync status (model, counts, freshness, search backend)
-    Status {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
+    Status { path: Option<PathBuf> },
     /// Delete a project's index (embeddings + metadata). The next
     /// init/sync rebuilds from scratch.
-    Clear {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
+    Clear { path: Option<PathBuf> },
     /// Start MCP server mode on stdio
     Serve,
     /// Inspection helpers
@@ -100,15 +94,12 @@ enum Command {
 #[derive(Subcommand)]
 enum DebugCmd {
     /// List indexed files with chunk counts
-    Files {
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
+    Files { path: Option<PathBuf> },
     /// Show all chunks for one file
     Chunks {
         file: String,
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -240,14 +231,14 @@ fn verify_and_save(cfg: &Config, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn engine(path: &Path) -> Result<SyncEngine> {
-    let dir = std::fs::canonicalize(path).context("resolve path")?;
+fn engine(path: Option<&Path>) -> Result<SyncEngine> {
+    let dir = root::resolve_project_root(path)?;
     let cfg = Config::load_for_project(&dir).context("load config")?;
     SyncEngine::new(dir, cfg).context("open engine")
 }
 
-fn inspector(path: &Path) -> Result<Inspector> {
-    let dir = std::fs::canonicalize(path).context("resolve path")?;
+fn inspector(path: Option<&Path>) -> Result<Inspector> {
+    let dir = root::resolve_project_root(path)?;
     let cfg = Config::load_for_project(&dir).context("load config")?;
     Inspector::open(&dir, cfg).context("open inspector")
 }
@@ -369,9 +360,7 @@ fn main() -> Result<()> {
         Command::Serve => return mcp::run(),
         Command::Clear { path } => {
             use embedding_search_core::{config::PROJECT_INDEX_DIR, sync::wipe_index};
-            let dir = std::fs::canonicalize(&path)
-                .context("resolve path")?
-                .join(PROJECT_INDEX_DIR);
+            let dir = root::resolve_project_root(path.as_deref())?.join(PROJECT_INDEX_DIR);
             if dir.is_dir() {
                 wipe_index(&dir).context("clear index")?;
                 println!("Cleared index at {}", dir.display());
@@ -380,12 +369,12 @@ fn main() -> Result<()> {
             }
         }
         Command::Init { path } => {
-            let eng = engine(&path)?;
+            let eng = engine(path.as_deref())?;
             println!("Index at {}", eng.index_dir().display());
             run_sync(&eng, true, Report::Summary)?;
         }
         Command::Sync { path, force } => {
-            let eng = engine(&path)?;
+            let eng = engine(path.as_deref())?;
             run_sync(&eng, force, Report::Summary)?;
         }
         Command::Search {
@@ -396,7 +385,7 @@ fn main() -> Result<()> {
             no_sync,
             scope,
         } => {
-            let eng = engine(&path)?;
+            let eng = engine(path.as_deref())?;
             // Cursor-style throttle: only resync if the last one is
             // older than sync.resync_interval_minutes (~10 min), not on
             // every search. Hash-incremental, bars self-clear.
@@ -440,16 +429,15 @@ fn main() -> Result<()> {
             }
         }
         Command::Status { path } => {
-            let s = inspector(&path)?.status()?;
+            let dir = root::resolve_project_root(path.as_deref())?;
+            let s = inspector(Some(&dir))?.status()?;
             match Config::config_path() {
                 Ok(p) => println!("config:         {}", p.display()),
                 Err(e) => println!("config:         <unavailable: {e}>"),
             }
-            if let Ok(dir) = std::fs::canonicalize(&path) {
-                let po = Config::project_override_path(&dir);
-                if po.exists() {
-                    println!("project config: {} (overrides global)", po.display());
-                }
+            let po = Config::project_override_path(&dir);
+            if po.exists() {
+                println!("project config: {} (overrides global)", po.display());
             }
             println!("model:          {}", s.model);
             println!("files:          {}", s.files);
@@ -471,7 +459,7 @@ fn main() -> Result<()> {
         }
         Command::Debug { cmd } => match cmd {
             DebugCmd::Files { path } => {
-                let ins = inspector(&path)?;
+                let ins = inspector(path.as_deref())?;
                 let files = ins.list_files()?;
                 println!("{} files indexed", files.len());
                 for f in files {
@@ -479,7 +467,7 @@ fn main() -> Result<()> {
                 }
             }
             DebugCmd::Chunks { file, path } => {
-                let ins = inspector(&path)?;
+                let ins = inspector(path.as_deref())?;
                 let chunks = ins.chunks_for_file(&file)?;
                 if chunks.is_empty() {
                     println!("No chunks for {file}");

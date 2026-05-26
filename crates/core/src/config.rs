@@ -495,7 +495,10 @@ impl Config {
         let mut merged = read_toml_table(&global_path);
         // `read_toml_table` yields an empty table when the override is
         // absent (merging it is a no-op) — no exists() race/stat.
-        merge_toml(&mut merged, read_toml_table(&Self::project_override_path(project_dir)));
+        merge_toml(
+            &mut merged,
+            read_toml_table(&Self::project_override_path(project_dir)),
+        );
         merged
             .try_into()
             .map_err(|e| Error::Config(format!("merge project config: {e}")))
@@ -524,8 +527,7 @@ impl Config {
             );
             root.insert(
                 "remote".into(),
-                toml::Value::try_from(&self.remote)
-                    .map_err(|e| Error::Config(e.to_string()))?,
+                toml::Value::try_from(&self.remote).map_err(|e| Error::Config(e.to_string()))?,
             );
         }
         root.insert("model".into(), toml::Value::Table(model));
@@ -601,9 +603,9 @@ impl Config {
     /// static potion models, OFF for the SOTA CodeRank/jina
     /// bi-encoders), and OFF for a custom/remote model with no spec.
     pub fn rerank_enabled(&self) -> bool {
-        self.rerank.enabled.unwrap_or_else(|| {
-            model_spec(&self.model.default).is_some_and(|s| s.rerank_default)
-        })
+        self.rerank
+            .enabled
+            .unwrap_or_else(|| model_spec(&self.model.default).is_some_and(|s| s.rerank_default))
     }
 
     /// Identity of everything that invalidates an existing index when
@@ -883,18 +885,35 @@ impl ModelSpec {
         matches!(self.arch, ModelArch::Static)
     }
 
-    /// Rough resident RAM in MB: weights + a fixed working-set
-    /// overhead. Model2Vec is a static f32 matrix with no ONNX Runtime
-    /// (~30 MB tokenizer overhead, 4 B/param); an `OnnxEncoder`
-    /// built-in ships its int8 export on CPU (~1 B/param) under ORT's
-    /// ~350 MB. A coarse estimate for `models list` display only.
+    /// Rough resident RAM in MB for the actual runtime path on the
+    /// current host: weights + a fixed working-set overhead. Static
+    /// Model2Vec is a flat f32 matrix (~30 MB tokenizer, 4 B/param).
+    /// Encoder models on Apple Silicon take the candle Metal path when
+    /// `candle_repo` is set (f16 weights at 2 B/param vs f32 at 4 B/param,
+    /// ~150 MB Metal/candle overhead); otherwise they ship the int8 ONNX
+    /// export under ORT (~350 MB, ~1 B/param). A coarse estimate for
+    /// `models list` display only.
     pub fn ram_mb(&self) -> u32 {
         let (overhead, bytes_per_param) = if self.is_static() {
             (30.0, 4.0)
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            match self.candle_bytes_per_param() {
+                Some(b) => (150.0, b),
+                None => (350.0, 1.0),
+            }
         } else {
             (350.0, 1.0)
         };
         (self.params_m as f32 * bytes_per_param + overhead) as u32
+    }
+
+    /// Bytes/param on the candle Metal path, inferred from a `*-f16`
+    /// suffix on `candle_repo` (project convention — the sensiarion
+    /// quant variants tag their repo name; everything else is native
+    /// f32). `None` when there is no candle path at all.
+    fn candle_bytes_per_param(&self) -> Option<f32> {
+        let r = self.candle_repo?;
+        Some(if r.ends_with("-f16") { 2.0 } else { 4.0 })
     }
 }
 

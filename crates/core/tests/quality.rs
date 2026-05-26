@@ -400,9 +400,7 @@ fn candle_encoder_throughput() {
     let snippet = "pub fn handle(req: Request) -> Result<Response> { \
                    let ctx = build_context(&req)?; validate(&ctx)?; \
                    Ok(dispatch(ctx).await?) } ";
-    let chunks: Vec<String> = (0..600)
-        .map(|i| snippet.repeat(1 + (i % 30)))
-        .collect();
+    let chunks: Vec<String> = (0..600).map(|i| snippet.repeat(1 + (i % 30))).collect();
     let refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
 
     // Warm up (model already resident; this primes pipelines/caches).
@@ -414,8 +412,8 @@ fn candle_encoder_throughput() {
         emb.embed_documents(&refs, cfg.embed_batch()).unwrap();
     }
     let per = t.elapsed().as_secs_f64() / iters as f64;
-    let batch = std::env::var("EMBEDDING_SEARCH_CANDLE_BATCH")
-        .unwrap_or_else(|_| "32 (default)".into());
+    let batch =
+        std::env::var("EMBEDDING_SEARCH_CANDLE_BATCH").unwrap_or_else(|_| "32 (default)".into());
     eprintln!(
         "candle_batch={batch}  {} chunks  {:.3} s/run  {:.0} chunks/s",
         refs.len(),

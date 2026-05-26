@@ -3,7 +3,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-const SCHEMA_VERSION: &str = "3";
+const SCHEMA_VERSION: &str = "4";
 
 #[derive(Debug, Clone)]
 pub struct NewChunk {
@@ -13,8 +13,18 @@ pub struct NewChunk {
     pub end_byte: i64,
     pub node_type: String,
     pub language: String,
-    /// blake3 of `content` — identity for cross-edit vector reuse.
+    /// blake3(header ++ body) — exact embed-text identity. Used for
+    /// intra-file `Same` reuse where the path/symbol/sig haven't
+    /// shifted.
     pub content_hash: String,
+    /// blake3(body) only — used for cross-file `Copy` reuse so that
+    /// renames / branch switches that place identical code at a new
+    /// path can copy the source embedding instead of re-running the
+    /// model. The source vector was computed against the OLD header,
+    /// so the new chunk's embedding will be very slightly off (header
+    /// is a few dozen tokens out of hundreds — dominant body signal
+    /// is preserved). Acceptable trade-off for skipping the embed.
+    pub body_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -84,10 +94,12 @@ impl Db {
                 node_type   TEXT NOT NULL DEFAULT 'lines',
                 language    TEXT NOT NULL DEFAULT '',
                 content_hash TEXT NOT NULL DEFAULT '',
+                body_hash    TEXT NOT NULL DEFAULT '',
                 vector_id   INTEGER NOT NULL UNIQUE
             );
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id   ON chunks(file_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_vector_id ON chunks(vector_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_body_hash ON chunks(body_hash);
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -113,6 +125,14 @@ impl Db {
             );
             let _ = self.conn.execute(
                 "ALTER TABLE chunks ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+            let _ = self.conn.execute(
+                "ALTER TABLE chunks ADD COLUMN body_hash TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+            let _ = self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_body_hash ON chunks(body_hash)",
                 [],
             );
         }
@@ -196,6 +216,24 @@ impl Db {
         Ok(id)
     }
 
+    /// Refresh just the (mtime, size) on an existing `files` row. Used
+    /// by the sync's "content unchanged but stat moved" path (`git
+    /// checkout` rewrites mtimes on every touched file): without this
+    /// the fast `(mtime, size)` short-circuit in `classify` would never
+    /// fire on a subsequent sync, and we'd re-read + re-hash the same
+    /// bytes on every tick forever. Returns whether the row existed —
+    /// `false` means a concurrent delete (Clear / external mutation)
+    /// removed the row between the sync's snapshot and this call, so
+    /// the caller can re-insert with `upsert_file` instead of silently
+    /// leaving the file unindexed.
+    pub fn touch_file_meta(&self, path: &str, mtime: i64, size: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE files SET last_modified = ?2, size = ?3 WHERE path = ?1",
+            params![path, mtime, size],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn vector_ids_for_file(&self, file_id: i64) -> Result<Vec<u64>> {
         let mut stmt = self
             .conn
@@ -217,6 +255,32 @@ impl Db {
         self.conn
             .execute("DELETE FROM files WHERE id = ?1", [file_id])?;
         Ok(vids)
+    }
+
+    /// Look up a vector_id for ANY chunk in the index whose BODY
+    /// matches `body_hash`, regardless of which file owns it or what
+    /// path/symbol prefix it had at index time. Used for cross-file
+    /// `Copy` reuse: a chunk that moved across files (rename or `git
+    /// checkout` to a branch with the same code at a new path) can
+    /// copy the existing embedding instead of re-running the model.
+    /// The source vector was computed against the OLD header — accept
+    /// a small embedding drift in exchange for skipping the embed.
+    /// Returns the lowest matching vector_id for determinism. Filters
+    /// out legacy chunks with empty body_hash (pre-v4 schema).
+    pub fn lookup_vector_id_by_body_hash(&self, body_hash: &str) -> Result<Option<u64>> {
+        if body_hash.is_empty() {
+            return Ok(None);
+        }
+        let row: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MIN(vector_id) FROM chunks WHERE body_hash = ?1",
+                [body_hash],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(row.map(|v| v as u64))
     }
 
     /// `(content_hash, vector_id)` for every chunk of a file, in
@@ -260,8 +324,8 @@ impl Db {
             let mut stmt = tx.prepare(
                 "INSERT INTO chunks(file_id, chunk_index, content, start_byte,
                                     end_byte, node_type, language,
-                                    content_hash, vector_id)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                    content_hash, body_hash, vector_id)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for (c, vid) in chunks.iter().zip(vector_ids.iter()) {
                 stmt.execute(params![
@@ -273,6 +337,7 @@ impl Db {
                     c.node_type,
                     c.language,
                     c.content_hash,
+                    c.body_hash,
                     *vid as i64,
                 ])?;
             }

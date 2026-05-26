@@ -347,7 +347,13 @@ impl Chunker {
                 end = c.end_byte;
                 merged = true;
             } else {
-                flush(start, end, std::mem::take(&mut node_type), symbol.take(), merged);
+                flush(
+                    start,
+                    end,
+                    std::mem::take(&mut node_type),
+                    symbol.take(),
+                    merged,
+                );
                 start = c.start_byte;
                 end = c.end_byte;
                 node_type = c.node_type;

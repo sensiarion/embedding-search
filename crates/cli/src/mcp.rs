@@ -17,6 +17,11 @@ use tokio::sync::Semaphore;
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchCodeArgs {
     /// Natural-language query describing the code you want to find.
+    /// Phrase as intent ("how does X work", "where is Y enforced"), not
+    /// as a literal string match — use grep for exact tokens.
+    #[schemars(example = &"how does reranking work")]
+    #[schemars(example = &"where is the index incrementally synced")]
+    #[schemars(example = &"chunking strategy for source files")]
     pub query: String,
     /// Max results (default 10, max 50).
     #[serde(default)]
@@ -108,7 +113,9 @@ impl Server {
     }
 
     #[tool(
-        description = "Semantic code search across the current project. Use this FIRST instead of grep for: conceptual questions (\"how does auth work?\"), finding related code across files, exploring an unfamiliar codebase, identifying patterns/relationships, and queries where the exact terminology is unknown. (Keep using grep for exact strings: error messages, a known symbol name, imports, TODO/FIXME.) Optional `path` scopes the search to a directory or file. Returns ranked chunks; each has file_path, language, node_type, signature (def line), 1-based start_line/end_line, content, score, an optional parent (enclosing impl/class/module) and prev/next sibling refs (no body). Use start_line/parent to locate code and decide whether to open the file; expand via prev/next only when needed."
+        title = "Semantic code search",
+        annotations(read_only_hint = true),
+        description = "Meaning-based code search over the current project. PREFER over grep/find for any question about *what the code does or where intent lives*: \"how does auth work?\", \"where is rate limiting enforced?\", \"what handles billing?\", \"chunking strategy for source files\". Falls back gracefully while the index warms up. Keep using grep for exact strings (a known symbol, an error message, an import line, TODO/FIXME). Examples that should call this tool: query=\"how does reranking work\" → first hit lives in crates/core/src/rerank.rs; query=\"where is the index incrementally synced\" → crates/core/src/sync.rs; query=\"chunking strategy for source files\" → crates/core/src/chunker.rs. Optional `path` scopes the search to a directory or file. Returns ranked chunks: file_path, language, node_type, signature (def line), 1-based start_line/end_line, content, score, optional parent (enclosing impl/class/module) and prev/next sibling refs (no body). Use start_line/parent to locate code and decide whether to open the file; expand via prev/next only when needed."
     )]
     async fn search_code(
         &self,
@@ -228,7 +235,7 @@ fn skill_instructions() -> &'static str {
     }
 }
 
-#[tool_handler(name = "embedding-search", version = "0.2.8")]
+#[tool_handler(name = "embedding-search", version = "0.2.9")]
 impl ServerHandler for Server {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo::new(
@@ -281,11 +288,10 @@ async fn run_resync(eng: Arc<SyncEngine>, label: &'static str, gate: SyncGate, w
 }
 
 async fn serve_async() -> Result<()> {
-    let project_dir = match std::env::var("EMBEDDING_SEARCH_PROJECT_DIR") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => std::env::current_dir().context("resolve current dir")?,
-    };
-    let project_dir = std::fs::canonicalize(&project_dir).unwrap_or(project_dir);
+    // MCP server has no explicit user path — resolve from
+    // EMBEDDING_SEARCH_PROJECT_DIR, then git toplevel of CWD, then CWD,
+    // refusing $HOME / `/` / ancestors of $HOME.
+    let project_dir = crate::root::resolve_project_root(None)?;
 
     let config = Config::load_for_project(&project_dir).context("load config")?;
     // Catch-up cadence for the background resync loop. Captured before
@@ -354,5 +360,18 @@ mod tests {
         let body = skill_instructions();
         assert!(body.starts_with("# embedding-search"));
         assert!(!body.contains("description:"));
+    }
+
+    #[test]
+    fn search_code_schema_carries_examples() {
+        // Per-field schemars(example = ...) must surface in the JSON
+        // Schema so MCP clients see them.
+        let schema = schemars::schema_for!(SearchCodeArgs);
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(
+            json.contains("\"examples\""),
+            "no examples in schema: {json}"
+        );
+        assert!(json.contains("how does reranking work"), "schema: {json}");
     }
 }

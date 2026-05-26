@@ -58,8 +58,11 @@ fn model_change_rebuilds_without_vector_id_collision() {
 
     // Swapping back to model A must stay clean too.
     drop(e2);
-    let e3 = SyncEngine::new(p.to_path_buf(), cfg_for("minishlab/potion-multilingual-128M"))
-        .expect("engine C");
+    let e3 = SyncEngine::new(
+        p.to_path_buf(),
+        cfg_for("minishlab/potion-multilingual-128M"),
+    )
+    .expect("engine C");
     e3.sync(true, |_| {})
         .expect("third model swap must be clean");
 }
@@ -118,4 +121,122 @@ fn forced_resync_is_stable_with_enriched_hash() {
         .map(|h| h.file_path)
         .collect();
     assert_eq!(got, want, "forced resync changed search results");
+}
+
+/// `git checkout` rewrites file mtimes without changing content. The
+/// fast `(mtime, size)` short-circuit in `classify` won't fire on a
+/// touched file unless the DB row's `last_modified` is bumped to match
+/// the new disk mtime. Without `touch_file_meta` we'd re-read +
+/// re-hash the same bytes on every sync forever.
+#[test]
+fn touch_refreshes_db_meta_so_next_sync_short_circuits() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let p = dir.path();
+    fs::create_dir_all(p.join("src")).expect("mkdir");
+    let f = p.join("src/lib.rs");
+    fs::write(&f, "/// alpha.\npub fn one() {}\n").expect("write");
+
+    let eng =
+        SyncEngine::new(p.to_path_buf(), cfg_for("minishlab/potion-base-32M")).expect("engine");
+    eng.sync(true, |_| {}).expect("initial sync");
+
+    // Bump mtime ~3s into the future without touching the bytes.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&f)
+        .expect("open")
+        .set_modified(later)
+        .expect("set mtime");
+
+    // Hash matches → Touched → DB row refreshed, no re-embed.
+    let s1 = eng.sync(false, |_| {}).expect("touched sync");
+    assert_eq!(s1.files_indexed, 0, "touched file was re-embedded");
+    assert_eq!(s1.files_skipped, 1);
+
+    // Disk and DB mtime must now agree, so the next sync hits the
+    // cheap stat short-circuit instead of re-reading + re-hashing.
+    let disk = f
+        .metadata()
+        .and_then(|m| m.modified())
+        .expect("modified")
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs() as i64;
+    let infos = eng.list_files().expect("list_files");
+    assert_eq!(infos.len(), 1);
+    assert_eq!(
+        infos[0].last_modified, disk,
+        "touch_file_meta did not refresh the DB row"
+    );
+}
+
+/// Cross-file chunk reuse (B7 phase 2). Renaming a file shifts the
+/// embed-text header (path component) so intra-file `Same` reuse
+/// misses, but the header-independent `body_hash` lookup still finds
+/// the source vector → new file Copy-reuses the existing embedding
+/// without re-running the model. Verifies (a) clean indexing across
+/// the rename (no `vector_id UNIQUE` violation) and (b) search keeps
+/// finding the renamed file.
+#[test]
+fn cross_file_copy_survives_rename() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let p = dir.path();
+    fs::create_dir_all(p.join("src")).expect("mkdir");
+    let body = "/// auth helper.\npub fn check_token(t: &str) -> bool { !t.is_empty() }\n";
+    fs::write(p.join("src/a.rs"), body).expect("write a");
+
+    let eng =
+        SyncEngine::new(p.to_path_buf(), cfg_for("minishlab/potion-base-32M")).expect("engine");
+    let s1 = eng.sync(true, |_| {}).expect("sync 1");
+    assert!(s1.chunks_total > 0);
+
+    fs::rename(p.join("src/a.rs"), p.join("src/b.rs")).expect("rename");
+    let s2 = eng.sync(false, |_| {}).expect("sync 2");
+    assert!(s2.files_indexed >= 1, "sync 2 indexed nothing new");
+    assert_eq!(s2.files_deleted, 1, "old path was not retired");
+
+    let hits: Vec<String> = eng
+        .search("check token", 5, None)
+        .expect("search")
+        .into_iter()
+        .map(|h| h.file_path)
+        .collect();
+    assert!(
+        hits.iter().any(|p| p.ends_with("b.rs")),
+        "lost b.rs after rename: {hits:?}"
+    );
+}
+
+/// Two distinct files with identical bodies must index cleanly side-by-
+/// side (no `vector_id UNIQUE` violation — each chunk row owns its
+/// vector_id; Copy duplicates the source bytes into the new key).
+#[test]
+fn cross_file_duplicate_content_indexes_and_searches() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let p = dir.path();
+    fs::create_dir_all(p.join("src")).expect("mkdir");
+    let body = "/// auth helper.\npub fn check_token(t: &str) -> bool { !t.is_empty() }\n";
+    fs::write(p.join("src/a.rs"), body).expect("write a");
+
+    let eng =
+        SyncEngine::new(p.to_path_buf(), cfg_for("minishlab/potion-base-32M")).expect("engine");
+    eng.sync(true, |_| {}).expect("sync 1");
+    fs::write(p.join("src/b.rs"), body).expect("write b");
+    eng.sync(false, |_| {}).expect("sync 2");
+
+    let hits: Vec<String> = eng
+        .search("check token", 5, None)
+        .expect("search")
+        .into_iter()
+        .map(|h| h.file_path)
+        .collect();
+    assert!(
+        hits.iter().any(|p| p.ends_with("a.rs")),
+        "lost a.rs: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|p| p.ends_with("b.rs")),
+        "lost b.rs: {hits:?}"
+    );
 }

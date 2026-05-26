@@ -161,7 +161,9 @@ impl CandleEncoder {
             .map(|(_, v)| v.dtype())
             .ok_or_else(|| Error::Embed("candle: empty safetensors".into()))?;
         let dtype = DType::try_from(native).map_err(|e| {
-            Error::Embed(format!("candle: unsupported safetensors dtype {native:?}: {e}"))
+            Error::Embed(format!(
+                "candle: unsupported safetensors dtype {native:?}: {e}"
+            ))
         })?;
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[safetensors], dtype, &device)
@@ -215,11 +217,16 @@ impl CandleEncoder {
         let mut ids_buf: Vec<u32> = Vec::new();
         let mut mask_buf: Vec<u8> = Vec::new();
         length_batched(&encs, |batch| {
-            let (ids, mask) =
-                pack_ids_mask(batch, &mut ids_buf, &mut mask_buf, |m| m as u8, &self.device)?;
+            let (ids, mask) = pack_ids_mask(
+                batch,
+                &mut ids_buf,
+                &mut mask_buf,
+                |m| m as u8,
+                &self.device,
+            )?;
             let hidden = self.model.forward(&ids, None, Some(&mask))?; // [b, seq, n_embd]
-            // CLS upcast to f32 so the L2 norm + readback stay
-            // full-precision when the model loaded at f16/bf16.
+                                                                       // CLS upcast to f32 so the L2 norm + readback stay
+                                                                       // full-precision when the model loaded at f16/bf16.
             let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?.to_dtype(DType::F32)?;
             let norm = cls.sqr()?.sum_keepdim(1)?.sqrt()?;
             Ok(cls.broadcast_div(&norm)?.to_vec2::<f32>()?)

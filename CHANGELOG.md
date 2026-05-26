@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.9
+
+- **BREAKING (safety):** the MCP server and CLI now refuse to index
+  `$HOME`, `/`, or any ancestor of `$HOME`. Previously a launcher
+  spawning the MCP server from `$HOME` would walk the entire home
+  tree and write `~/.embedding-search/` artifacts; this is the bug
+  that motivated the release. When `HOME` is unset (sandboxed
+  launcher, CI), the resolved path must be inside a git repository —
+  otherwise the indexer refuses to start. To explicitly target a path
+  set `EMBEDDING_SEARCH_PROJECT_DIR` to a git checkout subdir.
+- **BREAKING:** CLI subcommands (`init`, `sync`, `search`, `status`,
+  `clear`, `debug ...`) no longer default `path` to `.`. When the
+  path is omitted, the project root is resolved via
+  `EMBEDDING_SEARCH_PROJECT_DIR` → `git rev-parse --show-toplevel` →
+  CWD. Pass an explicit path to keep the old "use CWD" behavior:
+  `embedding-search sync .` still works.
+- MCP `search_code` tool gets an intent-shaped description with
+  concrete examples and inline `tool_use_examples` in the JSON
+  Schema so Claude prefers it over `Grep` for conceptual queries.
+- `models list` RAM~MB is now platform-aware: the candle Metal path
+  on Apple Silicon reports 2 B/param for `*-f16` repos and 4 B/param
+  for native-f32 repos (`sensiarion/CodeRankEmbed-f16` → ~424 MB,
+  `nomic-ai/CodeRankEmbed` → ~698 MB). Off Apple Silicon both still
+  report the int8 ONNX footprint.
+- Incremental sync hardened:
+  - `git checkout` no longer triggers an endless re-read loop: a
+    file whose bytes match but whose mtime/size moved now refreshes
+    the DB row's stat so the next sync's cheap (mtime, size)
+    short-circuit fires.
+  - Cross-file chunk reuse: a chunk whose body matches one already
+    embedded somewhere (rename, branch switch, copy-paste) now
+    copies the existing vector instead of re-running the model. The
+    source vector encoded the original path's header, so a small
+    embedding drift is accepted in exchange for skipping the embed.
+  - All content/chunk hashing audited to use blake3 end to end.
+- `cargo xtask eval` driver:
+  - `--models a,b,c` or `--models all` selects the model set
+    (defaults preserved).
+  - `--output DIR` overrides the per-run results dir; default
+    layout is `benchmarks/results/<UTC>-<commit>/results.jsonl` +
+    `REPORT.md` (ranked Markdown summary). The legacy
+    `effectiveness.jsonl` history file is still appended for any
+    tooling that reads it.
+  - A bad model no longer aborts the sweep; its failure shows up in
+    REPORT.md under an `## errors` section.
+
 ## 0.2.8
 
 - Skill description rewritten to trigger in subagent (Explore /

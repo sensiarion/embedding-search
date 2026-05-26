@@ -111,8 +111,10 @@ impl CandleReranker {
         // tensor is re-keyed under `model.` before binding.
         let flat = candle_core::safetensors::load(encoder_st, &device)
             .map_err(|e| Error::Embed(format!("candle: ettin encoder: {e}")))?;
-        let prefixed: HashMap<String, Tensor> =
-            flat.into_iter().map(|(k, v)| (format!("model.{k}"), v)).collect();
+        let prefixed: HashMap<String, Tensor> = flat
+            .into_iter()
+            .map(|(k, v)| (format!("model.{k}"), v))
+            .collect();
         let vb = VarBuilder::from_tensors(prefixed, RERANK_DTYPE, &device);
         let encoder = ModernBert::load(vb, &cfg)
             .map_err(|e| Error::Embed(format!("candle: ettin encoder load: {e}")))?;
@@ -178,9 +180,9 @@ impl CandleReranker {
                 &self.device,
             )?;
             let hidden = self.encoder.forward(&ids, &mask)?; // [b, seq, h]
-            // ST CrossEncoder head: CLS pooling (token 0) →
-            // Dense·GELU → LayerNorm → Dense → the single relevance
-            // logit.
+                                                             // ST CrossEncoder head: CLS pooling (token 0) →
+                                                             // Dense·GELU → LayerNorm → Dense → the single relevance
+                                                             // logit.
             let cls = hidden.i((.., 0, ..))?.contiguous()?; // [b, h]
             let x = self.dense1.forward(&cls)?.gelu_erf()?;
             let x = self.norm.forward(&x)?;

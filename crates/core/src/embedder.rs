@@ -4,9 +4,7 @@ use fastembed::TextEmbedding;
 use std::sync::Mutex;
 #[cfg(not(feature = "bench-stub"))]
 use {
-    crate::config::{
-        BackendConfig, EmbeddingProvider, ExecutionProvider, ModelArch, RemoteConfig,
-    },
+    crate::config::{BackendConfig, EmbeddingProvider, ExecutionProvider, ModelArch, RemoteConfig},
     fastembed::{InitOptions, TokenizerFiles, UserDefinedEmbeddingModel},
     ort::{
         session::{builder::GraphOptimizationLevel, Session},
@@ -293,10 +291,7 @@ fn onnx_candidates(explicit: Option<&str>) -> Vec<String> {
     match explicit {
         Some(f) if f.contains('/') => vec![f.to_string()],
         Some(f) => vec![f.to_string(), format!("onnx/{f}")],
-        None => vec![
-            "onnx/model.onnx".to_string(),
-            "model.onnx".to_string(),
-        ],
+        None => vec!["onnx/model.onnx".to_string(), "model.onnx".to_string()],
     }
 }
 
@@ -1610,10 +1605,7 @@ mod tests {
             vec!["onnx/model_q4.onnx"]
         );
         // no explicit ⇒ conventional default + flat fallback
-        assert_eq!(
-            onnx_candidates(None),
-            vec!["onnx/model.onnx", "model.onnx"]
-        );
+        assert_eq!(onnx_candidates(None), vec!["onnx/model.onnx", "model.onnx"]);
     }
 
     #[test]

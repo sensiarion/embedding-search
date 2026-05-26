@@ -304,6 +304,7 @@ fn chunk(idx: i32, content: &str, hash: &str) -> NewChunk {
         node_type: "function".into(),
         language: "rust".into(),
         content_hash: hash.into(),
+        body_hash: hash.into(),
     }
 }
 

@@ -14,19 +14,45 @@ use embedding_search_core::{Config, SyncEngine};
 // don't exist under `bench-stub`, so the whole eval cluster is gated —
 // otherwise the alias build (`cargo xtask bench`/`bump`) won't compile.
 #[cfg(not(feature = "bench-stub"))]
+use embedding_search_core::config::SUPPORTED_MODELS;
+#[cfg(not(feature = "bench-stub"))]
 use embedding_search_core::{embedder::Embedder, rerank::Reranker};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Models the effectiveness eval compares: the two static Model2Vec
-/// builtins + the default f16 transformer. Kept to these per the
-/// project decision (no code-specialized potion builtin).
+/// Default model set the eval compares when `--models` is omitted: the
+/// two static Model2Vec builtins + the default f16 transformer. Pass
+/// `--models a,b,c` (or `--models all` for every entry in
+/// `SUPPORTED_MODELS`) to override.
 #[cfg(not(feature = "bench-stub"))]
-const EVAL_MODELS: &[&str] = &[
+const DEFAULT_EVAL_MODELS: &[&str] = &[
     "minishlab/potion-multilingual-128M",
     "minishlab/potion-base-32M",
     "sensiarion/CodeRankEmbed-f16",
 ];
+
+/// Resolve `--models` selector to a concrete list. `all` expands to
+/// every built-in registered in `SUPPORTED_MODELS`; otherwise it's a
+/// comma-separated explicit list (built-in or registered custom name).
+/// `""` (no flag) falls back to `DEFAULT_EVAL_MODELS`.
+#[cfg(not(feature = "bench-stub"))]
+fn pick_models(selector: &str) -> Vec<String> {
+    if selector.is_empty() {
+        return DEFAULT_EVAL_MODELS.iter().map(|&s| s.to_string()).collect();
+    }
+    if selector == "all" {
+        return SUPPORTED_MODELS
+            .iter()
+            .map(|m| m.name.to_string())
+            .collect();
+    }
+    selector
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 fn arg(args: &[String], key: &str, default: &str) -> String {
     args.iter()
@@ -455,7 +481,11 @@ fn eval_model(
             .collect();
         sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let pos = |order: &[(usize, f32)]| {
-            order.iter().position(|(j, _)| *j == i).map_or(order.len(), |r| r) + 1
+            order
+                .iter()
+                .position(|(j, _)| *j == i)
+                .map_or(order.len(), |r| r)
+                + 1
         };
         base.add(pos(&sims));
 
@@ -483,7 +513,12 @@ fn eval_model(
             Some(r) => r + 1,
             // Gold fell outside the reranked window: keep its cosine
             // position, shifted past the n reranked slots.
-            None => n + sims[n..].iter().position(|(j, _)| *j == i).map_or(0, |r| r + 1),
+            None => {
+                n + sims[n..]
+                    .iter()
+                    .position(|(j, _)| *j == i)
+                    .map_or(0, |r| r + 1)
+            }
         };
         reranked.add(rank);
     }
@@ -517,34 +552,62 @@ fn eval_model(
 /// build and `process::exit`s first. Present only so `main` compiles
 /// under the alias feature.
 #[cfg(feature = "bench-stub")]
-fn eval(_cn: usize, _qn: usize, _rr: bool, _tn: usize, _ml: usize) -> Result<()> {
+fn eval(
+    _cn: usize,
+    _qn: usize,
+    _rr: bool,
+    _tn: usize,
+    _ml: usize,
+    _models: &str,
+    _out: Option<&Path>,
+) -> Result<()> {
     unreachable!("eval re-execs into a non-stub build via run_eval")
 }
 
 #[cfg(not(feature = "bench-stub"))]
+#[allow(clippy::too_many_arguments)]
 fn eval(
     corpus_n: usize,
     queries_n: usize,
     do_rerank: bool,
     rerank_top_n: usize,
     rerank_max_len: usize,
+    models_selector: &str,
+    out_override: Option<&Path>,
 ) -> Result<()> {
     let root = workspace_root();
     let pairs = load_csn(&root, corpus_n).context("load CodeSearchNet")?;
     anyhow::ensure!(!pairs.is_empty(), "no CSN pairs loaded");
     let queries_n = queries_n.min(pairs.len());
+    let models = pick_models(models_selector);
+    anyhow::ensure!(!models.is_empty(), "no models selected");
     println!(
-        "CodeSearchNet python/test — {} corpus docs, {} queries\n",
+        "CodeSearchNet python/test — {} corpus docs, {} queries, {} models\n",
         pairs.len(),
         queries_n,
+        models.len(),
     );
 
-    let results = root.join("benchmarks/results");
-    std::fs::create_dir_all(&results)?;
-    let hist = results.join("effectiveness.jsonl");
     let commit = git_short();
     let date = chrono::Utc::now().to_rfc3339();
     let host = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+
+    // Per-run output dir keeps each invocation's results isolated for
+    // before/after comparison (effectiveness.jsonl accumulates across
+    // runs and mixes commits). Default: benchmarks/results/<UTC-YYYY-
+    // MM-DDTHH-MM-SS>-<commit>/; --output PATH overrides.
+    let run_dir = match out_override {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let slug = date.replace(':', "-");
+            root.join("benchmarks/results")
+                .join(format!("{slug}-{commit}"))
+        }
+    };
+    std::fs::create_dir_all(&run_dir).with_context(|| format!("mkdir {}", run_dir.display()))?;
+    let results_jsonl = run_dir.join("results.jsonl");
+    // Legacy single-file history kept for any tooling that reads it.
+    let history_jsonl = root.join("benchmarks/results/effectiveness.jsonl");
 
     // Rerank is OFF unless `--rerank`. The cross-encoder is
     // model-independent (scores raw query↔code), so load once. Every
@@ -562,8 +625,8 @@ fn eval(
         eprintln!(
             "rerank ON: ~{} cross-encodes ({} models × {} queries × \
              top_n {}), seq≤{}.",
-            EVAL_MODELS.len() * queries_n * rerank_top_n,
-            EVAL_MODELS.len(),
+            models.len() * queries_n * rerank_top_n,
+            models.len(),
             queries_n,
             rerank_top_n,
             rerank_max_len,
@@ -581,18 +644,147 @@ fn eval(
         }
     };
 
-    for name in EVAL_MODELS {
-        for mut rec in eval_model(name, &pairs, queries_n, reranker.as_ref())? {
-            let obj = rec.as_object_mut().unwrap();
-            obj.insert("commit".into(), serde_json::json!(commit));
-            obj.insert("date".into(), serde_json::json!(date));
-            obj.insert("host".into(), serde_json::json!(host));
-            println!("{}", serde_json::to_string_pretty(&rec)?);
-            append_jsonl(&hist, &rec)?;
+    let mut all_records: Vec<serde_json::Value> = Vec::new();
+    for name in &models {
+        match eval_model(name, &pairs, queries_n, reranker.as_ref()) {
+            Ok(recs) => {
+                for mut rec in recs {
+                    let obj = rec.as_object_mut().unwrap();
+                    obj.insert("commit".into(), serde_json::json!(commit));
+                    obj.insert("date".into(), serde_json::json!(date));
+                    obj.insert("host".into(), serde_json::json!(host));
+                    println!("{}", serde_json::to_string_pretty(&rec)?);
+                    append_jsonl(&results_jsonl, &rec)?;
+                    append_jsonl(&history_jsonl, &rec)?;
+                    all_records.push(rec);
+                }
+            }
+            Err(e) => {
+                // One bad model shouldn't abort a 10-model sweep — record
+                // the failure as a row so the summary makes the gap
+                // visible, then keep going.
+                eprintln!("model '{name}' failed: {e:#}");
+                let rec = serde_json::json!({
+                    "model": name,
+                    "variant": "base",
+                    "error": format!("{e:#}"),
+                    "commit": commit,
+                    "date": date,
+                    "host": host,
+                });
+                append_jsonl(&results_jsonl, &rec)?;
+                all_records.push(rec);
+            }
         }
     }
-    println!("\nappended -> {}", hist.display());
+
+    let report = render_report(&all_records, &date, &commit, &host, pairs.len(), queries_n);
+    let report_path = run_dir.join("REPORT.md");
+    std::fs::write(&report_path, &report).context("write REPORT.md")?;
+    println!("\nresults  -> {}", results_jsonl.display());
+    println!("report   -> {}", report_path.display());
     Ok(())
+}
+
+/// Build a ranked Markdown summary of one eval run — one row per
+/// (model, variant), sorted by MRR@10 descending. Comparable across
+/// runs because every column is derived from the same `results.jsonl`.
+/// One row of the rendered eval report (sortable by `mrr`).
+#[cfg(not(feature = "bench-stub"))]
+struct ReportRow {
+    model: String,
+    variant: String,
+    mrr: f64,
+    r1: f64,
+    r5: f64,
+    ndcg: f64,
+    embed_ms: u64,
+    rerank_ms: Option<u64>,
+    error: Option<String>,
+}
+
+#[cfg(not(feature = "bench-stub"))]
+fn render_report(
+    records: &[serde_json::Value],
+    date: &str,
+    commit: &str,
+    host: &str,
+    corpus: usize,
+    queries: usize,
+) -> String {
+    use std::fmt::Write;
+    let mut rows: Vec<ReportRow> = records
+        .iter()
+        .map(|r| ReportRow {
+            model: r["model"].as_str().unwrap_or("?").to_string(),
+            variant: r["variant"].as_str().unwrap_or("base").to_string(),
+            mrr: r["mrr@10"].as_f64().unwrap_or(0.0),
+            r1: r["recall@1"].as_f64().unwrap_or(0.0),
+            r5: r["recall@5"].as_f64().unwrap_or(0.0),
+            ndcg: r["ndcg@10"].as_f64().unwrap_or(0.0),
+            embed_ms: r["embed_ms"].as_u64().unwrap_or(0),
+            rerank_ms: r["rerank_ms"].as_u64(),
+            error: r["error"].as_str().map(str::to_string),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.mrr
+            .partial_cmp(&a.mrr)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Sanitize a string for a single markdown table cell — strip
+    // newlines (would break the row) and escape pipes (would split
+    // into extra cells). Used for error messages, which can contain
+    // both when anyhow stringifies a multi-line cause chain.
+    fn cell(s: &str) -> String {
+        s.replace('\n', " ").replace('|', "\\|")
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(out, "# eval REPORT");
+    let _ = writeln!(out, "- date: `{date}`");
+    let _ = writeln!(out, "- commit: `{commit}`");
+    let _ = writeln!(out, "- host: `{host}`");
+    let _ = writeln!(out, "- corpus: CodeSearchNet python/test, {corpus} docs");
+    let _ = writeln!(out, "- queries: {queries}");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "| model | variant | MRR@10 | R@1 | R@5 | NDCG@10 | embed (ms) | rerank (ms) |"
+    );
+    let _ = writeln!(out, "|---|---|---:|---:|---:|---:|---:|---:|");
+    // Collect any errored rows so they get their own section below the
+    // metrics table — keeps the table well-formed (fixed 8 columns)
+    // and gives the error message room to be readable.
+    let mut errors: Vec<(&str, &str, &str)> = Vec::new();
+    for row in &rows {
+        let rr_cell = row
+            .rerank_ms
+            .map(|x| x.to_string())
+            .unwrap_or_else(|| "—".into());
+        if let Some(e) = &row.error {
+            errors.push((&row.model, &row.variant, e));
+            let _ = writeln!(
+                out,
+                "| `{}` | `{}` | ERR | — | — | — | — | — |",
+                row.model, row.variant
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "| `{}` | `{}` | {:.4} | {:.4} | {:.4} | {:.4} | {} | {rr_cell} |",
+                row.model, row.variant, row.mrr, row.r1, row.r5, row.ndcg, row.embed_ms
+            );
+        }
+    }
+    if !errors.is_empty() {
+        let _ = writeln!(out, "\n## errors\n");
+        for (m, v, e) in errors {
+            let _ = writeln!(out, "- `{}` ({}): {}", m, v, cell(e));
+        }
+    }
+    out
 }
 
 /// Under the `cargo xtask` alias the build carries `bench-stub` (the
@@ -645,7 +837,21 @@ fn main() -> Result<()> {
             let do_rerank = args.iter().any(|a| a == "--rerank");
             let rr_top_n = arg(&args, "--rerank-top-n", "20").parse().unwrap_or(20);
             let rr_max_len = arg(&args, "--rerank-max-len", "256").parse().unwrap_or(256);
-            eval(corpus, queries, do_rerank, rr_top_n, rr_max_len)?;
+            // `--models a,b,c` (or `--models all`) overrides the default
+            // 3-model set. `--output PATH` overrides the auto-generated
+            // per-run dir under benchmarks/results/.
+            let models = arg(&args, "--models", "");
+            let out_raw = arg(&args, "--output", "");
+            let out_path = (!out_raw.is_empty()).then(|| PathBuf::from(out_raw));
+            eval(
+                corpus,
+                queries,
+                do_rerank,
+                rr_top_n,
+                rr_max_len,
+                &models,
+                out_path.as_deref(),
+            )?;
         }
         "bump" => {
             let v = args.get(1).context("usage: cargo xtask bump <version>")?;
@@ -655,8 +861,15 @@ fn main() -> Result<()> {
             eprintln!(
                 "usage: cargo xtask <gen-corpus|bench|eval|bump> \
                  [--files N] [--seed S] [--corpus N] [--queries N] \
-                 [--rerank [--rerank-top-n N] \
-                 [--rerank-max-len N]] [--out DIR]"
+                 [--models a,b,c|all] [--output DIR] \
+                 [--rerank [--rerank-top-n N] [--rerank-max-len N]] \
+                 [--out DIR]\n\n\
+                 eval:\n  \
+                 --models  comma-separated names, or `all` for every \
+                 entry in SUPPORTED_MODELS (default: 3-model baseline).\n  \
+                 --output  per-run results dir (default: \
+                 benchmarks/results/<date>-<commit>/). Writes \
+                 results.jsonl + REPORT.md."
             );
             std::process::exit(2);
         }

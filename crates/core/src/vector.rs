@@ -62,6 +62,22 @@ impl VectorIndex {
         Ok(())
     }
 
+    /// Read a vector by key. `dims` must match the index dimensions.
+    /// Used by cross-file chunk reuse to copy an existing embedding
+    /// under a fresh vector_id without re-running the model.
+    pub fn get(&self, key: u64, dims: usize) -> Result<Option<Vec<f32>>> {
+        let mut buf = vec![0.0f32; dims];
+        let n = self
+            .inner
+            .get(key, &mut buf)
+            .map_err(|e| Error::Index(e.to_string()))?;
+        if n == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(buf))
+        }
+    }
+
     /// Returns (vector_id, similarity_score) pairs, best first. `exact`
     /// runs brute-force cosine over every vector (use on small indexes:
     /// HNSW is an approximate heuristic that buys nothing there and can

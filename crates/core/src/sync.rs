@@ -138,6 +138,18 @@ impl IndexStatus {
     }
 }
 
+/// Outcome of `classify` for a single file.
+enum Classified {
+    /// DB row already matches disk (or file unreadable / has no chunks).
+    Unchanged,
+    /// Bytes match the indexed hash but `(mtime, size)` moved — refresh
+    /// the file row so the next sync hits the cheap stat short-circuit
+    /// instead of re-reading + re-hashing the same bytes.
+    Touched { mtime: i64, size: i64 },
+    /// File needs to be re-embedded.
+    Changed(FileWork),
+}
+
 /// A changed file ready to embed: metadata + its chunks.
 struct FileWork {
     rel: String,
@@ -148,10 +160,24 @@ struct FileWork {
     chunks: Vec<Chunk>,
 }
 
+/// How a planned chunk gets its embedding.
+enum Reuse {
+    /// Identical chunk already lived in THIS file at the prior index
+    /// state — keep its vector_id verbatim (`vector_id` is `UNIQUE`
+    /// per chunk row, so this avoids the schema fight).
+    Same(u64),
+    /// Identical content lives in the index under another file (rename,
+    /// branch checkout, copy-paste). Allocate a fresh vector_id at
+    /// apply time and COPY the source bytes into it — skips the
+    /// embedding compute, the dominant cost.
+    Copy { source: u64 },
+    /// No prior vector matches — embed fresh.
+    Fresh,
+}
+
 /// A chunk tagged with the text actually fed to the model (raw body +
 /// the code↔NL header), its content hash **over that enriched text**,
-/// and — when an identical enriched text already existed in the prior
-/// index — the vector to reuse instead of re-embedding.
+/// and how its embedding is sourced.
 struct Planned {
     chunk: Chunk,
     /// Small code↔NL header (path/symbol/kind/signature) prepended to
@@ -160,8 +186,14 @@ struct Planned {
     /// — the enriched `header + body` string is materialized
     /// transiently only for the chunks actually being embedded.
     embed_header: String,
+    /// blake3(header ++ body) — exact embed-text identity for intra-file
+    /// `Same` reuse and for the DB `content_hash` column.
     hash: String,
-    reuse: Option<u64>,
+    /// blake3(body) — header-independent identity used to find cross-file
+    /// `Copy` sources (rename / branch switch lands the same body under a
+    /// new path; the source vector is close enough — see `Reuse::Copy`).
+    body_hash: String,
+    reuse: Reuse,
 }
 
 /// Code↔NL bridge header prepended to a chunk **for embedding only**:
@@ -496,8 +528,8 @@ impl SyncEngine {
         // real file's path is the one indexed, so search hits the
         // canonical location. Reals stay ahead of kept links and both
         // keep the sorted order, so vector-id allocation is stable.
-        let canon_root = std::fs::canonicalize(&self.project_dir)
-            .unwrap_or_else(|_| self.project_dir.clone());
+        let canon_root =
+            std::fs::canonicalize(&self.project_dir).unwrap_or_else(|_| self.project_dir.clone());
         let mut seen: HashSet<PathBuf> = HashSet::with_capacity(out.len());
         let mut reals: Vec<PathBuf> = Vec::with_capacity(out.len());
         let mut links: Vec<PathBuf> = Vec::new();
@@ -508,7 +540,9 @@ impl SyncEngine {
             {
                 links.push(path);
             } else {
-                let rel = path.strip_prefix(&self.project_dir).unwrap_or(path.as_path());
+                let rel = path
+                    .strip_prefix(&self.project_dir)
+                    .unwrap_or(path.as_path());
                 seen.insert(canon_root.join(rel));
                 reals.push(path);
             }
@@ -562,6 +596,14 @@ impl SyncEngine {
     /// and which old vectors are now orphaned. Identity is the chunk's
     /// blake3 — robust to chunks moving (byte offsets / index shift)
     /// when the file is edited above them.
+    ///
+    /// Three reuse paths, in priority order: (1) intra-file Same —
+    /// identical chunk already lived in this file at the prior index,
+    /// keep its `vector_id` verbatim; (2) cross-file Copy — identical
+    /// content lives in the index under another file (rename, branch
+    /// switch, copy-paste), so allocate a fresh `vector_id` and copy
+    /// the source embedding bytes at apply time, skipping the model
+    /// call; (3) Fresh — no prior vector matches, embed normally.
     fn plan_file(&self, f: FileWork) -> Result<FilePlan> {
         let old = self
             .db
@@ -580,15 +622,46 @@ impl SyncEngine {
             // path/symbol gets a new header → new hash → re-embed
             // (correct: its vector would otherwise be stale).
             let header = embed_header(&f.rel, &c);
+            // `hash` = full embed-text identity (header ++ body) for
+            // intra-file Same reuse; `body_hash` strips the header so
+            // cross-file Copy lookups can match renames / branch switches.
+            let body_hash = blake3::hash(c.content.as_bytes()).to_hex().to_string();
             let mut hasher = blake3::Hasher::new();
             hasher.update(header.as_bytes());
             hasher.update(c.content.as_bytes());
             let hash = hasher.finalize().to_hex().to_string();
-            let reuse = avail.get_mut(&hash).and_then(Vec::pop);
+            let reuse = if let Some(v) = avail.get_mut(&hash).and_then(Vec::pop) {
+                Reuse::Same(v)
+            } else if let Some(src) = self
+                .db
+                .lock()
+                .unwrap()
+                .lookup_vector_id_by_body_hash(&body_hash)?
+            {
+                // Pre-flight: confirm the source vector actually exists in
+                // the usearch store (the chunks ↔ vector stores are not
+                // transactional — a partial-crash recovery can leave an
+                // orphan chunk row whose vector_id was already removed,
+                // and a prior file in this same `flush_group` may have
+                // dropped the source as part of its own purge). If it's
+                // gone, downgrade to Fresh here so the embed batch sized
+                // by `flush_group` (Fresh-count) stays aligned with what
+                // `apply_plan` consumes from the iterator.
+                let dims = self.embedder.dimensions;
+                let exists = self.vector.lock().unwrap().get(src, dims)?.is_some();
+                if exists {
+                    Reuse::Copy { source: src }
+                } else {
+                    Reuse::Fresh
+                }
+            } else {
+                Reuse::Fresh
+            };
             chunks.push(Planned {
                 chunk: c,
                 embed_header: header,
                 hash,
+                body_hash,
                 reuse,
             });
         }
@@ -605,31 +678,64 @@ impl SyncEngine {
         })
     }
 
-    /// Persist one planned file: reused chunks keep their vector (only
-    /// their row metadata — index/offsets — is refreshed), genuinely
-    /// new chunks consume freshly embedded vectors, orphaned vectors
-    /// are dropped. `embedded` yields vectors for the no-reuse chunks
-    /// in plan order. Returns the file's chunk count.
+    /// Persist one planned file: `Same` chunks keep their vector_id,
+    /// `Copy` chunks get a fresh vector_id with the source bytes
+    /// duplicated into it (no embedding compute), `Fresh` chunks
+    /// consume freshly embedded vectors. Orphaned vectors from the
+    /// prior file state are dropped (best-effort — a vector still
+    /// referenced by another chunk row is left in place by
+    /// `remove_many`'s tolerance). `embedded` yields vectors for
+    /// `Fresh`-only chunks in plan order.
     fn apply_plan(
         &self,
         p: FilePlan,
         embedded: &mut impl Iterator<Item = Vec<f32>>,
     ) -> Result<usize> {
         let n = p.chunks.len();
-        let need_new = p.chunks.iter().filter(|c| c.reuse.is_none()).count();
+        let need_new = p
+            .chunks
+            .iter()
+            .filter(|c| !matches!(c.reuse, Reuse::Same(_)))
+            .count();
         let (file_id, mut fresh) = {
             let db = self.db.lock().unwrap();
             let id = db.upsert_file(&p.rel, p.mtime, p.size, &p.fhash)?;
             (id, db.alloc_vector_ids(need_new)?.into_iter())
         };
+        let dims = self.embedder.dimensions;
         let mut add_keys = Vec::with_capacity(need_new);
         let mut add_vecs = Vec::with_capacity(need_new);
         let mut new_chunks = Vec::with_capacity(n);
         let mut vids = Vec::with_capacity(n);
         for (i, pc) in p.chunks.into_iter().enumerate() {
             let vid = match pc.reuse {
-                Some(v) => v,
-                None => {
+                Reuse::Same(v) => v,
+                Reuse::Copy { source } => {
+                    let v = fresh.next().ok_or_else(|| {
+                        Error::Index("internal: allocated vector ids < new chunks".into())
+                    })?;
+                    // Read the source embedding under the existing key
+                    // and re-add under the freshly-allocated key. Cheap
+                    // (memcpy + usearch add) vs. a full model forward
+                    // pass. `plan_file` pre-flights existence and
+                    // downgrades to Fresh when the source is gone, so
+                    // `None` here means a concurrent purge raced past
+                    // the pre-flight check. Treat it as an internal
+                    // error rather than steal from the Fresh-sized
+                    // embed iterator: the next sync will replan and
+                    // self-heal.
+                    let src_vec = self.vector.lock().unwrap().get(source, dims)?;
+                    let vec = src_vec.ok_or_else(|| {
+                        Error::Index(format!(
+                            "internal: cross-file Copy source vector {source} vanished after \
+                             plan_file pre-flight; abort sync (next pass will replan)"
+                        ))
+                    })?;
+                    add_keys.push(v);
+                    add_vecs.push(vec);
+                    v
+                }
+                Reuse::Fresh => {
                     let v = fresh.next().ok_or_else(|| {
                         Error::Index("internal: allocated vector ids < new chunks".into())
                     })?;
@@ -649,6 +755,7 @@ impl SyncEngine {
                 node_type: pc.chunk.node_type,
                 language: p.lang.clone(),
                 content_hash: pc.hash,
+                body_hash: pc.body_hash,
             });
             vids.push(vid);
         }
@@ -687,9 +794,13 @@ impl SyncEngine {
             // being embedded, and only for this group — freed right
             // after the embed call, so the bounded window never holds
             // two copies of a body.
+            // Only Fresh chunks consume the embed iterator. Copy
+            // chunks also need a fresh vector_id but they reuse the
+            // source vector's bytes at apply time (no model call), so
+            // they are NOT in the embedded text list.
             let owned: Vec<String> = plans
                 .iter()
-                .flat_map(|p| p.chunks.iter().filter(|c| c.reuse.is_none()))
+                .flat_map(|p| p.chunks.iter().filter(|c| matches!(c.reuse, Reuse::Fresh)))
                 .map(|c| format!("{}{}", c.embed_header, c.chunk.content))
                 .collect();
             let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
@@ -704,17 +815,16 @@ impl SyncEngine {
         Ok(chunks_total)
     }
 
-    /// Classify a file: always returns its relative key (so the caller
-    /// can track `seen` for delete-detection) plus `Some(FileWork)` only
-    /// when it changed and must be re-embedded. The expensive tree-sitter
-    /// parse is skipped entirely for unchanged files (hash compared
-    /// first).
+    /// Classify a file. Returns the relative key (so the caller tracks
+    /// `seen` for delete-detection) and one of three outcomes. The
+    /// expensive tree-sitter parse is skipped entirely for unchanged
+    /// files (hash compared first).
     fn classify(
         &self,
         path: &Path,
         existing: &HashMap<String, crate::db::FileState>,
         force: bool,
-    ) -> (String, Option<FileWork>) {
+    ) -> (String, Classified) {
         let rel = self.rel_str(path);
         let (mtime, size) = mtime_size(path);
         let prior = existing.get(&rel);
@@ -723,26 +833,34 @@ impl SyncEngine {
         // unchanged and skip the file read, blake3 AND tree-sitter
         // parse entirely (the dominant cost on a clean resync).
         if !force && prior.is_some_and(|st| st.mtime == mtime && st.size == size) {
-            return (rel, None);
+            return (rel, Classified::Unchanged);
         }
 
         let Some(content) = Self::read_text(path) else {
-            return (rel, None);
+            return (rel, Classified::Unchanged);
         };
         let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
-        // mtime/size moved but bytes are identical (touch, checkout):
-        // nothing to embed, but the caller still marks it seen.
+        // mtime/size moved but bytes are identical (touch, `git
+        // checkout`): nothing to embed, but refresh the DB row so the
+        // fast (mtime,size) short-circuit hits next sync instead of
+        // re-reading + re-hashing the same bytes forever. Use the
+        // stat captured BEFORE the read: re-statting after the read
+        // can pick up a concurrent writer's newer mtime (paired with a
+        // possibly-torn-read hash) and lock that mismatched pair into
+        // the DB. The pre-read stat may be slightly stale relative to
+        // the disk if a touch raced the read, but the next sync's
+        // mtime mismatch re-reads correctly and self-heals.
         if !force && prior.is_some_and(|st| st.hash == hash) {
-            return (rel, None);
+            return (rel, Classified::Touched { mtime, size });
         }
         let (lang, chunks) = self.chunker.chunk_file(path, &content);
         if chunks.is_empty() {
-            return (rel, None);
+            return (rel, Classified::Unchanged);
         }
         let rel2 = rel.clone();
         (
             rel,
-            Some(FileWork {
+            Classified::Changed(FileWork {
                 rel: rel2,
                 mtime,
                 size,
@@ -790,13 +908,13 @@ impl SyncEngine {
         let mut done = 0usize;
         let mut discovered = 0usize;
 
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Option<FileWork>)>(window);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Classified)>(window);
         let files_ref = &files;
         let existing_ref = &existing;
         std::thread::scope(|s| -> Result<()> {
             let producer = s.spawn(move || {
                 for win in files_ref.chunks(window) {
-                    let classified: Vec<(String, Option<FileWork>)> = self.pool.install(|| {
+                    let classified: Vec<(String, Classified)> = self.pool.install(|| {
                         win.par_iter()
                             .map(|p| self.classify(p, existing_ref, force))
                             .collect()
@@ -811,12 +929,45 @@ impl SyncEngine {
                 }
             });
 
-            for (rel, work) in rx {
+            for (rel, outcome) in rx {
                 done += 1;
-                let changed = work.is_some();
-                match work {
-                    None => stats.files_skipped += 1,
-                    Some(work) => {
+                // Defensive dedup: two paths can produce the same `rel`
+                // on case-insensitive filesystems or via a symlink-chain
+                // miss in collect_files. Apply only the first outcome
+                // for each rel; otherwise a Touched arriving after a
+                // Changed would overwrite (mtime, size) while leaving
+                // the content_hash from Changed — DB internally
+                // inconsistent and the next sync's cheap short-circuit
+                // would trust a stat that doesn't match the bytes.
+                if seen.contains(&rel) {
+                    tracing::warn!("duplicate rel during sync, skipping later outcome: {rel}");
+                    continue;
+                }
+                let changed = matches!(outcome, Classified::Changed(_));
+                match outcome {
+                    Classified::Unchanged => stats.files_skipped += 1,
+                    Classified::Touched { mtime, size } => {
+                        // Refresh the stale stat so the cheap path hits
+                        // on the next sync. No vectors to touch. If the
+                        // row vanished between snapshot and write
+                        // (concurrent Clear / external mutation), warn
+                        // and drop it from `seen` so the next sync will
+                        // re-classify it as Changed and re-embed from
+                        // scratch.
+                        let existed = self.db.lock().unwrap().touch_file_meta(&rel, mtime, size)?;
+                        if existed {
+                            stats.files_skipped += 1;
+                        } else {
+                            tracing::warn!(
+                                "file row vanished mid-sync, will re-index next pass: {rel}"
+                            );
+                            // Skip marking `seen` so delete-detection
+                            // doesn't think it was just dropped; next
+                            // sync will pick it back up.
+                            continue;
+                        }
+                    }
+                    Classified::Changed(work) => {
                         pending_chunks += work.chunks.len();
                         pending_bytes += work.chunks.iter().map(|c| c.content.len()).sum::<usize>();
                         discovered += work.chunks.len();
