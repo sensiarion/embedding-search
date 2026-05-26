@@ -687,7 +687,15 @@ fn eval(
         }
     }
 
-    let report = render_report(&all_records, &date, &commit, &host, pairs.len(), queries_n);
+    let report = render_report(
+        &all_records,
+        &date,
+        &commit,
+        &host,
+        "CodeSearchNet python/test",
+        pairs.len(),
+        queries_n,
+    );
     let report_path = run_dir.join("REPORT.md");
     std::fs::write(&report_path, &report).context("write REPORT.md")?;
     println!("\nresults  -> {}", results_jsonl.display());
@@ -718,6 +726,7 @@ fn render_report(
     date: &str,
     commit: &str,
     host: &str,
+    corpus_label: &str,
     corpus: usize,
     queries: usize,
 ) -> String {
@@ -755,7 +764,7 @@ fn render_report(
     let _ = writeln!(out, "- date: `{date}`");
     let _ = writeln!(out, "- commit: `{commit}`");
     let _ = writeln!(out, "- host: `{host}`");
-    let _ = writeln!(out, "- corpus: CodeSearchNet python/test, {corpus} docs");
+    let _ = writeln!(out, "- corpus: {corpus_label}, {corpus} docs");
     let _ = writeln!(out, "- queries: {queries}");
     let _ = writeln!(out);
     let _ = writeln!(
@@ -824,6 +833,12 @@ fn load_golden(path: &Path) -> Result<Vec<GoldenQuery>> {
 /// `target`, `.embedding-search`, `node_modules`). Used by `golden` to
 /// snapshot the source root into a tempdir so the per-model index
 /// builds don't trample the working tree's .embedding-search/.
+///
+/// Symlinks are followed only when they target a regular file or
+/// directory inside the tree; broken / out-of-tree links and special
+/// nodes (sockets, fifos) are skipped. The indexer follows symlinks
+/// itself when walking the snapshot, so re-creating the link
+/// structure isn't necessary for retrieval coverage.
 #[cfg(not(feature = "bench-stub"))]
 fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
     const SKIP: &[&str] = &[".git", "target", ".embedding-search", "node_modules"];
@@ -834,12 +849,23 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
         if SKIP.iter().any(|s| std::ffi::OsStr::new(s) == name) {
             continue;
         }
+        let from = e.path();
         let to = dst.join(&name);
-        if e.file_type()?.is_dir() {
-            copy_dir_filtered(&e.path(), &to)?;
-        } else {
-            std::fs::copy(e.path(), &to)?;
+        // Stat-follow: if the resolved target is a directory descend
+        // into it as a real dir; if it's a regular file copy bytes.
+        // Anything else (broken link, fifo, socket, device) is silently
+        // skipped so the snapshot can't fail on workspace quirks.
+        let meta = match std::fs::metadata(&from) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            copy_dir_filtered(&from, &to)?;
+        } else if meta.is_file() {
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
         }
+        // else: special file — skip.
     }
     Ok(())
 }
@@ -967,11 +993,13 @@ fn golden(
         records.push(rec);
     }
 
+    let corpus_label = format!("golden ({})", corpus_path.display());
     let report = render_report(
         &records,
         &date,
         &commit,
         &host,
+        &corpus_label,
         queries.len(),
         queries.len(),
     );

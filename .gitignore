@@ -3,6 +3,8 @@
 benchmarks/corpus/
 benchmarks/csn/
 benchmarks/results/*.jsonl
+# Per-run directories from `cargo xtask eval` / `xtask golden`
+benchmarks/results/*/
 *.usearch
 .idea/
 .claude/
