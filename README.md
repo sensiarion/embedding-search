@@ -245,6 +245,7 @@ measured indexing a real ~12k-chunk repo (auto per-model batch).
 | sensiarion/CodeRankEmbed-f16 **(default)** | candle f16 Metal / onnx int8 CPU | 768 | ★★★★★ | ★★ | cls | ~0.57 GB |
 | nomic-ai/CodeRankEmbed | candle f32 Metal / onnx int8 CPU | 768 | ★★★★★ | ★★ | cls | ~1.1 GB |
 | jinaai/jina-embeddings-v2-base-code | onnx (int8) | 768 | ★★★★★ | ★★ | mean | ~0.76 GB |
+| google/embeddinggemma-300m | candle f32 Metal / onnx int8 CPU | 768 | ★★★★ | ★★★★★ | mean | ~1.6 GB |
 | minishlab/potion-multilingual-128M | static | 256 | ★★★ | ★★★★★ | mean | ~0.85 GB |
 | minishlab/potion-base-32M | static | 512 | ★★★ | ★★ | mean | ~0.36 GB |
 
@@ -258,9 +259,14 @@ ONNX, on CUDA the f32 ONNX. For exact upstream provenance pick the
 official f32 weights: `models set-default nomic-ai/CodeRankEmbed`
 (~2x RAM on Metal, same embeddings; identical to the default off
 Apple-Silicon). `jinaai/jina-embeddings-v2-base-code` is a lighter
-code alternative (~0.76 GB). For multilingual / Russian (or the
-fastest possible sync of a big repo, in seconds at <1 GB) use the
-static `potion-multilingual-128M` — bag-of-token-means (weaker raw
+code alternative (~0.76 GB). `google/embeddinggemma-300m` (308 M,
+int8 ONNX, Matryoshka 128–768, multilingual incl. Russian) is the
+strongest non-default on the in-repo 130-query golden corpus and the
+only model that lands a top-1 hit there — pick it when the queries
+are NL-rich ("how does X work") or non-English; the trade is ~4×
+the per-query latency of CodeRankEmbed (rerank off, both). For
+multilingual / Russian (or the fastest possible sync of a big repo,
+in seconds at <1 GB) use the static `potion-multilingual-128M` — bag-of-token-means (weaker raw
 code relevance, but re-rank is **on by default** for it and largely
 closes the gap); the onnx encoders are slower on the first sync of a
 large repo (incremental after). `models add` registers any other HF
@@ -281,13 +287,25 @@ metric). `base` and the `+rerank` column are the **same 200 queries /
 
 | model | MRR@10 | R@1 | NDCG@10 | MRR@10 +rerank | index (docs/s) | rerank default |
 |-------|-------|-----|---------|----------------|----------------|----------------|
+| google/embeddinggemma-300m | **0.938** | **0.910** | **0.949** | **0.942** | ~2 | off |
 | sensiarion/CodeRankEmbed-f16 **(default)** | 0.929 | 0.910 | 0.937 | 0.928 | ~21 | off |
 | minishlab/potion-base-32M | 0.730 | 0.660 | 0.759 | **0.849** | ~11 000 | on |
 | minishlab/potion-multilingual-128M | 0.716 | 0.635 | 0.749 | **0.858** | ~7 600 | on |
 
-The default transformer is markedly more accurate; the static models
-trade ~0.20 MRR for a **~500× faster index** (the right pick on a
-large repo or when sync speed matters). Cross-encoder re-rank
+`google/embeddinggemma-300m` edges past the default on every quality
+metric (+0.009 MRR base, +0.014 MRR with re-rank, +0.012 NDCG) and
+matches it on Recall@1 (0.910). On Apple Silicon it runs on the
+**Metal GPU via candle (f32)** — about 2.8× the indexing throughput
+of the int8 ONNX CPU fallback, and on this repo's 130-query golden
+set it also beats the ONNX path on MRR (0.444 vs 0.437). The HF repo
+is license-gated; the first sync needs a token with `canReadGatedRepos`
+or it falls back to int8 ONNX with a single warn line. Pick
+CodeRankEmbed as the speed-balanced default; switch to EmbeddingGemma
+when query language is multilingual or NL ("how does X work") rather
+than identifier-shaped. The default transformer is markedly more
+accurate than the static models; the static models trade ~0.20 MRR
+for a **~500× faster index** (the right pick on a large repo or when
+sync speed matters). Cross-encoder re-rank
 (`ettin-reranker-68m-v1`, ~68M, candle Metal, top-20) is a **major
 rescue for the static retrievers** (+0.12–0.14 MRR, +0.17–0.21 R@1 —
 they reach ≈ a transformer's top-1) but **~neutral on the SOTA
@@ -375,12 +393,9 @@ embedding-search models add --name mxbai \
   --repo https://huggingface.co/mixedbread-ai/mxbai-embed-large-v1
 
 # onnx-community / large models: weights split into a .onnx_data
-# sidecar — fetched automatically. --onnx-file picks the variant.
-embedding-search models add --name gemma \
-  --repo onnx-community/embeddinggemma-300m-ONNX --onnx-file onnx/model_quantized.onnx
-
-# pick an EXACT quantization (q4 / q4f16 / bnb4 / uint8 …) by its
-# concrete filename with --onnx-file
+# sidecar — fetched automatically. --onnx-file picks an EXACT
+# quantization (q4 / q4f16 / bnb4 / uint8 …) by its concrete filename.
+# (EmbeddingGemma is now built-in — this pattern is for everything else.)
 embedding-search models add --name qwen3 \
   --repo onnx-community/Qwen3-Embedding-0.6B-ONNX --onnx-file model_q4f16.onnx
 

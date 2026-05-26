@@ -110,6 +110,33 @@ pub(crate) fn candle_batch() -> usize {
     })
 }
 
+/// Common surface every candle-Metal embedding model exposes — so the
+/// `Backend::Candle` dispatch stays one boxed trait object regardless
+/// of which architecture (NomicBert today, Gemma3 next) is loaded.
+/// Object-safe by construction (only `&self` methods, no generics in
+/// the signatures). The concrete embedder owns the tokenizer, model,
+/// and device, applying per-architecture pooling / projection / L2
+/// internally — callers only see f32 vectors out.
+pub(crate) trait CandleEmbed: Send + Sync {
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+    fn dim(&self) -> usize;
+    /// Index-identity suffix that flips when the underlying weight
+    /// precision changes (so f16 ↔ f32 ↔ bf16 re-embed cleanly).
+    fn variant(&self) -> &'static str;
+}
+
+impl CandleEmbed for CandleEncoder {
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        CandleEncoder::embed(self, texts)
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn variant(&self) -> &'static str {
+        CandleEncoder::variant(self)
+    }
+}
+
 /// CodeRankEmbed on Metal. CLS-pooled + L2-normalized; the query/doc
 /// prefix is applied by the caller (`Contract`), exactly as for the
 /// ONNX path, so embeddings are interchangeable across backends.

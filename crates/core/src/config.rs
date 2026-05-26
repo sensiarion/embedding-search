@@ -768,6 +768,18 @@ pub enum ModelArch {
     Fastembed(EmbeddingModel),
 }
 
+/// Which candle-Metal model class loads `candle_repo`. Defaults to the
+/// historical NomicBert path (CodeRankEmbed); explicit `Gemma3` opts a
+/// model into the EmbeddingGemma encoder (bidirectional gemma3 +
+/// `2_Dense` projection + L2). Adding a third architecture is one arm
+/// here and one `try_candle_*` branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CandleArch {
+    #[default]
+    NomicBert,
+    Gemma3,
+}
+
 /// Which repo ONNX file to load, resolved against the active execution
 /// provider. Replaces a blunt `force_cpu` bool: most models ship one
 /// export used on any provider; CodeRankEmbed keeps the small **int8**
@@ -855,13 +867,15 @@ pub struct ModelSpec {
     /// pins an exact file and/or the CPU provider for raw exports that
     /// fragment the CoreML/CUDA partitioner.
     pub onnx: OnnxFiles,
-    /// Base HF repo with f32 `model.safetensors` for the candle Metal
+    /// Base HF repo with `model.safetensors` for the candle Metal
     /// backend (Apple Silicon only). `Some` ⇒ on aarch64 macOS this
-    /// model runs on the Metal GPU via candle (≈1.8x the int8 ONNX CPU
-    /// path; the ORT CoreML EP can't accelerate it), falling back to
-    /// the `onnx`/ONNX path if Metal is unreachable or off-Apple. Only
-    /// NomicBert (CodeRankEmbed) is wired today.
+    /// model runs on the Metal GPU via candle, falling back to the
+    /// `onnx`/ONNX path if Metal is unreachable or off-Apple.
     pub candle_repo: Option<&'static str>,
+    /// Which candle architecture loads `candle_repo`. Ignored when
+    /// `candle_repo` is `None`. Defaults to `NomicBert` for backwards
+    /// compatibility with the original CodeRankEmbed path.
+    pub candle_arch: CandleArch,
     /// How this model is loaded/run (the dispatch switch).
     pub arch: ModelArch,
     /// Recommended embed batch size for this model, used when
@@ -953,6 +967,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         // runs half-precision on Metal; the `candle-f16` variant tag
         // keeps its index distinct from the f32 entry below.
         candle_repo: Some("sensiarion/CodeRankEmbed-f16"),
+        candle_arch: CandleArch::NomicBert,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
         rerank_default: false,
@@ -976,6 +991,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         // default's RAM, identical embeddings). `candle-f32` variant
         // tag → its own index.
         candle_repo: Some("nomic-ai/CodeRankEmbed"),
+        candle_arch: CandleArch::NomicBert,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
         rerank_default: false,
@@ -997,6 +1013,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         hf_repo: Some("jinaai/jina-embeddings-v2-base-code"),
         onnx: OnnxFiles::Single(Some("onnx/model_quantized.onnx")),
         candle_repo: None,
+        candle_arch: CandleArch::NomicBert,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
         rerank_default: false,
@@ -1015,6 +1032,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         hf_repo: Some("minishlab/potion-multilingual-128M"),
         onnx: OnnxFiles::Single(None),
         candle_repo: None,
+        candle_arch: CandleArch::NomicBert,
         arch: ModelArch::Static,
         rec_batch: 64,
         rerank_default: true,
@@ -1033,6 +1051,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         hf_repo: Some("minishlab/potion-base-32M"),
         onnx: OnnxFiles::Single(None),
         candle_repo: None,
+        candle_arch: CandleArch::NomicBert,
         arch: ModelArch::Static,
         rec_batch: 64,
         rerank_default: true,
@@ -1076,11 +1095,19 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
             accel: "onnx/model.onnx",
             cpu: "onnx/model_quantized.onnx",
         },
-        candle_repo: None,
+        // Apple Silicon Metal path. The candle fork in
+        // crates/core/src/candle_gemma_embed.rs models gemma3's
+        // alternating local/global rope split, per-layer sliding-
+        // window attention (window=512, every 6th layer is full),
+        // and the two-layer (768→3072→768) sentence-transformers
+        // dense head. License-gated HF download — first sync needs
+        // a token with `canReadGatedRepos`.
+        candle_repo: Some("google/embeddinggemma-300m"),
+        candle_arch: CandleArch::Gemma3,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
         rerank_default: false,
-        note: "EmbeddingGemma 300M, Matryoshka 128-768, multilingual (int8 CPU)",
+        note: "EmbeddingGemma 300M, Matryoshka 128-768, multilingual (bf16 Metal / int8 CPU)",
     },
 ];
 

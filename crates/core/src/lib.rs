@@ -3,6 +3,8 @@
 #[cfg(candle_backend)]
 mod candle_encoder;
 #[cfg(candle_backend)]
+mod candle_gemma_embed;
+#[cfg(candle_backend)]
 mod candle_rerank;
 pub mod chunker;
 pub mod config;

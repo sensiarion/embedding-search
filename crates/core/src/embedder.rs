@@ -34,10 +34,12 @@ enum Backend {
     /// encoder) run directly on ORT with bounded fixed-shape batches.
     #[cfg(not(feature = "bench-stub"))]
     Onnx(OnnxEncoder),
-    /// CodeRankEmbed (NomicBert) on the Metal GPU via candle —
-    /// Apple-Silicon only, ~1.8x the int8 ONNX CPU path.
+    /// Any candle-Metal embedding model — CodeRankEmbed (NomicBert)
+    /// today, EmbeddingGemma (Gemma3 + 2_Dense head) next. The trait
+    /// object lets each architecture own its tokenizer / pooling /
+    /// projection / L2 while sharing the dispatch site.
     #[cfg(candle_backend)]
-    Candle(Box<crate::candle_encoder::CandleEncoder>),
+    Candle(Box<dyn crate::candle_encoder::CandleEmbed>),
 }
 
 /// Resolved per-model input/output contract: the query/document
@@ -500,15 +502,17 @@ fn is_kv_cache_decoder(onnx: &[u8]) -> bool {
 /// Try to build the Apple-Silicon Metal (candle) backend for a
 /// `candle_repo` model. Returns `None` (and logs why) on any failure —
 /// no Metal device (headless/CI), download error, bad weights — so the
-/// caller transparently falls back to the ONNX path.
+/// caller transparently falls back to the ONNX path. Dispatches on
+/// `spec.candle_arch`: NomicBert → CodeRankEmbed path, Gemma3 →
+/// EmbeddingGemma path (bidirectional backbone + 2_Dense head).
 #[cfg(candle_backend)]
 fn try_candle(
     spec: &crate::config::ModelSpec,
     cfg: &Config,
     cache_dir: &Path,
-) -> Option<crate::candle_encoder::CandleEncoder> {
+) -> Option<Box<dyn crate::candle_encoder::CandleEmbed>> {
     let repo = spec.candle_repo?;
-    let build = || -> Result<crate::candle_encoder::CandleEncoder> {
+    let result: Result<Box<dyn crate::candle_encoder::CandleEmbed>> = (|| {
         let (_repo, r) = hf_repo(repo, cache_dir)?;
         let get = |f: &str| -> Result<std::path::PathBuf> {
             r.get(f)
@@ -517,14 +521,38 @@ fn try_candle(
         let safetensors = get("model.safetensors")?;
         let config_json = read(&get("config.json")?)?;
         let tokenizer_json = read(&get("tokenizer.json")?)?;
-        crate::candle_encoder::CandleEncoder::build(
-            &safetensors,
-            &config_json,
-            &tokenizer_json,
-            cfg.model.max_length.max(1),
-        )
-    };
-    match build() {
+        let max_len = cfg.model.max_length.max(1);
+        match spec.candle_arch {
+            crate::config::CandleArch::NomicBert => {
+                let enc = crate::candle_encoder::CandleEncoder::build(
+                    &safetensors,
+                    &config_json,
+                    &tokenizer_json,
+                    max_len,
+                )?;
+                Ok(Box::new(enc) as Box<dyn crate::candle_encoder::CandleEmbed>)
+            }
+            crate::config::CandleArch::Gemma3 => {
+                // Sentence-transformers package: the EmbeddingGemma
+                // head is two Linear(no-bias, Identity) layers under
+                // `2_Dense/` and `3_Dense/`, with mean pool before
+                // them and L2 after (no separate `4_Normalize/`
+                // weights — pure tensor op).
+                let dense2 = get("2_Dense/model.safetensors")?;
+                let dense3 = get("3_Dense/model.safetensors")?;
+                let enc = crate::candle_gemma_embed::CandleGemmaEncoder::build(
+                    &safetensors,
+                    &dense2,
+                    &dense3,
+                    &config_json,
+                    &tokenizer_json,
+                    max_len,
+                )?;
+                Ok(Box::new(enc) as Box<dyn crate::candle_encoder::CandleEmbed>)
+            }
+        }
+    })();
+    match result {
         Ok(enc) => Some(enc),
         Err(e) => {
             tracing::warn!("candle Metal backend unavailable ({e}); using ONNX fallback");
@@ -1378,10 +1406,13 @@ impl Embedder {
                 // vs int8 = different vectors) busts the index.
                 #[cfg(candle_backend)]
                 if let Some(enc) = try_candle(spec, cfg, &cache_dir) {
+                    // `enc` is already `Box<dyn CandleEmbed>`; method
+                    // calls dispatch via vtable, keeping the call site
+                    // arch-agnostic across NomicBert / Gemma3.
                     return Ok(Self {
-                        dimensions: enc.dim,
+                        dimensions: enc.dim(),
                         model_name: tagged_model_name(spec.name, Some(enc.variant())),
-                        backend: Backend::Candle(Box::new(enc)),
+                        backend: Backend::Candle(enc),
                         contract: Contract::from_spec(spec),
                     });
                 }

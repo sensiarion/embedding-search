@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Sharpen `search_code` MCP tool description: state "ONE call usually
+  beats several greps", clarify when `path`/`limit` help, and trim
+  self-referential examples so the description applies to any
+  project (not just embedding-search itself).
+- Tighten loading guidance in the `SessionStart` /
+  `UserPromptSubmit` hooks and SKILL.md: load via `ToolSearch` only
+  when the tool is listed as deferred; if it is absent from both the
+  available and deferred lists, the MCP is not wired up — don't call
+  `ToolSearch` (it returns `No matching deferred tools found`) and
+  don't retry within the session. Cuts wasted tool calls.
+
 ## 0.2.9
 
 - **BREAKING (safety):** the MCP server and CLI now refuse to index
@@ -54,6 +67,23 @@
   `benchmarks/golden/this-repo.toml`). Reports MRR@k / Recall@1 / R@5 /
   NDCG@k + sync/search latency per model. Use to compare candidates on
   this repo's own retrieval before picking a default.
+- New built-in model: `google/embeddinggemma-300m` (308 M, Matryoshka
+  128–768 dims, multilingual incl. Russian, Gemma license). On
+  **Apple Silicon** it runs on the **Metal GPU via candle (f32)** —
+  ~2.8× faster indexing than the int8 ONNX CPU fallback used on
+  other platforms (or when the candle path is unavailable). The HF
+  repo is license-gated: the first sync needs a token with the
+  "Read access to public gated repos" scope (`canReadGatedRepos`),
+  otherwise the loader falls back to int8 ONNX with a single warn
+  line. Task-shaped prompts wired automatically
+  (`task: code retrieval | query: …` / `title: none | text: …`).
+  Pick with `models set-default google/embeddinggemma-300m` (and
+  re-index). On CodeSearchNet 5000/200 it edges past the default on
+  every quality metric (MRR 0.938 vs 0.929, NDCG 0.949 vs 0.937,
+  R@1 tied at 0.91); on the in-repo 130-query golden corpus it is
+  the only built-in that lands top-1 hits (R@1 0.16 vs 0.00 for
+  every other candidate). The previous `models add` example for the
+  same repo was dropped from the README — it's a built-in now.
 
 ## 0.2.8
 
