@@ -1566,6 +1566,44 @@ impl Embedder {
         self.contract.tag()
     }
 
+    /// Backend-aware effective outer batch size. Candle Metal has no
+    /// per-shape graph cache and can sustain a much wider batch than
+    /// the ONNX-CoreML / ORT path the `ModelSpec::rec_batch` default
+    /// was tuned for (4, to bound the CoreML EP's per-shape graph
+    /// blow-up). With `rec_batch = 4` the inner length-bucketed
+    /// `candle_batch()` window (32) never fills, wasting Metal GPU
+    /// occupancy and the bucket-sort. Static + remote backends inherit
+    /// the spec / explicit value. Override the candle default at
+    /// runtime via `EMBEDDING_SEARCH_BATCH_CANDLE` for tuning without
+    /// a rebuild.
+    pub fn recommended_batch(
+        &self,
+        spec_rec_batch: usize,
+        explicit: usize,
+        is_static: bool,
+    ) -> usize {
+        #[cfg(candle_backend)]
+        if matches!(self.backend, Backend::Candle(_)) {
+            if explicit > 0 {
+                return explicit;
+            }
+            return std::env::var("EMBEDDING_SEARCH_BATCH_CANDLE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(32);
+        }
+        let rec = spec_rec_batch.max(1);
+        if explicit == 0 {
+            return rec;
+        }
+        if is_static {
+            explicit
+        } else {
+            explicit.min(rec)
+        }
+    }
+
     /// Embed indexed chunks, prepending the model's `doc_prefix` when
     /// it has one (verbatim, zero extra allocation, when it does not).
     pub fn embed_documents(&self, texts: &[&str], batch_size: usize) -> Result<Vec<Vec<f32>>> {

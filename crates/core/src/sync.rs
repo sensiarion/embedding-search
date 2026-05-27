@@ -805,7 +805,7 @@ impl SyncEngine {
                 .collect();
             let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
             self.embedder
-                .embed_documents(&texts, self.config.embed_batch())?
+                .embed_documents(&texts, self.config.embed_batch_for(&self.embedder))?
         };
         let mut it = vectors.into_iter();
         let mut chunks_total = 0;
@@ -896,7 +896,7 @@ impl SyncEngine {
         // path (deterministic index). `self.pool` (private, not the
         // global pool) bounds chunking CPU to `sync_threads`.
         use rayon::prelude::*;
-        let batch_chunks = self.config.embed_batch().max(1);
+        let batch_chunks = self.config.embed_batch_for(&self.embedder).max(1);
         let batch_bytes = self.config.sync.embed_batch_bytes.max(4096);
         let window = self.config.sync.scan_window.max(1);
         let mut group: Vec<FileWork> = Vec::new();

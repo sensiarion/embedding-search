@@ -628,7 +628,9 @@ impl Config {
         )
     }
 
-    /// Effective embed batch size.
+    /// Effective embed batch size. Backend-agnostic version — used
+    /// when the active embedder is not available (CLI status / table
+    /// renderers).
     ///
     /// `0` = auto → the active model's `rec_batch` (or
     /// `AUTO_EMBED_BATCH_FALLBACK` for a custom/remote model with no
@@ -653,6 +655,19 @@ impl Config {
         } else {
             explicit.min(rec)
         }
+    }
+
+    /// Backend-aware effective embed batch size. The active embedder
+    /// decides — candle paths sustain a far wider batch than the
+    /// ONNX-CoreML `rec_batch=4` default. Routes to
+    /// `Embedder::recommended_batch` with spec metadata.
+    pub fn embed_batch_for(&self, embedder: &crate::embedder::Embedder) -> usize {
+        let spec = model_spec(&self.model.default);
+        let rec = spec
+            .map(|s| s.rec_batch as usize)
+            .unwrap_or(AUTO_EMBED_BATCH_FALLBACK);
+        let is_static = spec.is_some_and(ModelSpec::is_static);
+        embedder.recommended_batch(rec, self.sync.embed_batch_size, is_static)
     }
 }
 

@@ -90,14 +90,16 @@ impl From<candle_core::Error> for Error {
     }
 }
 
-/// GPU sub-batch. Decoupled from `[sync] embed_batch` / `rec_batch`
-/// (which is small on purpose to bound the ONNX CoreML/CUDA per-shape
-/// graph cache — a constraint candle does NOT have). A wider batch
-/// amortizes tokenize/upload/readback and raises GPU occupancy;
-/// working set is `BATCH * seq * n_embd * 4 B` ≈ 50 MB at seq 512 per
-/// 32. Overridable via `EMBEDDING_SEARCH_CANDLE_BATCH` for tuning
-/// without a rebuild (default 32; the GPU-occupancy sweet spot is
-/// hardware-dependent).
+/// Inner GPU forward batch size — the length-bucket window. Decoupled
+/// from the OUTER `[sync] embed_batch_size` / `rec_batch` which feeds
+/// `embed_documents` (that one bounds the ONNX CoreML/CUDA per-shape
+/// graph cache; candle has no such constraint). Forward attention is
+/// `O(b · h · t²)` per layer; with seq=512 and a transformer of this
+/// class (~300 M f32 backbone), the unified-memory working set starts
+/// paging past b=16 on a 16 GB M-series. Bench peak across Gemma3 f32
+/// and CodeRankEmbed-f16 lands at b=8 — smaller windows lose Metal
+/// occupancy and bigger ones thrash. Override via the env var
+/// `EMBEDDING_SEARCH_CANDLE_BATCH` for hardware tuning.
 pub(crate) fn candle_batch() -> usize {
     use std::sync::OnceLock;
     static BATCH: OnceLock<usize> = OnceLock::new();
@@ -106,7 +108,7 @@ pub(crate) fn candle_batch() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(32)
+            .unwrap_or(8)
     })
 }
 

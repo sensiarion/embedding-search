@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- EmbeddingGemma candle Metal path stays at native f32. An attempt to
+  cast to f16 on Metal collapsed retrieval quality (Google's model
+  card explicitly warns activations don't survive fp16 — confirmed by
+  bench: MRR 0.445 → 0.117). bf16 fared no better — emulated below M3
+  and ~3× slower. The 308 M backbone at f32 stays well under typical
+  GPU memory limits, so the cost is acceptable for the quality.
 - Sharpen `search_code` MCP tool description: state "ONE call usually
   beats several greps", clarify when `path`/`limit` help, and trim
   self-referential examples so the description applies to any

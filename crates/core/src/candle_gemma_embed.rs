@@ -34,7 +34,7 @@ use crate::candle_encoder::{length_batched, metal_device, pack_ids_mask, CandleE
 use crate::embedder::load_tokenizer;
 use crate::error::{Error, Result};
 use candle_core::safetensors::MmapedSafetensors;
-use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{linear_no_bias, Linear, VarBuilder};
 use candle_transformers::models::gemma3::Config as Gemma3Config;
 use std::path::Path;
@@ -564,17 +564,22 @@ impl CandleEmbed for CandleGemmaEncoder {
             let hidden = self.backbone.forward(&ids, &full, &sliding)?; // [b, t, h]
 
             // Attention-masked mean pool over the time axis. Multiply
-            // hidden by the binary mask (broadcast to [b,t,1]), sum,
-            // divide by token count per row. Done in f32 for stability.
-            let mask_f = Tensor::from_slice(
-                &mask_slice.iter().map(|&m| m as f32).collect::<Vec<_>>(),
-                (b, t, 1),
-                &self.backbone.device,
-            )?;
-            let hidden32 = hidden.to_dtype(DType::F32)?;
-            let summed = hidden32.broadcast_mul(&mask_f)?.sum(1)?; // [b, h]
+            // hidden by the binary mask (broadcast to [b,t,1]), sum
+            // along time, divide by per-row token count.
+            //
+            // Stage 2 micro-opt: pool in the BACKBONE's dtype, then
+            // up-convert the pooled `[b, h]` once. Avoids materializing
+            // a `[b, t, h]` f32 promotion (b·t·h = up to ~3 M elements
+            // at b=8 t=512 h=768) when the backbone runs at half
+            // precision. The intermediate mask host vec is built
+            // directly with extend (no extra collect allocation).
+            let mut mask_host: Vec<f32> = Vec::with_capacity(b * t);
+            mask_host.extend(mask_slice.iter().map(|&m| m as f32));
+            let mask_f = Tensor::from_vec(mask_host, (b, t, 1), &self.backbone.device)?
+                .to_dtype(self.backbone.dtype)?;
+            let summed = hidden.broadcast_mul(&mask_f)?.sum(1)?; // [b, h]
             let counts = mask_f.sum(1)?.clamp(1f32, f32::INFINITY)?; // [b, 1]
-            let pooled = summed.broadcast_div(&counts)?; // [b, h]
+            let pooled = summed.broadcast_div(&counts)?.to_dtype(DType::F32)?; // [b, h] @ f32 for the dense head
 
             // 2_Dense → 3_Dense (both f32, Identity activation, no
             // bias). Composed effective `Linear(768→768)` via a 3072
@@ -593,9 +598,12 @@ impl CandleEmbed for CandleGemmaEncoder {
                 .sqrt()?
                 .clamp(1e-12f32, f32::INFINITY)?;
             let out = proj.broadcast_div(&norm)?;
-            let mut rows: Vec<Vec<f32>> = (0..b)
-                .map(|i| out.i(i)?.to_vec1::<f32>())
-                .collect::<candle_core::Result<Vec<_>>>()?;
+            // Stage 2 micro-opt: single batched readback (one Metal →
+            // CPU sync) instead of a per-row `to_vec1` (b separate
+            // syncs). The candle Metal storage layout for a
+            // contiguous `[b, h]` tensor is row-major so `to_vec2`
+            // hands back exactly the per-row vectors we want.
+            let mut rows: Vec<Vec<f32>> = out.to_vec2::<f32>()?;
             for row in &mut rows {
                 if row.iter().any(|v| v.is_nan()) {
                     row.iter_mut().for_each(|v| *v = 0.0);
