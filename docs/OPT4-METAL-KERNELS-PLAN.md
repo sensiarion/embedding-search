@@ -101,9 +101,29 @@ dispatches per layer × 24 = 48-72.
 
 ### T4 — Residual_add + RmsNorm fuse
 
-`x = (x_in + sublayer_out); x = next_norm(x)` → one kernel.
-2 residuals per layer × 24 = 48 add dispatches saved.
-**Effort:** low. Simplest. Best de-risk path.
+**Phase A scaffolding shipped** (`crates/core/src/candle_gemma_kernels.{rs,metal}`).
+CustomOp3 plumbing + MSL pipeline cache + CPU/Metal numerical match
+test (≤5e-5 vs ref). Kernel itself proven correct.
+
+**Design block uncovered in Phase A:** Gemma3 normalizes BEFORE the
+residual add, not after. The fusable pattern is `(post_attn_norm_out
++ residual) → pre_ff_norm`, BUT the `(post_attn_norm_out + residual)`
+value is **also saved as the next residual** (used at end-of-layer).
+A single-output fused kernel forces recompute, killing the savings.
+
+**Fix: dual-output kernel.** Output buffer `[2, N, h]`: index 0 =
+`y` (normed), index 1 = `residual_sum`. Caller narrows both for ~0
+cost. CustomOp3 returns one Tensor; we adopt the `[2, N, h]` shape
+and `i(0)` / `i(1)` to split.
+
+`x = (x_in + sublayer_out); x = next_norm(x)` → one kernel, two
+outputs. 1 fuse per layer × 24 = 24 dispatches saved (within-layer
+only; cross-layer fuse would need to restructure `Backbone::forward`
+to absorb the next layer's `input_layernorm`).
+
+**Effort:** medium (was: low). Most plumbing is done. The MSL change
+is small: write `(x_in + sub)` to a second output slot before
+applying the norm + weight multiply.
 
 ## Integration — candle-metal-kernels
 

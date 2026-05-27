@@ -52,6 +52,13 @@ ort = { version = "=2.0.0-rc.12", features = ["coreml"] }
 candle-core = { version = "0.10.2", features = ["metal"] }
 candle-nn = { version = "0.10.2", features = ["metal"] }
 candle-transformers = "0.10.2"
+# Direct access to MSL pipeline state + ComputeCommandEncoder. Needed
+# by `candle_gemma_kernels` for the Opt 4 fused kernels. Already
+# pulled transitively by candle-core/metal; named here so we can
+# resolve `candle_metal_kernels::*` and the objc2-metal types
+# (`MTLResourceUsage`) without going through candle's re-exports.
+candle-metal-kernels = "0.10.2"
+objc2-metal = "0.3"
 
 [target.'cfg(not(all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 ort = "=2.0.0-rc.12"

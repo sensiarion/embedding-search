@@ -225,6 +225,21 @@ impl GemmaRmsNorm {
             .map_err(|e| Error::Embed(format!("candle: rmsnorm weight: {e}")))?;
         Ok(Self { weight, eps })
     }
+
+    /// Exposed for the fused `residual_add + rmsnorm` Metal kernel in
+    /// `candle_gemma_kernels`. The kernel reads `weight` directly
+    /// into its `(1 + w) * x * inv_rms` step. Currently dead pending
+    /// the packed-output redesign (see
+    /// `docs/OPT4-METAL-KERNELS-PLAN.md` Phase A footnote).
+    #[allow(dead_code)]
+    fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    #[allow(dead_code)]
+    fn eps(&self) -> f64 {
+        self.eps
+    }
 }
 
 impl Module for GemmaRmsNorm {
