@@ -357,20 +357,23 @@ pub struct SyncConfig {
     pub max_rss_mb: u64,
 }
 
+/// Fallback when the active model has no `ModelSpec` (custom HF
+/// model added via `models add`, remote endpoint, raw `onnx_path`).
+/// Pareto-tuned for the candle Metal transformer path; see
+/// `benchmarks/results/PERF-EXPERIMENTS.md`.
+const FALLBACK_MAX_LENGTH: usize = 448;
+
 impl Default for ModelConfig {
     fn default() -> Self {
-        // Default 448 — confirmed via CSN eval (5000 distractor pool,
-        // 200 queries) to be the Pareto sweet spot for the candle
-        // Metal path: quality identical to 512 within bench noise
-        // (Gemma MRR Δ −0.0005, CodeRankEmbed MRR Δ −0.0002), indexing
-        // throughput +26-38%. Override per-project via
-        // `[model] max_length = N`, or ad-hoc via the env var (256 for
-        // ~−40% sync at ~−5% MRR — see PERF-EXPERIMENTS.md Pareto).
+        // Per-model `ModelSpec.max_length` is the canonical value
+        // (each spec is bench-tuned). Env var override lets users
+        // sweep quality/throughput ad-hoc without editing config.
         let max_length = std::env::var("EMBEDDING_SEARCH_MAX_LENGTH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(448);
+            .or_else(|| model_spec(DEFAULT_MODEL).map(|s| s.max_length as usize))
+            .unwrap_or(FALLBACK_MAX_LENGTH);
         Self {
             default: DEFAULT_MODEL.to_string(),
             provider: EmbeddingProvider::Local,
@@ -911,6 +914,15 @@ pub struct ModelSpec {
     /// the ~10 GB blow-up on a real repo) while the static Model2Vec
     /// models — no attention — get a large batch for throughput.
     pub rec_batch: u16,
+    /// Per-model token cap. Used when `[model] max_length` is left
+    /// at its `Default` (= the spec value below) and no env override
+    /// is set. Picked per model by Pareto bench (CSN 5000 distractor
+    /// pool, 200 queries): 448 is the sweet spot for the candle
+    /// Metal transformer backbones (quality identical to 512 within
+    /// noise, indexing +26–38%). Static Model2Vec models truncate at
+    /// the cap too but don't pay attention cost, so the value there
+    /// is for safety / tokenizer truncation only.
+    pub max_length: u16,
     /// Default for the optional cross-encoder re-rank when the user
     /// leaves `[rerank] enabled` unspecified. `true` for the fast
     /// static models (re-rank is a large measured quality rescue —
@@ -997,6 +1009,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_arch: CandleArch::NomicBert,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
+        max_length: 448,
         rerank_default: false,
         note: "DEFAULT: SOTA code retrieval, English, CLS (f16 Metal / int8 CPU)",
     },
@@ -1021,6 +1034,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_arch: CandleArch::NomicBert,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
+        max_length: 448,
         rerank_default: false,
         note: "Official upstream f32 weights (Metal); ~2x f16 default RAM",
     },
@@ -1043,6 +1057,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_arch: CandleArch::NomicBert,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
+        max_length: 448,
         rerank_default: false,
         note: "Pure code, 30 prog langs, English (int8)",
     },
@@ -1062,6 +1077,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_arch: CandleArch::NomicBert,
         arch: ModelArch::Static,
         rec_batch: 64,
+        max_length: 448,
         rerank_default: true,
         note: "Model2Vec static, multilingual incl. Russian, tiny+fast",
     },
@@ -1081,6 +1097,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_arch: CandleArch::NomicBert,
         arch: ModelArch::Static,
         rec_batch: 64,
+        max_length: 448,
         rerank_default: true,
         note: "Model2Vec static, English, smallest+fastest, lowest RAM",
     },
@@ -1133,6 +1150,7 @@ pub const SUPPORTED_MODELS: &[ModelSpec] = &[
         candle_arch: CandleArch::Gemma3,
         arch: ModelArch::OnnxEncoder,
         rec_batch: 4,
+        max_length: 448,
         rerank_default: false,
         note: "EmbeddingGemma 300M, Matryoshka 128-768, multilingual (bf16 Metal / int8 CPU)",
     },
