@@ -1,18 +1,17 @@
-//! T4 — fused residual_add + Gemma RmsNorm Metal kernel (Opt 4
-//! Phase A). Replaces a `(x + sublayer)` op followed by
-//! `GemmaRmsNorm::forward` with a single MSL kernel that loads the
-//! pair once and writes the normed output, saving 1 read + 1 write
-//! per call. Two such pairs per Gemma3 layer × 24 layers = 48
-//! dispatches removed per forward.
+//! T4 — fused `(x_in + sub)` then Gemma RmsNorm Metal kernel (Opt 4
+//! Phase A). Dual-output: produces both the residual-summed value
+//! `x = x_in + sub` and the normed output `y = (1 + w) · x · rsqrt(mean(x²) + eps)`
+//! in a single MSL dispatch. Gemma3 normalizes BEFORE the residual
+//! add, so the residual-summed value is needed twice per layer — a
+//! single-output fuse would force a recompute that kills the win.
 //!
-//! See `docs/OPT4-METAL-KERNELS-PLAN.md` (Phase A) for the design
-//! decision gate.
+//! See `docs/OPT4-METAL-KERNELS-PLAN.md` Phase A for the gate
+//! criteria.
 //!
 //! Apple-Silicon only; gated through `candle_backend` from lib.rs.
-//!
-//! Wired into `candle_gemma_embed::Layer::forward` in a follow-up
-//! step (allow(dead_code) until then so the scaffolding can land
-//! and unit-tests against the CPU/Metal reference can run).
+//! Some helpers (`pipeline_for`, internal layout helpers) only have
+//! call sites once `Layer::forward` is wired below — silence the
+//! intermediate-build dead-code lint for the whole module.
 #![allow(dead_code)]
 
 use candle_core::backend::BackendStorage;
@@ -22,23 +21,20 @@ use std::sync::{Mutex, OnceLock};
 
 const MSL_SRC: &str = include_str!("candle_gemma_kernels.metal");
 const FN_NAME: &str = "fused_add_rmsnorm_gemma_f32";
-/// Threads per row threadgroup. Must be a power of 2 (the kernel's
-/// pairwise reduction assumes it). 256 fits comfortably under
-/// Metal's 1024-thread max with low launch latency.
+/// Threads per row threadgroup. Must be power of 2 — the kernel's
+/// pairwise reduction assumes it. 256 fits well under Metal's
+/// 1024-thread max with low launch latency.
 const TG_SIZE: usize = 256;
 
-/// Pipeline state cache keyed by raw `MetalDevice` pointer. The
-/// MTLLibrary compile is one-time per device and reusing
+/// Pipeline state cache keyed by raw `MetalDevice` pointer.
+/// `MTLLibrary` compile is one-time per device and reusing
 /// `ComputePipelineState` across forward passes is the standard
-/// candle pattern. Pointer key is safe — candle clones an Arc and
-/// the underlying object lives for the device's lifetime.
+/// candle pattern.
 fn pipeline_for(
     device: &candle_core::MetalDevice,
 ) -> Result<candle_metal_kernels::metal::ComputePipeline, String> {
     type Cache = HashMap<usize, candle_metal_kernels::metal::ComputePipeline>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    // Key by MTLDevice pointer. Candle hands us a long-lived &Device;
-    // the address uniquely identifies the GPU within the process.
     let raw = device.device();
     let key = (raw as *const _) as *const () as usize;
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -64,16 +60,14 @@ fn pipeline_for(
     Ok(pipeline)
 }
 
-/// CustomOp3 fusing `(x_in + sub)` then Gemma-style RmsNorm:
+/// CustomOp3 fusing `(x_in + sub)` then Gemma RmsNorm, dual output.
 ///
-/// ```text
-///   x_i = x_in_i + sub_i
-///   y_i = (1 + weight_i) * x_i / sqrt(mean(x²) + eps)
-/// ```
+/// All three inputs must be f32 + contiguous + matching shape (apart
+/// from `weight` which is the per-feature vector of size `h = last
+/// dim`). Output shape is `[2, ..input_shape]`:
 ///
-/// All three inputs must be f32 + contiguous + same shape (apart
-/// from `weight` which is the per-feature broadcast vector of size
-/// `h = last dim`).
+///   * `out.i(0)` = `x_in + sub` (the residual sum)
+///   * `out.i(1)` = `(1 + weight) · (x_in + sub) · rsqrt(mean(·²) + eps)`
 pub struct FusedAddRmsNormGemma {
     pub eps: f32,
 }
@@ -108,6 +102,13 @@ fn flat_n_h(
     }
     let n: usize = dims[..dims.len() - 1].iter().product::<usize>().max(1);
     Ok((n, h))
+}
+
+fn output_shape_for(input_dims: &[usize]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(input_dims.len() + 1);
+    out.push(2);
+    out.extend_from_slice(input_dims);
+    out
 }
 
 impl CustomOp3 for FusedAddRmsNormGemma {
@@ -152,20 +153,26 @@ impl CustomOp3 for FusedAddRmsNormGemma {
         let off_x = l1.start_offset();
         let off_s = l2.start_offset();
         let off_w = l3.start_offset();
-        let mut out = vec![0f32; n * h];
+        // Packed: [resid_sum (N*h) | y (N*h)].
+        let mut out = vec![0f32; 2 * n * h];
+        let y_base = n * h;
         for row in 0..n {
             let mut sum_sq = 0f64;
             for j in 0..h {
                 let v = x[off_x + row * h + j] + sub[off_s + row * h + j];
+                out[row * h + j] = v;
                 sum_sq += (v as f64) * (v as f64);
             }
             let inv = (1.0 / (sum_sq / h as f64 + self.eps as f64).sqrt()) as f32;
             for j in 0..h {
-                let v = x[off_x + row * h + j] + sub[off_s + row * h + j];
-                out[row * h + j] = (1.0 + w[off_w + j]) * v * inv;
+                let v = out[row * h + j];
+                out[y_base + row * h + j] = (1.0 + w[off_w + j]) * v * inv;
             }
         }
-        Ok((CpuStorage::F32(out), Shape::from(l1.shape().dims())))
+        Ok((
+            CpuStorage::F32(out),
+            Shape::from(output_shape_for(l1.shape().dims())),
+        ))
     }
 
     fn metal_fwd(
@@ -186,7 +193,8 @@ impl CustomOp3 for FusedAddRmsNormGemma {
         }
         let device = s1.device();
         let pipeline = pipeline_for(device).map_err(candle_core::Error::Msg)?;
-        let out_buf = device.new_buffer(n * h, DType::F32, "fused_add_rmsnorm_gemma_out")?;
+        // Packed [2 * N * h] output buffer.
+        let out_buf = device.new_buffer(2 * n * h, DType::F32, "fused_add_rmsnorm_gemma_out")?;
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(&pipeline);
         let dt = DType::F32.size_in_bytes();
@@ -196,14 +204,11 @@ impl CustomOp3 for FusedAddRmsNormGemma {
         encoder.set_buffer(3, Some(&out_buf), 0);
         let h_u32: u32 = h as u32;
         encoder.set_bytes_directly(4, std::mem::size_of::<u32>(), (&h_u32 as *const u32).cast());
+        let n_u32: u32 = n as u32;
+        encoder.set_bytes_directly(5, std::mem::size_of::<u32>(), (&n_u32 as *const u32).cast());
         let eps = self.eps;
-        encoder.set_bytes_directly(5, std::mem::size_of::<f32>(), (&eps as *const f32).cast());
+        encoder.set_bytes_directly(6, std::mem::size_of::<f32>(), (&eps as *const f32).cast());
         encoder.set_threadgroup_memory_length(0, TG_SIZE * std::mem::size_of::<f32>());
-        // `use_resource` takes `impl Into<&MetalResource>`; candle's
-        // `Buffer` directly implements `From<&Buffer> for
-        // &MetalResource`, so the raw `&Buffer` (from
-        // `MetalStorage::buffer()`) is the right shape — no
-        // `as_ref()` to a deeper type.
         encoder.use_resource(s1.buffer(), MTLResourceUsage::Read);
         encoder.use_resource(s2.buffer(), MTLResourceUsage::Read);
         encoder.use_resource(s3.buffer(), MTLResourceUsage::Read);
@@ -219,14 +224,18 @@ impl CustomOp3 for FusedAddRmsNormGemma {
             depth: 1,
         };
         encoder.dispatch_thread_groups(groups, threads);
-        let storage = MetalStorage::new(out_buf, device.clone(), n * h, DType::F32);
-        Ok((storage, Shape::from(l1.shape().dims())))
+        let storage = MetalStorage::new(out_buf, device.clone(), 2 * n * h, DType::F32);
+        Ok((storage, Shape::from(output_shape_for(l1.shape().dims()))))
     }
 }
 
-/// Apply the fused op to a residual-add + RmsNorm pair. Inputs must
-/// be f32 + contiguous + matching shape; `weight` is the per-feature
-/// vector of length `hidden_size`.
+/// Apply the dual-output fused op to a residual-add + RmsNorm pair.
+/// Inputs: f32 + contiguous + matching shape; `weight` is the
+/// per-feature vector of length `hidden_size`. Returns a tensor of
+/// shape `[2, ..input_shape]`:
+///
+///   * `result.i(0)` = `x_in + sub` (residual sum)
+///   * `result.i(1)` = Gemma RmsNorm of the residual sum
 pub fn fused_add_rmsnorm_gemma(
     x_in: &Tensor,
     sub: &Tensor,
@@ -239,24 +248,25 @@ pub fn fused_add_rmsnorm_gemma(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{Device, IndexOp};
 
-    fn ref_impl(x_in: &[f32], sub: &[f32], w: &[f32], h: usize, eps: f32) -> Vec<f32> {
+    fn ref_impl(x_in: &[f32], sub: &[f32], w: &[f32], h: usize, eps: f32) -> (Vec<f32>, Vec<f32>) {
         let n = x_in.len() / h;
-        let mut out = vec![0f32; n * h];
+        let mut resid = vec![0f32; n * h];
+        let mut y = vec![0f32; n * h];
         for r in 0..n {
             let mut sq = 0f64;
             for j in 0..h {
                 let v = x_in[r * h + j] + sub[r * h + j];
+                resid[r * h + j] = v;
                 sq += (v as f64) * (v as f64);
             }
             let inv = (1.0 / (sq / h as f64 + eps as f64).sqrt()) as f32;
             for j in 0..h {
-                let v = x_in[r * h + j] + sub[r * h + j];
-                out[r * h + j] = (1.0 + w[j]) * v * inv;
+                y[r * h + j] = (1.0 + w[j]) * resid[r * h + j] * inv;
             }
         }
-        out
+        (resid, y)
     }
 
     fn det_data(n: usize, h: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -266,24 +276,43 @@ mod tests {
         (x, s, w)
     }
 
+    fn validate(got_resid: &[f32], got_y: &[f32], want_resid: &[f32], want_y: &[f32], tol: f32) {
+        let mut max_resid = 0f32;
+        let mut max_y = 0f32;
+        for (a, b) in got_resid.iter().zip(want_resid.iter()) {
+            max_resid = max_resid.max((a - b).abs());
+        }
+        for (a, b) in got_y.iter().zip(want_y.iter()) {
+            max_y = max_y.max((a - b).abs());
+        }
+        assert!(max_resid < tol, "residual err {max_resid}");
+        assert!(max_y < tol, "y err {max_y}");
+    }
+
     #[test]
     fn cpu_matches_reference() -> candle_core::Result<()> {
-        let h = 768;
-        let n = 4;
+        let (h, n) = (768usize, 4usize);
         let (x, s, w) = det_data(n, h);
         let dev = Device::Cpu;
         let xt = Tensor::from_slice(&x, (n, h), &dev)?;
         let st = Tensor::from_slice(&s, (n, h), &dev)?;
         let wt = Tensor::from_slice(&w, (h,), &dev)?;
-        let got: Vec<f32> = fused_add_rmsnorm_gemma(&xt, &st, &wt, 1e-6)?
+        let packed = fused_add_rmsnorm_gemma(&xt, &st, &wt, 1e-6)?;
+        assert_eq!(packed.shape().dims(), &[2, n, h]);
+        let resid: Vec<f32> = packed
+            .i(0)?
             .to_vec2::<f32>()?
             .into_iter()
             .flatten()
             .collect();
-        let want = ref_impl(&x, &s, &w, h, 1e-6);
-        for (a, b) in got.iter().zip(want.iter()) {
-            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
-        }
+        let y: Vec<f32> = packed
+            .i(1)?
+            .to_vec2::<f32>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let (want_r, want_y) = ref_impl(&x, &s, &w, h, 1e-6);
+        validate(&resid, &y, &want_r, &want_y, 1e-5);
         Ok(())
     }
 
@@ -291,23 +320,48 @@ mod tests {
     #[test]
     fn metal_matches_cpu() -> candle_core::Result<()> {
         let dev = Device::new_metal(0)?;
-        let h = 768;
-        let n = 8;
+        let (h, n) = (768usize, 8usize);
         let (x, s, w) = det_data(n, h);
         let xt = Tensor::from_slice(&x, (n, h), &dev)?;
         let st = Tensor::from_slice(&s, (n, h), &dev)?;
         let wt = Tensor::from_slice(&w, (h,), &dev)?;
-        let got = fused_add_rmsnorm_gemma(&xt, &st, &wt, 1e-6)?.to_vec2::<f32>()?;
-        let want = ref_impl(&x, &s, &w, h, 1e-6);
-        let mut max_err = 0f32;
-        for r in 0..n {
-            for j in 0..h {
-                let a = got[r][j];
-                let b = want[r * h + j];
-                max_err = max_err.max((a - b).abs());
-            }
-        }
-        assert!(max_err < 5e-5, "max err {max_err}");
+        let packed = fused_add_rmsnorm_gemma(&xt, &st, &wt, 1e-6)?;
+        assert_eq!(packed.shape().dims(), &[2, n, h]);
+        let resid: Vec<f32> = packed
+            .i(0)?
+            .to_vec2::<f32>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let y: Vec<f32> = packed
+            .i(1)?
+            .to_vec2::<f32>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let (want_r, want_y) = ref_impl(&x, &s, &w, h, 1e-6);
+        validate(&resid, &y, &want_r, &want_y, 5e-5);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_higher_rank() -> candle_core::Result<()> {
+        // Backbone calls this with `[b, t, h]`. Output should be
+        // `[2, b, t, h]`.
+        let dev = Device::new_metal(0)?;
+        let (b, t, h) = (2usize, 5usize, 768usize);
+        let n = b * t;
+        let (x, s, w) = det_data(n, h);
+        let xt = Tensor::from_slice(&x, (b, t, h), &dev)?;
+        let st = Tensor::from_slice(&s, (b, t, h), &dev)?;
+        let wt = Tensor::from_slice(&w, (h,), &dev)?;
+        let packed = fused_add_rmsnorm_gemma(&xt, &st, &wt, 1e-6)?;
+        assert_eq!(packed.shape().dims(), &[2, b, t, h]);
+        let resid: Vec<f32> = packed.i(0)?.flatten_all()?.to_vec1::<f32>()?;
+        let y: Vec<f32> = packed.i(1)?.flatten_all()?.to_vec1::<f32>()?;
+        let (want_r, want_y) = ref_impl(&x, &s, &w, h, 1e-6);
+        validate(&resid, &y, &want_r, &want_y, 5e-5);
         Ok(())
     }
 }

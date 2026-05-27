@@ -34,7 +34,7 @@ use crate::candle_encoder::{length_batched, metal_device, pack_ids_mask, CandleE
 use crate::embedder::load_tokenizer;
 use crate::error::{Error, Result};
 use candle_core::safetensors::MmapedSafetensors;
-use candle_core::{DType, Device, Module, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{linear_no_bias, Linear, VarBuilder};
 use candle_transformers::models::gemma3::Config as Gemma3Config;
 use std::path::Path;
@@ -311,9 +311,25 @@ impl Layer {
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self.attn.forward(&xs, attn_mask)?;
         let xs = xs.apply(&self.post_attention_layernorm)?;
-        let xs = (xs + residual)?;
-        let residual = xs.clone();
-        let xs = xs.apply(&self.pre_feedforward_layernorm)?;
+        // Opt 4 T4 fuse: `(xs + residual)` and `pre_feedforward_layernorm`
+        // collapse into one Metal kernel that emits BOTH outputs in one
+        // dispatch — the residual sum is needed twice per layer (norm
+        // input AND end-of-layer add). Only kicks in on the candle
+        // Metal f32 path the backbone actually uses; the CustomOp3's
+        // cpu_fwd is a faithful reference so CPU/test runs match.
+        // `contiguous()` is a no-op when already row-major; the norm
+        // and residual paths can produce broadcast-strided tensors
+        // that the MSL kernel's flat indexing assumes away.
+        let xs_c = xs.contiguous()?;
+        let resid_c = residual.contiguous()?;
+        let packed = crate::candle_gemma_kernels::fused_add_rmsnorm_gemma(
+            &xs_c,
+            &resid_c,
+            self.pre_feedforward_layernorm.weight(),
+            self.pre_feedforward_layernorm.eps() as f32,
+        )?;
+        let residual = packed.i(0)?.contiguous()?;
+        let xs = packed.i(1)?.contiguous()?;
         let xs = self.mlp.forward(&xs)?;
         let xs = xs.apply(&self.post_feedforward_layernorm)?;
         Ok((residual + xs)?)

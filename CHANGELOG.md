@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Opt 4 Phase A — fused `residual_add + Gemma RmsNorm` Metal kernel
+  shipped. One MSL dispatch replaces a pair (residual sum + norm)
+  per Gemma3 layer × 24 layers = 24 dispatches removed per forward.
+  Kernel is dual-output (`[2, N, h]`): `i(0)` = residual sum (saved
+  for end-of-layer add), `i(1)` = normed (fed to MLP). Numerical
+  match with CPU/reference ≤5e-5. Bench on golden 130q: ~14% sync
+  gain on Gemma f32, quality bit-identical (MRR / R@1 / NDCG
+  unchanged across A/B runs). Apple Silicon Metal only; CPU
+  fallback in the CustomOp3 path keeps tests working off-Metal.
 - **Default `[model] max_length` is now 448** (was 512). Confirmed on
   the CSN eval (5000 distractor pool, 200 queries) to be the Pareto
   sweet spot for the candle Metal path: quality identical to 512

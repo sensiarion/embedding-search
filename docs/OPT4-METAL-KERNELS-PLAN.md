@@ -99,11 +99,16 @@ NOT flash-attention (verdicted slower at S=512 in
 dispatches per layer × 24 = 48-72.
 **Effort:** medium. Pattern follows `candle_metal_kernels::call_softmax`.
 
-### T4 — Residual_add + RmsNorm fuse
+### T4 — Residual_add + RmsNorm fuse — **SHIPPED**
 
-**Phase A scaffolding shipped** (`crates/core/src/candle_gemma_kernels.{rs,metal}`).
-CustomOp3 plumbing + MSL pipeline cache + CPU/Metal numerical match
-test (≤5e-5 vs ref). Kernel itself proven correct.
+Phase A delivered. Dual-output MSL kernel (residual sum + Gemma
+RmsNorm in one dispatch) wired into `Layer::forward`. Bench:
+**~14% sync gain on Gemma f32 golden** (baseline ~58 s → fused
+~50 s averaged across 2 runs each), MRR / R@1 / NDCG bit-identical
+across runs. Well above Phase A's 3% decision gate.
+
+Code: `crates/core/src/candle_gemma_kernels.{rs,metal}` +
+`Layer::forward` in `candle_gemma_embed.rs`.
 
 **Design block uncovered in Phase A:** Gemma3 normalizes BEFORE the
 residual add, not after. The fusable pattern is `(post_attn_norm_out

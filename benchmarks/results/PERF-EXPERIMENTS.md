@@ -115,7 +115,25 @@ distractor pool, 200 queries, --rerank):
 
 All quality deltas within bench noise. Throughput gain shipped.
 
-### Opt 3 / Opt 4 — parked
+### Opt 4 Phase A — shipped (`bf52f70` + follow-up)
+
+Fused `residual_add + Gemma RmsNorm` MSL kernel. Dual-output
+(`[2, N, h]`) so Gemma's residual-summed value is reused both as
+norm input and end-of-layer residual without recompute. Wired into
+`Layer::forward`; one fewer pair of dispatches per Gemma3 layer ×
+24 = 24 dispatches removed per forward.
+
+Head-to-head golden 130q (this repo, same indexing state):
+
+| variant | run 1 sync | run 2 sync | mid | MRR | R@1 |
+|---------|-----------:|-----------:|----:|----:|----:|
+| baseline (S1+S2 + max_length=448) | 65 217 | 51 264 | ~58 000 | 0.446 | 0.1846 |
+| **+ T4 fused** | **47 476** | **53 000** | **~50 000** | **0.446** | **0.1846** |
+
+**~14% extra sync gain on Gemma f32, quality bit-identical.** Above
+Phase A's 3% decision gate.
+
+### Opt 3 / Opt 4 Phase B+ — parked
 
 - **Opt 3 (sequence packing):** profile shows most buckets pad to
   512 anyway because long chunks dominate length-sorted buckets.
