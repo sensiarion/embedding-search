@@ -359,15 +359,18 @@ pub struct SyncConfig {
 
 impl Default for ModelConfig {
     fn default() -> Self {
-        // Per-config override stays explicit (`[model] max_length`);
-        // env var is the throughput-vs-quality knob for ad-hoc tuning
-        // (set `EMBEDDING_SEARCH_MAX_LENGTH=256` for ~−40% sync on
-        // Gemma at ~−7% MRR — see PERF-EXPERIMENTS.md).
+        // Default 448 — confirmed via CSN eval (5000 distractor pool,
+        // 200 queries) to be the Pareto sweet spot for the candle
+        // Metal path: quality identical to 512 within bench noise
+        // (Gemma MRR Δ −0.0005, CodeRankEmbed MRR Δ −0.0002), indexing
+        // throughput +26-38%. Override per-project via
+        // `[model] max_length = N`, or ad-hoc via the env var (256 for
+        // ~−40% sync at ~−5% MRR — see PERF-EXPERIMENTS.md Pareto).
         let max_length = std::env::var("EMBEDDING_SEARCH_MAX_LENGTH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(512);
+            .unwrap_or(448);
         Self {
             default: DEFAULT_MODEL.to_string(),
             provider: EmbeddingProvider::Local,

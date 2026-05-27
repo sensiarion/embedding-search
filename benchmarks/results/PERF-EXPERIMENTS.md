@@ -95,7 +95,25 @@ CodeRankEmbed-f16 — monotonic (no sweet spot):
 | **512 (default)** | 32026 | 0 | 0.328 | 0 |
 
 Shipped as `EMBEDDING_SEARCH_MAX_LENGTH=N` env var + per-project
-`[model] max_length` config. Default stays 512 (most conservative).
+`[model] max_length` config.
+
+**Default changed 512 → 448** after CSN confirmation (5000
+distractor pool, 200 queries, --rerank):
+
+| model | metric | @448 | README old @512 | Δ |
+|-------|--------|-----:|----------------:|---|
+| Gemma f32 | MRR base | 0.9395 | 0.940 | −0.0005 |
+|  | R@1 | 0.915 | 0.915 | 0 |
+|  | NDCG | 0.9495 | 0.951 | −0.0015 |
+|  | MRR +rerank | 0.9443 | 0.944 | +0.0003 |
+|  | embed docs/s | **16.6** | ~12 | **+38%** (combined with Stage 1+2) |
+| CodeRankEmbed-f16 | MRR base | 0.9288 | 0.929 | −0.0002 |
+|  | R@1 | 0.91 | 0.910 | 0 |
+|  | NDCG | 0.9354 | 0.937 | −0.0016 |
+|  | MRR +rerank | 0.9275 | 0.928 | −0.0005 |
+|  | embed docs/s | **26.4** | ~21 | **+26%** |
+
+All quality deltas within bench noise. Throughput gain shipped.
 
 ### Opt 3 / Opt 4 — parked
 

@@ -101,7 +101,7 @@ command (CLI or MCP), so it's there to edit. Delete it to reset.
 ```toml
 [model]
 default   = "sensiarion/CodeRankEmbed-f16"    # SOTA code (f16 Metal / int8 CPU)
-max_length = 512                              # token cap; keep ≈ max_chunk_bytes/4. Throughput knob — see *Tuning indexing throughput* below.
+max_length = 448                              # token cap. Pareto-tuned for the candle Metal path; throughput knob — see *Tuning indexing throughput* below.
 # onnx_path = "/path/to/model-dir"            # custom local ONNX (see below)
 # onnx_query_prefix = "search_query: "        # e.g. nomic; omit for none
 # onnx_doc_prefix   = "search_document: "     # e.g. nomic; omit for none
@@ -254,23 +254,24 @@ Apple Silicon (the dominant sync cost):
 
 | model | MRR@10 | R@1 | NDCG@10 | MRR@10 +rerank | index (docs/s) | rerank default |
 |-------|-------|-----|---------|----------------|----------------|----------------|
-| google/embeddinggemma-300m | **0.940** | **0.915** | **0.951** | **0.944** | ~12 | off |
-| sensiarion/CodeRankEmbed-f16 **(default)** | 0.929 | 0.910 | 0.937 | 0.928 | ~21 | off |
+| google/embeddinggemma-300m | **0.940** | **0.915** | **0.950** | **0.944** | ~17 | off |
+| sensiarion/CodeRankEmbed-f16 **(default)** | 0.929 | 0.910 | 0.935 | 0.928 | ~26 | off |
 | minishlab/potion-base-32M | 0.730 | 0.660 | 0.759 | **0.849** | ~11 000 | on |
 | minishlab/potion-multilingual-128M | 0.716 | 0.635 | 0.749 | **0.858** | ~7 600 | on |
 
 Takeaways:
 
 - EmbeddingGemma edges past the default on every metric (+0.011 MRR
-  base, +0.014 NDCG, +0.005 R@1) at ~half the indexing throughput.
-  Numbers are the **candle Metal f32 path** (Google's model card
-  warns activations don't survive fp16; benching confirmed the cast
-  collapses MRR ~75%, so the backbone stays at native f32); the int8
-  ONNX CPU fallback (off-Mac, headless host, or gated-download
-  failure) scores ~0.002 MRR / ~0.005 R@1 lower and indexes ~6×
-  slower. The HF repo
-  is license-gated — first sync needs a token with `canReadGatedRepos`
-  or it falls back to int8 ONNX with one warn line.
+  base, +0.015 NDCG, +0.005 R@1) at ~⅔ the indexing throughput.
+  Numbers measured on the **candle Metal f32 path at the default
+  `max_length = 448`** (Pareto-tuned per *Tuning indexing throughput*
+  below; Google's model card warns activations don't survive fp16,
+  and benching confirmed the cast collapses MRR ~75%, so the backbone
+  stays at native f32). The int8 ONNX CPU fallback (off-Mac, headless
+  host, or gated-download failure) scores ~0.002 MRR / ~0.005 R@1
+  lower and indexes ~6× slower. The HF repo is license-gated — first
+  sync needs a token with `canReadGatedRepos` or it falls back to
+  int8 ONNX with one warn line.
 - The static `potion-*` models trade ~0.20 MRR for a **~500× faster
   index** — the right pick on a very large repo. Cross-encoder rerank
   closes most of the quality gap (+0.12–0.14 MRR, reaching ≈ a
@@ -287,39 +288,44 @@ Reproduce: `cargo xtask eval [--corpus N] [--queries N] [--rerank]`;
 ### Tuning indexing throughput
 
 Sync cost on the candle Metal backend is dominated by backbone forward
-attention (profile says ≈99% of wall time). The `[model] max_length`
-knob is the cheapest quality-vs-speed lever — attention is `O(seq²)`,
-so cutting the token cap multiplies through every layer. Chunks
-longer than the cap are truncated at tokenize time (raw content is
-unchanged).
+attention (profile: ≈99% of wall time). `[model] max_length` is the
+cheapest quality-vs-speed lever — attention is `O(seq²)`, so cutting
+the token cap multiplies through every layer. Chunks longer than the
+cap are truncated at tokenize time (raw content is unchanged).
+
+**Default is 448** — confirmed via CSN eval to be the Pareto sweet
+spot (quality identical to 512 within bench noise: MRR Δ ≤ 0.0005;
+indexing +26–38%). All deltas in the sweep below are relative to the
+old 512 baseline:
 
 | max_length | Gemma sync Δ | Gemma MRR Δ | CodeRankEmbed sync Δ | CodeRankEmbed MRR Δ |
 |-----------:|-------------:|------------:|---------------------:|--------------------:|
-| 256 | **−43%** | **−0.030** | **−48%** | **−0.024** |
+| 256 | **−43%** | −0.030 | **−48%** | −0.024 |
 | 320 | −31% | −0.021 | −36% | −0.012 |
 | 384 | −19% | −0.013 | −23% | −0.007 |
-| 448 | −8% | +0.009 (noise?) | −10% | −0.004 |
-| **512 (default)** | 0 | 0 | 0 | 0 |
+| **448 (default)** | **−8%** | **~0** | **−10%** | **~0** |
+| 512 | 0 | 0 | 0 | 0 |
 
-Per-project knob:
+Lower it for cheaper sync (e.g. on a very large repo) — quality
+gradient shown above. Per-project:
 
 ```toml
 # <project>/.embedding-search/config.toml
 [model]
-max_length = 384      # ~20% faster sync, ~3% quality loss
+max_length = 384      # ~10% extra sync win, ~−0.01 MRR
 ```
 
-Or ad-hoc per-run for benchmarking:
+Ad-hoc per-run:
 
 ```bash
 EMBEDDING_SEARCH_MAX_LENGTH=384 embedding-search sync
 ```
 
 Changing `max_length` shifts the index fingerprint → auto-rebuild on
-next sync. Other deeper levers (sequence packing, fused Metal kernels)
-are documented in `docs/OPT4-METAL-KERNELS-PLAN.md`; they are not
-shipped because the simpler `max_length` knob covers the same use case
-with a known, configurable quality trade.
+next sync. Deeper levers (sequence packing, fused Metal kernels) are
+documented in `docs/OPT4-METAL-KERNELS-PLAN.md`; not shipped because
+the `max_length` knob covers the same use case with a known,
+configurable quality trade.
 
 ### Selecting a model
 
