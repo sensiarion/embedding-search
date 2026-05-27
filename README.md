@@ -101,7 +101,7 @@ command (CLI or MCP), so it's there to edit. Delete it to reset.
 ```toml
 [model]
 default   = "sensiarion/CodeRankEmbed-f16"    # SOTA code (f16 Metal / int8 CPU)
-max_length = 512                              # token cap; keep ≈ max_chunk_bytes/4
+max_length = 512                              # token cap; keep ≈ max_chunk_bytes/4. Throughput knob — see *Tuning indexing throughput* below.
 # onnx_path = "/path/to/model-dir"            # custom local ONNX (see below)
 # onnx_query_prefix = "search_query: "        # e.g. nomic; omit for none
 # onnx_doc_prefix   = "search_document: "     # e.g. nomic; omit for none
@@ -283,6 +283,43 @@ Takeaways:
 
 Reproduce: `cargo xtask eval [--corpus N] [--queries N] [--rerank]`;
 `benchmarks/results/effectiveness.jsonl` holds this matched run.
+
+### Tuning indexing throughput
+
+Sync cost on the candle Metal backend is dominated by backbone forward
+attention (profile says ≈99% of wall time). The `[model] max_length`
+knob is the cheapest quality-vs-speed lever — attention is `O(seq²)`,
+so cutting the token cap multiplies through every layer. Chunks
+longer than the cap are truncated at tokenize time (raw content is
+unchanged).
+
+| max_length | Gemma sync Δ | Gemma MRR Δ | CodeRankEmbed sync Δ | CodeRankEmbed MRR Δ |
+|-----------:|-------------:|------------:|---------------------:|--------------------:|
+| 256 | **−43%** | **−0.030** | **−48%** | **−0.024** |
+| 320 | −31% | −0.021 | −36% | −0.012 |
+| 384 | −19% | −0.013 | −23% | −0.007 |
+| 448 | −8% | +0.009 (noise?) | −10% | −0.004 |
+| **512 (default)** | 0 | 0 | 0 | 0 |
+
+Per-project knob:
+
+```toml
+# <project>/.embedding-search/config.toml
+[model]
+max_length = 384      # ~20% faster sync, ~3% quality loss
+```
+
+Or ad-hoc per-run for benchmarking:
+
+```bash
+EMBEDDING_SEARCH_MAX_LENGTH=384 embedding-search sync
+```
+
+Changing `max_length` shifts the index fingerprint → auto-rebuild on
+next sync. Other deeper levers (sequence packing, fused Metal kernels)
+are documented in `docs/OPT4-METAL-KERNELS-PLAN.md`; they are not
+shipped because the simpler `max_length` knob covers the same use case
+with a known, configurable quality trade.
 
 ### Selecting a model
 

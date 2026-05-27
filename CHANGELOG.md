@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `[model] max_length` is now the documented throughput/quality knob.
+  Profile says backbone forward = 99% of sync wall time on candle
+  Metal, and attention is `O(seq²)` — lowering the token cap is the
+  cheapest win. Pareto frontier (golden, 130q):
+  256 → −43% sync / −0.030 MRR;
+  384 → −19% sync / −0.013 MRR;
+  448 → −8% sync / ~0 MRR;
+  512 default.
+  Set per-project in `<project>/.embedding-search/config.toml`, or
+  ad-hoc via `EMBEDDING_SEARCH_MAX_LENGTH=N` for benchmarking.
+  Changing it shifts the index fingerprint → auto-rebuild.
 - EmbeddingGemma candle Metal path stays at native f32. An attempt to
   cast to f16 on Metal collapsed retrieval quality (Google's model
   card explicitly warns activations don't survive fp16 — confirmed by
