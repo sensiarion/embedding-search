@@ -115,7 +115,7 @@ distractor pool, 200 queries, --rerank):
 
 All quality deltas within bench noise. Throughput gain shipped.
 
-### Opt 4 Phase A — shipped (`bf52f70` + follow-up)
+### Opt 4 Phase A — shipped (`bf52f70`, wired live in `980a4d1`)
 
 Fused `residual_add + Gemma RmsNorm` MSL kernel. Dual-output
 (`[2, N, h]`) so Gemma's residual-summed value is reused both as
@@ -123,15 +123,23 @@ norm input and end-of-layer residual without recompute. Wired into
 `Layer::forward`; one fewer pair of dispatches per Gemma3 layer ×
 24 = 24 dispatches removed per forward.
 
-Head-to-head golden 130q (this repo, same indexing state):
+**Approved bench — CSN 5000 distractor pool, 200 queries, --rerank:**
 
-| variant | run 1 sync | run 2 sync | mid | MRR | R@1 |
-|---------|-----------:|-----------:|----:|----:|----:|
-| baseline (S1+S2 + max_length=448) | 65 217 | 51 264 | ~58 000 | 0.446 | 0.1846 |
-| **+ T4 fused** | **47 476** | **53 000** | **~50 000** | **0.446** | **0.1846** |
+| variant | embed_ms | docs/s | MRR base | R@1 | NDCG |
+|---------|---------:|-------:|---------:|----:|-----:|
+| pre-Opt-4 baseline (no fuse, this commit) | 316 730 | 15.8 | 0.9395 | 0.915 | 0.9495 |
+| **Opt 4 run 1** | **295 267** | **16.93** | **0.9395** | **0.915** | **0.9495** |
+| **Opt 4 run 2** | **295 240** | **16.93** | **0.9395** | **0.915** | **0.9495** |
 
-**~14% extra sync gain on Gemma f32, quality bit-identical.** Above
-Phase A's 3% decision gate.
+**~6.8% Gemma CSN sync gain, quality bit-identical** (MRR / R@1 /
+NDCG match to 4 decimals across all three runs). Opt 4 also more
+reproducible: Δ between two Opt-4 runs = 27 ms (0.01%), vs ~5%
+spread on baseline.
+
+CodeRankEmbed-f16 unchanged (kernel is Gemma-specific; NomicBert
+encoder path is separate). Golden 130q showed a larger spread
+(~14%) but is variance-dominated at the smaller chunk count — the
+CSN steady-state number is the headline.
 
 ### Opt 3 / Opt 4 Phase B+ — parked
 

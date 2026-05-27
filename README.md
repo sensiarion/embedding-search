@@ -254,7 +254,7 @@ Apple Silicon (the dominant sync cost):
 
 | model | MRR@10 | R@1 | NDCG@10 | MRR@10 +rerank | index (docs/s) | rerank default |
 |-------|-------|-----|---------|----------------|----------------|----------------|
-| google/embeddinggemma-300m | **0.940** | **0.915** | **0.950** | **0.944** | ~17 | off |
+| google/embeddinggemma-300m | **0.940** | **0.915** | **0.950** | **0.944** | ~17 (Opt 4 fused) | off |
 | sensiarion/CodeRankEmbed-f16 **(default)** | 0.929 | 0.910 | 0.935 | 0.928 | ~26 | off |
 | minishlab/potion-base-32M | 0.730 | 0.660 | 0.759 | **0.849** | ~11 000 | on |
 | minishlab/potion-multilingual-128M | 0.716 | 0.635 | 0.749 | **0.858** | ~7 600 | on |
