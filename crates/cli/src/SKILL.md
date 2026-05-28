@@ -17,17 +17,25 @@ contexts (Explore, general-purpose, Task). Inside a subagent this
 skill is your standing directive: reach for `search_code` first for
 any code exploration.
 
-## Loading the tool when deferred
+## Loading the tool (at most once per session)
 
 `mcp__embedding-search__search_code` may appear under "deferred tools"
 with its schema not loaded — direct calls then fail with
-`InputValidationError`. Load it once:
+`InputValidationError`. Procedure:
 
-```
-ToolSearch query: "select:mcp__embedding-search__search_code"
-```
+1. Scan the available-tools / deferred-tools list in the system
+   reminders for the tool name.
+2. **Listed as deferred** → load once with
+   `ToolSearch select:mcp__embedding-search__search_code`, then call
+   the tool normally. Schema persists for the session.
+3. **Already directly callable** → just call it. No `ToolSearch`.
+4. **Not in either list** → the MCP is not wired up in this project.
+   Do NOT call `ToolSearch` — it returns
+   `No matching deferred tools found` and the retry is wasted. Use
+   grep/find for this session.
 
-The tool becomes callable.
+Never call `ToolSearch` for this tool more than once per session: if
+the first attempt did not surface it, neither will the second.
 
 ## Use `search_code` for
 

@@ -12,11 +12,17 @@
 
 process.stdout.write(
   "EMBEDDING-SEARCH ACTIVE — semantic code search is the default exploration tool.\n\n" +
-    "Tool: mcp__embedding-search__search_code (meaning-based search over this codebase).\n" +
-    "If it appears under deferred tools (schema not loaded), FIRST call ToolSearch\n" +
-    'with query "select:mcp__embedding-search__search_code", then call it. Do NOT\n' +
-    "fall back to grep/find merely because the schema is not loaded yet — loading\n" +
-    "it is one cheap step.\n\n" +
+    "Tool: mcp__embedding-search__search_code (meaning-based search over this codebase).\n\n" +
+    "## Loading the tool (do this AT MOST ONCE per session)\n" +
+    "1. Look at the available-tools / deferred-tools list in your system reminders.\n" +
+    "2. If `mcp__embedding-search__search_code` is listed as deferred → call\n" +
+    '   ToolSearch ONCE with `select:mcp__embedding-search__search_code`, then\n' +
+    "   call the tool. The schema stays loaded for the rest of the session.\n" +
+    "3. If the tool name is NOT in either list → the MCP is not installed in this\n" +
+    "   project. DO NOT call ToolSearch — it will return `No matching deferred\n" +
+    "   tools found` and the retry is pure waste. Fall back to grep/find for\n" +
+    "   this session and do not try to load it again.\n" +
+    "4. If the tool is already directly callable → just call it. No ToolSearch.\n\n" +
     "## Use search_code (default for exploration)\n" +
     '- "how does X work", "where is Y", "what handles Z"\n' +
     "- finding related code spread across files / unfamiliar areas\n" +

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.2.10
+
+- **Fix:** opening an index built before v0.2.10 on a project whose
+  schema lacked the `body_hash` column failed with
+  `no such column: body_hash` during the chunk-index creation. The
+  index for `body_hash` is now created **after** the legacy ALTER
+  TABLE migration runs (instead of in the always-run initial batch),
+  so pre-v3 schemas migrate cleanly without a manual wipe.
+- **Fix:** stale `vectors.usearch` files whose dim no longer matches
+  the active embedder used to surface only at first search as the
+  cryptic usearch error
+  `Vector length must match index dimensionality`. Startup now probes
+  the file header dim (header-only, no full load) and auto-wipes +
+  rebuilds the index when it disagrees with the embedder. Self-heals
+  without `sync --force`.
+
 - Opt 4 Phase A — fused `residual_add + Gemma RmsNorm` Metal kernel
   shipped. One MSL dispatch replaces a pair (residual sum + norm)
   per Gemma3 layer × 24 layers = 24 dispatches removed per forward.

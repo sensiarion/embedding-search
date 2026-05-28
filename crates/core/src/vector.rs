@@ -2,6 +2,23 @@ use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
+/// Read the on-disk header dim of a `vectors.usearch` file WITHOUT
+/// loading the full index into memory. Returns `None` when the file is
+/// absent, unreadable, or its header can't be parsed (treat as
+/// "wipe-and-rebuild" rather than blocking startup).
+///
+/// Used by `SyncEngine::new` as a belt-and-suspenders check next to the
+/// fingerprint comparison: a stale `vectors.usearch` whose dim doesn't
+/// match the active embedder would otherwise surface only at the first
+/// `search` call with the cryptic usearch error
+/// "Vector length must match index dimensionality".
+pub fn read_dim_on_disk(index_dir: &Path) -> Option<usize> {
+    let p = index_dir.join("vectors.usearch");
+    Index::metadata(p.to_str()?)
+        .ok()
+        .map(|m| m.dimensions as usize)
+}
+
 pub struct VectorIndex {
     inner: Index,
     path: PathBuf,

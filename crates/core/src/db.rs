@@ -99,7 +99,11 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id   ON chunks(file_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_vector_id ON chunks(vector_id);
-            CREATE INDEX IF NOT EXISTS idx_chunks_body_hash ON chunks(body_hash);
+            -- idx_chunks_body_hash created in migration block below, AFTER
+            -- legacy DBs get their `body_hash` column added via ALTER.
+            -- Creating it here would fail on pre-v4 schemas (column not
+            -- yet present) because CREATE TABLE IF NOT EXISTS is a no-op
+            -- on the existing legacy chunks table.
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL

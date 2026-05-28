@@ -115,7 +115,7 @@ impl Server {
     #[tool(
         title = "Semantic code search",
         annotations(read_only_hint = true),
-        description = "Meaning-based code search over the current project. PREFER over grep/find for any question about *what the code does or where intent lives*: \"how does auth work?\", \"where is rate limiting enforced?\", \"what handles billing?\", \"chunking strategy for source files\". Falls back gracefully while the index warms up. Keep using grep for exact strings (a known symbol, an error message, an import line, TODO/FIXME). Examples that should call this tool: query=\"how does reranking work\" → first hit lives in crates/core/src/rerank.rs; query=\"where is the index incrementally synced\" → crates/core/src/sync.rs; query=\"chunking strategy for source files\" → crates/core/src/chunker.rs. Optional `path` scopes the search to a directory or file. Returns ranked chunks: file_path, language, node_type, signature (def line), 1-based start_line/end_line, content, score, optional parent (enclosing impl/class/module) and prev/next sibling refs (no body). Use start_line/parent to locate code and decide whether to open the file; expand via prev/next only when needed."
+        description = "Meaning-based code search over the current project — call FIRST for any conceptual question about the codebase (\"how does X work\", \"where is Y enforced\", \"what handles Z\", \"chunking strategy\"). Strongly preferred over grep/find: ONE call usually beats several greps because it ranks by intent, not literal tokens. Optional `path` (project-relative dir/file) narrows scope when the area is already known. Default `limit=10` is right for most questions — only raise it (up to 50) for broad surveys. Use grep ONLY for exact strings you already know verbatim: a symbol, an error message, an import line, TODO/FIXME, a regex. Returns ranked chunks with `file_path`, 1-based `start_line`/`end_line`, `signature` (def line), `content`, `score`, optional `parent` (enclosing impl/class/module), and body-less `prev`/`next` sibling refs. Read `signature` + `parent` first; open the file at `start_line` only if you need the body; widen via `prev`/`next` lines instead of re-searching."
     )]
     async fn search_code(
         &self,
@@ -235,7 +235,7 @@ fn skill_instructions() -> &'static str {
     }
 }
 
-#[tool_handler(name = "embedding-search", version = "0.2.9")]
+#[tool_handler(name = "embedding-search", version = "0.2.10")]
 impl ServerHandler for Server {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo::new(

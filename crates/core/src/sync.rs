@@ -351,8 +351,25 @@ impl SyncEngine {
             // (legacy index from before fingerprinting) — but only if
             // there is data to invalidate, so a freshly created empty
             // db is left alone.
-            let mismatch = stored.as_deref() != Some(fingerprint.as_str());
-            if mismatch && indexed_files > 0 {
+            let fp_mismatch = stored.as_deref() != Some(fingerprint.as_str());
+            // Belt-and-suspenders: also probe the usearch header dim.
+            // Catches stale `vectors.usearch` whose dim the fingerprint
+            // scheme didn't capture (corrupt / partial-wipe leftovers
+            // where meta.db survived but vectors come from a different
+            // model). Without this the mismatch surfaces only at first
+            // search as the cryptic usearch error
+            // "Vector length must match index dimensionality".
+            let dim_mismatch = match crate::vector::read_dim_on_disk(&index_dir) {
+                Some(on_disk) if on_disk != dims => Some(on_disk),
+                _ => None,
+            };
+            if let Some(on_disk) = dim_mismatch {
+                tracing::warn!(
+                    "vector index dim mismatch (file={on_disk}, \
+                     embedder={dims}) — wiping index"
+                );
+                wipe_index(&index_dir)?;
+            } else if fp_mismatch && indexed_files > 0 {
                 tracing::warn!(
                     "index fingerprint changed ({} -> {fingerprint}) — wiping index",
                     stored.as_deref().unwrap_or("none")

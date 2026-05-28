@@ -21,10 +21,12 @@ process.stdin.on("end", () => {
         hookEventName: "UserPromptSubmit",
         additionalContext:
           "EMBEDDING-SEARCH ACTIVE: for code exploration prefer " +
-          "mcp__embedding-search__search_code over grep/find. If it is " +
-          "deferred, load it first via ToolSearch " +
-          "select:mcp__embedding-search__search_code. grep/find only for " +
-          "exact strings.",
+          "mcp__embedding-search__search_code over grep/find. Load it " +
+          "ONLY if it is listed under deferred tools (ToolSearch " +
+          "select:mcp__embedding-search__search_code, once). If the " +
+          "tool name is not in the available/deferred lists, the MCP " +
+          "isn't installed here — skip ToolSearch, use grep/find. " +
+          "grep/find for exact strings either way.",
       },
     })
   );
